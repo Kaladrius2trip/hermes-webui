@@ -130,7 +130,11 @@ def test_polling_transition_marks_completion_unread_without_sse_done():
     assert "const _sessionStreamingById = new Map();" in SESSIONS_JS
     assert "const wasStreaming = _sessionStreamingById.get(sid);" in transition_block
     assert "const isStreaming = _isSessionEffectivelyStreaming(s);" in transition_block
-    assert "s.is_streaming || _isSessionLocallyStreaming(s)" in effective_block
+    compact_effective = "".join(effective_block.split())
+    assert (
+        "s.is_streaming||s.active_stream_id||s.pending_user_message||s.pending_started_at||_isSessionLocallyStreaming(s)"
+        in compact_effective
+    )
     assert "wasStreaming === true && !isStreaming" in transition_block, (
         "polling fallback must only fire on an observed streaming -> stopped transition"
     )
@@ -193,7 +197,11 @@ def test_polling_transition_tracks_the_same_effective_streaming_state_as_sidebar
 
     assert "isActive && Boolean(S.busy)" in local_block
     assert "INFLIGHT && INFLIGHT[s.session_id]" not in local_block
-    assert "s.is_streaming || _isSessionLocallyStreaming(s)" in effective_block
+    compact_effective = "".join(effective_block.split())
+    assert (
+        "s.is_streaming||s.active_stream_id||s.pending_user_message||s.pending_started_at||_isSessionLocallyStreaming(s)"
+        in compact_effective
+    )
     assert "const isStreaming=_isSessionEffectivelyStreaming(s);" in render_block, (
         "the row spinner and polling completion transition must use the same "
         "effective streaming source, including local INFLIGHT-only streams"

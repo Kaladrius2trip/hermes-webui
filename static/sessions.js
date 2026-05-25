@@ -262,11 +262,17 @@ function _isSessionLocallyStreaming(s) {
 }
 
 function _isSessionEffectivelyStreaming(s) {
-  return Boolean(s && (s.is_streaming || _isSessionLocallyStreaming(s)));
+  return Boolean(s && (
+    s.is_streaming ||
+    s.active_stream_id ||
+    s.pending_user_message ||
+    s.pending_started_at ||
+    _isSessionLocallyStreaming(s)
+  ));
 }
 
 function _isServerIdleSessionRow(s) {
-  return Boolean(s && s.session_id && !s.is_streaming && !s.active_stream_id && !s.pending_user_message);
+  return Boolean(s && s.session_id && !s.is_streaming && !s.active_stream_id && !s.pending_user_message && !s.pending_started_at);
 }
 
 function _reconcileActiveSessionIdleStateFromList(serverRows) {
@@ -321,12 +327,12 @@ function _purgeStaleInflightEntries() {
       continue;
     }
     const s = sessionsById.get(sid);
-    if (!s.is_streaming) {
-      // Session exists but is not streaming — purge it.
+    if (!_isSessionEffectivelyStreaming(s)) {
+      // Session exists but has no effective runtime liveness — purge it.
       delete INFLIGHT[sid];
       if (typeof clearInflightState === 'function') clearInflightState(sid);
     }
-    // Sessions that exist and are still streaming are preserved.
+    // Sessions that exist and still have stream/runtime fields are preserved.
   }
 }
 
@@ -554,6 +560,7 @@ async function loadSession(sid){
   // Mark this session as the in-flight load. Subsequent loadSession() calls
   // will overwrite this; stale awaits use the mismatch to bail out (#1060).
   _loadingSessionId = sid;
+  try {
   stopApprovalPolling();hideApprovalCard(forceReload);
   _yoloEnabled=false;_updateYoloPill();
   if(typeof stopClarifyPolling==='function') stopClarifyPolling();
@@ -836,6 +843,16 @@ async function loadSession(sid){
     _checkAndShowHandoffHint(sid);
   } else {
     _hideHandoffHint();
+  }
+  } catch(e) {
+    const _msgInner = $('msgInner');
+    if (_loadingSessionId === sid && _msgInner && /Loading conversation/i.test(_msgInner.textContent || '')) {
+      _msgInner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Failed to load conversation. Try switching sessions or refreshing.</div>';
+      if (typeof showToast === 'function') showToast('Failed to load conversation', 3000, 'error');
+    }
+    throw e;
+  } finally {
+    if (_loadingSessionId === sid) _loadingSessionId = null;
   }
 }
 
@@ -2064,11 +2081,12 @@ function _mergeOptimisticFirstTurnSessions(fetchedSessions){
       const fetched=merged[idx]||{};
       const fetchedIsServerIdle=_isServerIdleSessionRow(fetched);
       const keepLocalOptimistic=fetchedIsServerIdle?false:_shouldKeepLocalOnlyOptimisticSessionRow(local);
+      const fetchedHasRuntimeLiveness=Boolean(fetched.is_streaming||fetched.active_stream_id||fetched.pending_user_message||fetched.pending_started_at);
       const localCount=Number(local.message_count||0);
       const fetchedCount=Number(fetched.message_count||0);
       const localTs=Number(local.last_message_at||local.updated_at||0);
       const fetchedTs=Number(fetched.last_message_at||fetched.updated_at||0);
-      if(!keepLocalOptimistic&&typeof _dropStaleOptimisticSessionRow==='function') _dropStaleOptimisticSessionRow(sid);
+      if(!keepLocalOptimistic&&!fetchedHasRuntimeLiveness&&typeof _dropStaleOptimisticSessionRow==='function') _dropStaleOptimisticSessionRow(sid);
       merged[idx]={
         ...local,
         ...fetched,
@@ -2076,10 +2094,10 @@ function _mergeOptimisticFirstTurnSessions(fetchedSessions){
         message_count:keepLocalOptimistic?Math.max(localCount,fetchedCount):fetchedCount,
         last_message_at:keepLocalOptimistic?Math.max(localTs,fetchedTs):fetchedTs,
         updated_at:keepLocalOptimistic?Math.max(Number(local.updated_at||0),Number(fetched.updated_at||0),localTs,fetchedTs):Number(fetched.updated_at||fetchedTs||0),
-        active_stream_id:fetchedIsServerIdle?null:(keepLocalOptimistic?(fetched.active_stream_id||local.active_stream_id||null):null),
-        pending_user_message:fetchedIsServerIdle?null:(keepLocalOptimistic?(fetched.pending_user_message||local.pending_user_message||null):null),
-        pending_started_at:fetchedIsServerIdle?null:(keepLocalOptimistic?(fetched.pending_started_at||local.pending_started_at||null):null),
-        is_streaming:fetchedIsServerIdle?false:(keepLocalOptimistic&&Boolean(fetched.is_streaming||local.is_streaming||_isSessionLocallyStreaming(local))),
+        active_stream_id:fetchedIsServerIdle?null:(fetched.active_stream_id||(keepLocalOptimistic?local.active_stream_id:null)),
+        pending_user_message:fetchedIsServerIdle?null:(fetched.pending_user_message||(keepLocalOptimistic?local.pending_user_message:null)),
+        pending_started_at:fetchedIsServerIdle?null:(fetched.pending_started_at||(keepLocalOptimistic?local.pending_started_at:null)),
+        is_streaming:fetchedIsServerIdle?false:Boolean(fetched.is_streaming||fetched.active_stream_id||fetched.pending_user_message||fetched.pending_started_at||(keepLocalOptimistic&&Boolean(local.is_streaming||_isSessionLocallyStreaming(local)))),
       };
     }else{
       if(_shouldKeepLocalOnlyOptimisticSessionRow(local)){
@@ -2140,7 +2158,7 @@ function _applySessionListPayload(sessData, projData){
   _clearLineageReportCache();
   _allProjects = projData.projects||[];
   _markPollingCompletionUnreadTransitions(_allSessions);
-  const isStreaming = _allSessions.some(s => Boolean(s && s.is_streaming));
+  const isStreaming = _allSessions.some(s => _isSessionEffectivelyStreaming(s));
   if (isStreaming) {
     startStreamingPoll();
   } else {

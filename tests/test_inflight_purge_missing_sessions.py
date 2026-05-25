@@ -58,7 +58,7 @@ def test_purge_removes_entry_when_sid_is_absent_from_all_sessions():
     )
 
     # There must be a branch that deletes INFLIGHT[sid] for missing sessions.
-    # It should appear before the `!s.is_streaming` check so that missing
+    # It should appear before the effective streaming check so that missing
     # sessions are always cleaned regardless of their streaming state.
     has_check_pos = body.find('sessionsById.has(sid)')
     assert has_check_pos != -1
@@ -77,43 +77,42 @@ def test_purge_removes_entry_when_sid_is_absent_from_all_sessions():
     )
 
 
-def test_purge_removes_entry_when_sid_present_but_not_streaming():
-    r'''An INFLIGHT entry for a session present in _allSessions with
-    is_streaming:false must also be removed (existing behaviour preserved).
+def test_purge_removes_entry_when_sid_present_but_not_effectively_streaming():
+    r'''An INFLIGHT entry for a session present in _allSessions with no
+    stream/runtime liveness must also be removed (existing behaviour preserved).
     '''
     body = _function_body(SESSIONS_JS, '_purgeStaleInflightEntries')
-    assert '!s.is_streaming' in body, (
-        '_purgeStaleInflightEntries() must still check !s.is_streaming for '
-        'sessions present in _allSessions'
+    assert '_isSessionEffectivelyStreaming(s)' in body, (
+        '_purgeStaleInflightEntries() must use the unified stream/runtime '
+        'liveness check for sessions present in _allSessions'
     )
-    # Verify the delete for the non-streaming case is present.
-    # The body should contain something like `if (!s.is_streaming) { delete INFLIGHT[sid]; ... }`
-    ns_pos = body.find('!s.is_streaming')
-    assert ns_pos != -1
-    seg = body[ns_pos:]
-    delete_in_ns = seg.find('delete INFLIGHT[sid]')
-    assert delete_in_ns != -1, (
-        'delete INFLIGHT[sid] must follow !s.is_streaming for sessions not streaming'
+    # Verify the delete for the non-live case is present.
+    live_pos = body.find('!_isSessionEffectivelyStreaming(s)')
+    assert live_pos != -1
+    seg = body[live_pos:]
+    delete_in_non_live = seg.find('delete INFLIGHT[sid]')
+    assert delete_in_non_live != -1, (
+        'delete INFLIGHT[sid] must follow the non-live check for sessions without runtime liveness'
     )
 
 
-def test_purge_preserves_entry_when_sid_present_and_streaming():
+def test_purge_preserves_entry_when_sid_present_and_effectively_streaming():
     r'''An INFLIGHT entry for a session present in _allSessions with
-    is_streaming:true must NOT be deleted.
+    is_streaming/active_stream_id/pending runtime fields must NOT be deleted.
     '''
     body = _function_body(SESSIONS_JS, '_purgeStaleInflightEntries')
 
-    # The non-streaming branch must be an if without an else that deletes.
-    # If an else block deleted on streaming, the fix would be wrong.
+    # The non-live branch must be an if without an else that deletes.
+    # If an else block deleted on streaming/runtime-live rows, the fix would be wrong.
     # We verify by checking that the body does NOT contain a pattern like:
-    # `} else { delete INFLIGHT[sid]; }`  immediately after an is_streaming check.
-    ns_pos = body.find('!s.is_streaming')
-    assert ns_pos != -1
-    # The delete for non-streaming is in the same if block.
+    # `} else { delete INFLIGHT[sid]; }`  immediately after the liveness check.
+    live_pos = body.find('!_isSessionEffectivelyStreaming(s)')
+    assert live_pos != -1
+    # The delete for non-live rows is in the same if block.
     # We confirm that there is no unconditional delete outside the two guarded paths.
     # Reconstruct the two guarded paths:
     #   1. if (!sessionsById.has(sid)) { delete INFLIGHT[sid]; }
-    #   2. if (!s.is_streaming) { delete INFLIGHT[sid]; }
+    #   2. if (!_isSessionEffectivelyStreaming(s)) { delete INFLIGHT[sid]; }
     # After both, there should be no third unguarded delete.
 
     # Count 'delete INFLIGHT[sid]' — there should be exactly 2 (one per guarded path).

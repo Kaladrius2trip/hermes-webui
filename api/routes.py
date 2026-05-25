@@ -8687,47 +8687,81 @@ def _start_chat_stream_for_session(
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
     # Prevent duplicate runs in the same session while a stream is still active.
-    # This commonly happens after page refresh/reconnect races and can produce
-    # duplicated clarify cards for what appears to be a single user request.
-    diag.stage("active_stream_check") if diag else None
-    current_stream_id = getattr(s, "active_stream_id", None)
-    if current_stream_id:
-        diag.stage("active_stream_lock_wait") if diag else None
-        with STREAMS_LOCK:
-            current_active = current_stream_id in STREAMS
-        if current_active:
-            diag.stage("response_write") if diag else None
-            return {
-                "error": "session already has an active stream",
-                "active_stream_id": current_stream_id,
-                "_status": 409,
-            }
-        # Stale stream id from a previous run; clear and continue.
+    # The check and reservation must be under the per-session lock. When this
+    # lived before the lock, two concurrent /api/chat/start requests could both
+    # observe active_stream_id=None and then serialize into two workers for the
+    # same visible turn, duplicating live assistant output and sometimes leaving
+    # a false "Response interrupted" marker.
+    session_lock = _get_session_agent_lock(s.session_id)
+    stale_cleanup_attempted = set()
+    while True:
+        stale_stream_id = None
+        diag.stage("session_lock_wait") if diag else None
+        with session_lock:
+            diag.stage("active_stream_check") if diag else None
+            current_stream_id = getattr(s, "active_stream_id", None)
+            if current_stream_id:
+                diag.stage("active_stream_lock_wait") if diag else None
+                with STREAMS_LOCK:
+                    current_active = current_stream_id in STREAMS
+                if current_active:
+                    diag.stage("response_write") if diag else None
+                    return {
+                        "error": "session already has an active stream",
+                        "active_stream_id": current_stream_id,
+                        "_status": 409,
+                    }
+                if current_stream_id not in stale_cleanup_attempted:
+                    stale_stream_id = current_stream_id
+
+            if not stale_stream_id:
+                # #1932: check if this session has a pending goal continuation flag.
+                # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue
+                # fires, so the next chat/start for this session is automatically
+                # treated as goal-related. Only consume it once we know this request
+                # will own the new stream.
+                if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
+                    goal_related = True
+                    PENDING_GOAL_CONTINUATION.discard(s.session_id)
+
+                stream_id = uuid.uuid4().hex
+                stream = create_stream_channel()
+                diag.stage("stream_registration") if diag else None
+                with STREAMS_LOCK:
+                    STREAMS[stream_id] = stream
+                if goal_related:
+                    STREAM_GOAL_RELATED[stream_id] = True
+                try:
+                    diag.stage("save_pending_state") if diag else None
+                    was_hidden_empty_session = _is_hidden_empty_session(s)
+                    _prepare_chat_start_session_for_stream(
+                        s,
+                        msg=msg,
+                        attachments=attachments,
+                        workspace=workspace,
+                        model=model,
+                        model_provider=model_provider,
+                        stream_id=stream_id,
+                    )
+                except Exception:
+                    with STREAMS_LOCK:
+                        STREAMS.pop(stream_id, None)
+                    STREAM_GOAL_RELATED.pop(stream_id, None)
+                    if getattr(s, "active_stream_id", None) == stream_id:
+                        s.active_stream_id = None
+                        s.pending_user_message = None
+                        s.pending_attachments = []
+                        s.pending_started_at = None
+                    raise
+                break
+
+        # Stale stream id from a previous run; clear outside session_lock because
+        # _clear_stale_stream_state() re-enters the same per-session lock to
+        # avoid clobbering a concurrent writer.
         diag.stage("stale_stream_cleanup") if diag else None
         _clear_stale_stream_state(s)
+        stale_cleanup_attempted.add(stale_stream_id)
 
-    # #1932: check if this session has a pending goal continuation flag.
-    # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue fires,
-    # so the next chat/start for this session is automatically treated as goal-related.
-    if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
-        goal_related = True
-        PENDING_GOAL_CONTINUATION.discard(s.session_id)
-
-    stream_id = uuid.uuid4().hex
-    session_lock = _get_session_agent_lock(s.session_id)
-    diag.stage("session_lock_wait") if diag else None
-    with session_lock:
-        diag.stage("save_pending_state") if diag else None
-        was_hidden_empty_session = _is_hidden_empty_session(s)
-        _prepare_chat_start_session_for_stream(
-            s,
-            msg=msg,
-            attachments=attachments,
-            workspace=workspace,
-            model=model,
-            model_provider=model_provider,
-            stream_id=stream_id,
-        )
     if was_hidden_empty_session:
         publish_session_list_changed("session_new")
     diag.stage("turn_journal_submitted") if diag else None
@@ -8752,13 +8786,6 @@ def _start_chat_stream_for_session(
         logger.warning("Failed to append submitted turn journal event", exc_info=True)
     diag.stage("set_last_workspace") if diag else None
     set_last_workspace(workspace)
-    diag.stage("stream_registration") if diag else None
-    stream = create_stream_channel()
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
-    # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
-    if goal_related:
-        STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
     thr = threading.Thread(
         target=_run_agent_streaming,
