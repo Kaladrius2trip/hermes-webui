@@ -10,6 +10,7 @@ const ICONS={
   trash:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M4.5 4.5v8.5h7v-8.5"/><line x1="7" y1="7" x2="7" y2="11"/><line x1="9" y1="7" x2="9" y2="11"/></svg>',
   more:'<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" stroke="none"><circle cx="8" cy="3" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="8" cy="13" r="1.25"/></svg>',
   edit:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2z"/><path d="M10 4l2 2"/></svg>',
+  wand:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13l8-8"/><path d="M9.5 3.5l3 3"/><path d="M2.5 3.5h2M3.5 2.5v2M12 10h2M13 9v2"/></svg>',
 };
 
 // Tracks which session_id is currently being loaded. Used to discard stale
@@ -1825,17 +1826,31 @@ function _positionSessionActionMenu(anchorEl){
   if(!_sessionActionMenu || !anchorEl) return;
   const rect=anchorEl.getBoundingClientRect();
   const menuW=Math.min(280, Math.max(220, _sessionActionMenu.scrollWidth || 220));
+  const viewportH=window.innerHeight || document.documentElement.clientHeight || 0;
+  const margin=8;
+  const gap=6;
   let left=rect.right-menuW;
-  if(left<8) left=8;
-  if(left+menuW>window.innerWidth-8) left=window.innerWidth-menuW-8;
+  if(left<margin) left=margin;
+  if(left+menuW>window.innerWidth-margin) left=window.innerWidth-menuW-margin;
   _sessionActionMenu.style.left=left+'px';
-  _sessionActionMenu.style.top='8px';
-  const menuH=_sessionActionMenu.offsetHeight || 0;
-  let top=rect.bottom+6;
-  if(top+menuH>window.innerHeight-8 && rect.top>menuH+12){
-    top=rect.top-menuH-6;
+  _sessionActionMenu.style.maxHeight='';
+  _sessionActionMenu.style.overflowY='hidden';
+  _sessionActionMenu.style.top=margin+'px';
+  const menuH=_sessionActionMenu.scrollHeight || _sessionActionMenu.offsetHeight || 0;
+  const belowSpace=Math.max(0, viewportH-rect.bottom-gap-margin);
+  const aboveSpace=Math.max(0, rect.top-gap-margin);
+  const preferAbove=menuH>belowSpace && aboveSpace>belowSpace;
+  const available=preferAbove?aboveSpace:belowSpace;
+  let top=preferAbove?rect.top-menuH-gap:rect.bottom+gap;
+  if(menuH>available){
+    const fallbackSpace=Math.max(0, viewportH-(margin*2));
+    const constrainedH=Math.max(80, Math.min(menuH, Math.max(available, fallbackSpace)));
+    _sessionActionMenu.style.maxHeight=constrainedH+'px';
+    _sessionActionMenu.style.overflowY='auto';
+    top=preferAbove?rect.top-constrainedH-gap:rect.bottom+gap;
+    if(top+constrainedH>viewportH-margin) top=viewportH-margin-constrainedH;
   }
-  if(top<8) top=8;
+  if(top<margin) top=margin;
   _sessionActionMenu.style.top=top+'px';
 }
 
@@ -1878,6 +1893,31 @@ function _appendSessionDuplicateAction(menu, session){
   ));
 }
 
+async function _forceGenerateSessionTitle(session){
+  if(!session || !session.session_id) return;
+  closeSessionActionMenu();
+  if(typeof showToast==='function') showToast(t('session_title_generating'));
+  try{
+    const res=await api('/api/session/title/refresh',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
+    if(res && res.session){
+      const updated=res.session;
+      const idx=_allSessions.findIndex(item=>item&&item.session_id===updated.session_id);
+      if(idx>=0) _allSessions[idx]={..._allSessions[idx],...updated};
+      session.title=updated.title||session.title;
+      if(S.session&&S.session.session_id===updated.session_id){
+        S.session={...S.session,...updated};
+        syncTopbar();
+      }
+      renderSessionListFromCache();
+    }
+    await renderSessionList();
+    if(typeof showToast==='function') showToast(t('session_title_generated'));
+  }catch(err){
+    const detail=err&&err.message?err.message:String(err||'');
+    if(typeof showToast==='function') showToast(t('session_title_generate_failed')+detail,3000,'error');
+  }
+}
+
 function _openSessionActionMenu(session, anchorEl){
   if(_isReadOnlySession(session)){ if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000); return; }
   if(_sessionActionMenu && _sessionActionSessionId===session.session_id && _sessionActionAnchor===anchorEl){
@@ -1915,6 +1955,12 @@ function _openSessionActionMenu(session, anchorEl){
           showToast(t('session_rename_failed_no_row')||'Could not start rename — row not found.', 3000, 'error');
         }
       }
+    ));
+    menu.appendChild(_buildSessionAction(
+      t('session_generate_title'),
+      t('session_generate_title_desc'),
+      ICONS.wand,
+      async()=>{ await _forceGenerateSessionTitle(session); }
     ));
   }
   menu.appendChild(_buildSessionAction(

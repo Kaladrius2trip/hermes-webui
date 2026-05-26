@@ -1262,6 +1262,80 @@ def _ensure_full_session_before_mutation(sid: str, session):
     return full_session
 
 
+def _generate_forced_session_title(user_text: str, assistant_text: str):
+    """Generate an explicit user-requested session title.
+
+    This is the synchronous/manual companion to the automatic background title
+    updater. It intentionally ignores the refresh cadence and the current
+    manual-vs-generated title distinction because the user clicked a force
+    action.
+    """
+    from api.streaming import (
+        _fallback_title_from_exchange,
+        _generate_llm_session_title_via_aux,
+        _is_generic_fallback_title,
+    )
+
+    next_title, status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text)
+    if next_title:
+        return next_title, status, raw_preview
+    fallback_title = _fallback_title_from_exchange(user_text, assistant_text)
+    if fallback_title and not _is_generic_fallback_title(fallback_title):
+        return fallback_title, "fallback", raw_preview
+    return None, status or "empty", raw_preview
+
+
+def _handle_session_title_refresh(handler, body):
+    """Force-generate and persist a title for a session now."""
+    try:
+        require(body, "session_id")
+    except ValueError as e:
+        return bad(handler, str(e))
+    sid = body["session_id"]
+    try:
+        s = get_session(sid)
+        if s is None:
+            raise KeyError(sid)
+        s = _ensure_full_session_before_mutation(sid, s)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+
+    from api.streaming import _latest_exchange_snippets
+
+    user_text, assistant_text = _latest_exchange_snippets(s.messages)
+    if not (user_text and assistant_text):
+        return bad(handler, "Need at least one complete user/assistant exchange before generating a title")
+
+    try:
+        from api import profiles as profiles_api
+
+        with profiles_api.profile_env_for_background_worker(s, "forced session title", logger_override=logger):
+            next_title, status, raw_preview = _generate_forced_session_title(user_text, assistant_text)
+    except Exception as exc:
+        logger.debug("Forced title generation failed for session %s", sid, exc_info=True)
+        return bad(handler, f"Title generation failed: {exc}", 500)
+
+    if not next_title:
+        return bad(handler, f"Could not generate a title ({status or 'empty'})", 502)
+
+    with _get_session_agent_lock(sid):
+        try:
+            s = get_session(sid)
+            if s is None:
+                raise KeyError(sid)
+            s = _ensure_full_session_before_mutation(sid, s)
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+        s.title = str(next_title).strip()[:80] or "Untitled"
+        s.llm_title_generated = True
+        s.save(touch_updated_at=False)
+    publish_session_list_changed("session_title_refresh")
+    payload = {"ok": True, "status": status, "session": s.compact()}
+    if raw_preview:
+        payload["raw_preview"] = raw_preview
+    return j(handler, payload)
+
+
 def _reconcile_stale_stream_state_for_session_rows(session_rows) -> bool:
     """Clear stale persisted stream fields before /api/sessions serializes rows."""
     changed = False
@@ -5275,6 +5349,10 @@ def handle_post(handler, parsed) -> bool:
             s.save()
         publish_session_list_changed("session_rename")
         return j(handler, {"session": s.compact()})
+
+    if parsed.path == "/api/session/title/refresh":
+        _handle_session_title_refresh(handler, body)
+        return True
 
     if parsed.path == "/api/personality/set":
         try:
