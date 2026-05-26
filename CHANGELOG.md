@@ -3,6 +3,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- Local fork integration stack: per-session reasoning effort controls, workspace-scoped sidebar filtering, workspace-link previews from chat, long-running session cost-protection pause, and optional Edge TTS speech output with auth-gated `/api/tts` handling.
+
+### Changed
+
+- Local fork integration stack: model picker keyboard navigation, ultrawide composer width cap, clearer tool-card visuals, Docker cron/gateway docs, and contract-routing docs.
+- Local fork integration stack: context guidance is kept model-facing, terminal supervisor lifecycle is hardened, and session duplicate-merge/index churn paths are optimized.
+
+### Fixed
+
+- Local fork integration stack: provider-key 403 removal errors now show a clearer toast, streaming preserves underscores, interim progress remains visible, and older-history tail loading keeps cumulative windows stable.
+
 ## [v0.51.137] — 2026-05-25 — Release DI (stage-batch19 — 6-PR medium-risk batch)
 
 ### Added
