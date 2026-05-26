@@ -3359,16 +3359,20 @@ function _composerHasContent(){
 function _getExplicitBusyCommandAction(text){
   const trimmed=(text||'').trim();
   if(!trimmed.startsWith('/')) return null;
+  const parsed=typeof parseCommand==='function'?parseCommand(trimmed):null;
   const body=trimmed.slice(1);
-  const name=(body.split(/\s+/)[0]||'').toLowerCase();
-  const args=body.slice(name.length).trim();
+  const name=(parsed&&parsed.name)||(body.split(/\s+/)[0]||'').toLowerCase();
+  const args=(parsed&&parsed.args)||body.slice(name.length).trim();
   if(!args) return null;
-  if(name==='queue') return 'queue';
-  if(name==='steer'){
+  const command=typeof findCommand==='function'?findCommand(name):null;
+  const canonical=command&&command.name||name;
+  if(name==='queue'||canonical==='queue') return 'queue';
+  if(name==='background'||canonical==='background'||name==='btw'||canonical==='btw') return 'background';
+  if(name==='steer'||canonical==='steer'){
     if(S.activeStreamId&&typeof _trySteer==='function') return 'steer';
     return 'queue';
   }
-  if(name==='interrupt'){
+  if(name==='interrupt'||canonical==='interrupt'){
     if(S.activeStreamId&&typeof cancelStream==='function') return 'interrupt';
     return 'queue';
   }
@@ -3407,6 +3411,7 @@ function _setComposerPrimaryButtonIcon(btn,action){
   const icons={
     send:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>',
     queue:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 5H3"/><path d="M16 12H3"/><path d="M9 19H3"/><path d="m16 16-3 3 3 3"/><path d="M21 5v12a2 2 0 0 1-2 2h-6"/></svg>',
+    background:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v5h5"/><path d="M12 8v5l3 2"/></svg>',
     interrupt:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 4v16"/><path d="M6.029 4.285A2 2 0 0 0 3 6v12a2 2 0 0 0 3.029 1.715l9.997-5.998a2 2 0 0 0 .003-3.432z"/></svg>',
     steer:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m16.24 7.76-1.804 5.411a2 2 0 0 1-1.265 1.265L7.76 16.24l1.804-5.411a2 2 0 0 1 1.265-1.265z"/></svg>',
     stop:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg>',
@@ -3423,6 +3428,7 @@ function updateSendBtn(){
   btn.dataset.action=action;
   btn.classList.toggle('stop',action==='stop');
   btn.classList.toggle('queue',action==='queue');
+  btn.classList.toggle('background',action==='background');
   btn.classList.toggle('interrupt',action==='interrupt');
   btn.classList.toggle('steer',action==='steer');
   const _tt=(key,fb)=>{if(typeof t!=='function')return fb;const val=t(key);return val===key?fb:(val||fb);};
@@ -3434,7 +3440,7 @@ function updateSendBtn(){
     else if(_dcompr) _btnTitle=_tt('composer_disabled_compression','Waiting for compression to finish');
     else _btnTitle=_tt('composer_disabled_empty','Type a message to send');
   }else{
-    const _tmap={send:'Send message',queue:'Queue message',interrupt:'Interrupt and send',steer:'Steer current response',stop:'Stop generation'};
+    const _tmap={send:'Send message',queue:'Queue message',background:'Run in background',interrupt:'Interrupt and send',steer:'Steer current response',stop:'Stop generation'};
     _btnTitle=_tt('composer_'+action,_tmap[action]||'Send message');
   }
   btn.title=_btnTitle;

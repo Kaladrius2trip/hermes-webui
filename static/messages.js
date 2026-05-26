@@ -305,19 +305,18 @@ async function send(){
       if(!S.session){await newSession();await renderSessionList();}
       // Busy-control slash commands must be intercepted HERE, before the
       // busyMode routing block, so the user can always type /steer, /interrupt,
-      // or /queue while the agent is running and have them execute immediately.
+      // /queue, /background, or /btw while the agent is running and have them execute immediately.
       // Without this intercept they fall through to the queue and execute after
       // the current turn ends — by which point there is no active stream and
       // cmdSteer / cmdInterrupt say "No active task to stop."
       if(text.startsWith('/')){
         const _pc=typeof parseCommand==='function'&&parseCommand(text);
-        if(_pc&&['steer','interrupt','queue','terminal','goal'].includes(_pc.name)){
-          const _bc=COMMANDS.find(c=>c.name===_pc.name);
-          if(_bc){
-            $('msg').value='';autoResize();
-            await _bc.fn(_pc.args);
-            return;
-          }
+        const _immediateBusyCommands=new Set(['steer','interrupt','queue','terminal','goal','background','btw']);
+        const _bc=_pc&&(typeof findCommand==='function'?findCommand(_pc.name):COMMANDS.find(c=>c.name===_pc.name));
+        if(_bc&&_immediateBusyCommands.has(_bc.name)){
+          $('msg').value='';autoResize();
+          await _bc.fn(_pc.args);
+          return;
         }
       }
       const busyMode=window._busyInputMode||'queue';
@@ -370,7 +369,7 @@ async function send(){
   // the user's own input — reverse chronological order (#840 ordering bug).
   if(text.startsWith('/')&&!S.pendingFiles.length){
     const _parsedCmd=parseCommand(text);
-    const _cmd=_parsedCmd?COMMANDS.find(c=>c.name===_parsedCmd.name):null;
+    const _cmd=_parsedCmd?(typeof findCommand==='function'?findCommand(_parsedCmd.name):COMMANDS.find(c=>c.name===_parsedCmd.name)):null;
     if(_cmd){
       let _pushedUser=false;
       if(!_cmd.noEcho){

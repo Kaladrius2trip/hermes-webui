@@ -9,7 +9,10 @@ Pins the wiring for the three modes (queue / interrupt / steer):
 
 Issue: #720 (configurable busy-input behaviour)
 """
+import json
 from pathlib import Path
+import subprocess
+import textwrap
 
 ROOT = Path(__file__).parent.parent
 CONFIG_PY = (ROOT / "api" / "config.py").read_text(encoding="utf-8")
@@ -20,6 +23,33 @@ BOOT_JS = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
 PANELS_JS = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
 INDEX_HTML = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
 I18N_JS = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+STYLE_CSS = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+
+
+def _run_commands_js(script_body: str) -> dict:
+    """Run a small command-dispatch probe against static/commands.js."""
+    script = textwrap.dedent(
+        f"""
+        const vm = require('vm');
+        const ctx = {{
+          console,
+          localStorage: {{ getItem(){{return null;}}, setItem(){{}}, removeItem(){{}} }},
+          t: (key) => key,
+          api: async () => ({{commands: []}})
+        }};
+        vm.createContext(ctx);
+        vm.runInContext({json.dumps(COMMANDS_JS)}, ctx);
+        (async () => {{
+          const result = await vm.runInContext(`(async () => {{ {script_body} }})()`, ctx);
+          process.stdout.write(JSON.stringify(result));
+        }})().catch(err => {{
+          console.error(err && err.stack || err);
+          process.exit(1);
+        }});
+        """
+    )
+    proc = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    return json.loads(proc.stdout)
 
 
 # ── Backend: setting registration + enum validation ─────────────────────
@@ -72,6 +102,27 @@ class TestSlashCommandRegistration:
                 f"/{name} registration must set noEcho:true — "
                 "without it the command text is echoed as a user bubble, causing duplicates"
             )
+
+    def test_find_command_resolves_builtin_aliases(self):
+        """WebUI must resolve CLI-compatible aliases before local dispatch."""
+        result = _run_commands_js(
+            """
+            const names = ['background', 'bg', 'queue', 'q', 'btw'];
+            const out = {};
+            for (const name of names) {
+              const cmd = findCommand(name);
+              out[name] = cmd ? {name: cmd.name, noEcho: !!cmd.noEcho} : null;
+            }
+            return out;
+            """
+        )
+
+        assert result["background"] == {"name": "background", "noEcho": True}
+        assert result["bg"] == {"name": "background", "noEcho": True}
+        assert result["queue"] == {"name": "queue", "noEcho": True}
+        assert result["q"] == {"name": "queue", "noEcho": True}
+        # WebUI has a richer /btw route; exact command names must win over aliases.
+        assert result["btw"] == {"name": "btw", "noEcho": True}
 
 
 class TestSlashCommandHandlers:
@@ -199,6 +250,21 @@ class TestBusySendButton:
             "partial slash commands without a payload should not override the primary button while the user is still typing"
         )
 
+    def test_background_busy_command_has_own_button_visual_action(self):
+        idx = UI_JS.find("function _getExplicitBusyCommandAction(")
+        assert idx >= 0, "_getExplicitBusyCommandAction() not found"
+        body = UI_JS[idx:UI_JS.find("function getComposerPrimaryAction", idx)]
+        assert "return 'background'" in body, (
+            "typing /background or /bg while busy should show a background action, not the queue action"
+        )
+
+        update_idx = UI_JS.find("function updateSendBtn()")
+        update_body = UI_JS[update_idx:UI_JS.find("function handleComposerPrimaryAction", update_idx)]
+        assert "btn.classList.toggle('background',action==='background')" in update_body
+        icon_body = UI_JS[UI_JS.find("function _setComposerPrimaryButtonIcon"):UI_JS.find("function updateSendBtn")]
+        assert "background:" in icon_body
+        assert ".send-btn.background" in STYLE_CSS
+
     def test_send_button_click_uses_primary_action_handler(self):
         assert "function handleComposerPrimaryAction()" in UI_JS, (
             "btnSend click should route through a primary action handler so Stop can cancel instead of sending"
@@ -308,6 +374,25 @@ class TestSendBusyBranchDispatch:
             "The slash-command intercept must come BEFORE the busyMode routing "
             "so /steer executes while the agent is running, not after the turn ends"
         )
+
+    def test_background_busy_commands_intercept_before_queueing(self):
+        """/background, /bg, and WebUI /btw must run immediately while busy."""
+        send_idx = MESSAGES_JS.find("async function send(")
+        assert send_idx >= 0, "send() not found"
+        busy_start = MESSAGES_JS.find("S.busy||compressionRunning", send_idx)
+        assert busy_start >= 0, "busy block not found"
+        busymode_idx = MESSAGES_JS.find("_busyInputMode||'queue'", busy_start)
+        intercept_block = MESSAGES_JS[busy_start:busymode_idx]
+
+        assert "findCommand(_pc.name)" in intercept_block, (
+            "busy slash-command dispatch must use alias-aware findCommand(); "
+            "otherwise /bg falls into the queue as raw text"
+        )
+        for name in ("background", "btw"):
+            assert f"'{name}'" in intercept_block, (
+                f"/{name} must be in the immediate busy-command allowlist, "
+                "not deferred through busy_input_mode='queue'"
+            )
 
     def test_steer_intercept_calls_handler_directly(self):
         """The busy-intercept must dispatch via _bc.fn(_pc.args), not queue the text."""

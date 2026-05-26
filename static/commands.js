@@ -19,14 +19,14 @@ const COMMANDS=[
   {name:'skills',    desc:t('cmd_skills'),   fn:cmdSkills,   arg:'query'},
   {name:'stop',      desc:t('cmd_stop'),     fn:cmdStop,      noEcho:true},
   {name:'goal',      desc:t('cmd_goal'),     fn:cmdGoal,      arg:'[status|pause|resume|clear|text]', subArgs:['status','pause','resume','clear']},
-  {name:'queue',     desc:t('cmd_queue'),    fn:cmdQueue,     arg:'message', noEcho:true},
+  {name:'queue',     desc:t('cmd_queue'),    fn:cmdQueue,     arg:'message', aliases:['q'], noEcho:true},
   {name:'interrupt', desc:t('cmd_interrupt'), fn:cmdInterrupt, arg:'message', noEcho:true},
   {name:'steer',     desc:t('cmd_steer'),    fn:cmdSteer,     arg:'message', noEcho:true},
   {name:'title',     desc:t('cmd_title'),    fn:cmdTitle,    arg:'[title]'},
   {name:'retry',     desc:t('cmd_retry'),    fn:cmdRetry,     noEcho:true},
   {name:'undo',      desc:t('cmd_undo'),     fn:cmdUndo,      noEcho:true},
   {name:'btw',       desc:t('cmd_btw'),      fn:cmdBtw,       arg:'question', noEcho:true},
-  {name:'background',desc:t('cmd_background'),fn:cmdBackground,arg:'prompt',  noEcho:true},
+  {name:'background',desc:t('cmd_background'),fn:cmdBackground,arg:'prompt',  aliases:['bg'], noEcho:true},
   {name:'status',    desc:t('cmd_status'),   fn:cmdStatus},
   {name:'voice',     desc:t('cmd_voice'),    fn:cmdVoice,     noEcho:true},
   {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'show|hide|none|minimal|low|medium|high|xhigh', subArgs:['show','hide','none','minimal','low','medium','high','xhigh'], noEcho:true},
@@ -47,10 +47,18 @@ function parseCommand(text){
   return {name,args};
 }
 
+function findCommand(name){
+  const needle=String(name||'').trim().toLowerCase();
+  if(!needle)return null;
+  const exact=COMMANDS.find(c=>c.name===needle);
+  if(exact)return exact;
+  return COMMANDS.find(c=>Array.isArray(c.aliases)&&c.aliases.some(a=>String(a||'').toLowerCase()===needle))||null;
+}
+
 function executeCommand(text){
   const parsed=parseCommand(text);
   if(!parsed)return null;
-  const cmd=COMMANDS.find(c=>c.name===parsed.name);
+  const cmd=findCommand(parsed.name);
   if(!cmd)return null;
   // A handler may return `false` to opt out of interception — e.g. /reasoning
   // with an effort level falls through so the agent's own handler sees it,
@@ -62,7 +70,7 @@ function executeCommand(text){
 
 function getMatchingCommands(prefix){
   const q=prefix.toLowerCase();
-  const matches=COMMANDS.filter(c=>c.name.startsWith(q)).map(c=>({...c,source:'builtin'}));
+  const matches=COMMANDS.filter(c=>c.name.startsWith(q)||(Array.isArray(c.aliases)&&c.aliases.some(a=>String(a||'').toLowerCase().startsWith(q)))).map(c=>({...c,source:'builtin'}));
   const seen=new Set(matches.map(c=>c.name));
   for(const [name, spec] of Object.entries(SLASH_SUBARG_SOURCES)){
     if(!name.startsWith(q)||seen.has(name))continue;
