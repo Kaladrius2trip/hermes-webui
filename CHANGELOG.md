@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Contributor guidance now requires explicit `Contract Routing` for contract-affecting PRs and `Contract Change` when a PR intentionally changes an existing product, runtime, or review contract. Contract tests must move with the corresponding docs instead of silently redefining behavior by themselves, with the current static coverage documented as advisory rather than a GitHub policy gate.
+
 ## [v0.51.134] — 2026-05-25 — Release DF (stage-batch16 — single-PR Windows path defaults)
 
 ### Fixed
