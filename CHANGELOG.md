@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Chat runs now stop at a safe agent step boundary when repeated compression failures, fallback churn, repeated same-pattern tool failures, or very high model-call counts match cost-protection signals, then show a "Run paused for review" message instead of continuing to spend tokens silently. Cost-protection thresholds can be tuned from `config.yaml` under `cost_protection` or `webui.cost_protection`.
+
 ## [v0.51.134] — 2026-05-25 — Release DF (stage-batch16 — single-PR Windows path defaults)
 
 ### Fixed
