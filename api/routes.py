@@ -4698,6 +4698,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == '/api/sessions/events':
         return _handle_session_events_stream(handler)
 
+    if parsed.path == "/api/tts":
+        return _handle_tts(handler, parsed)
+
     if parsed.path == "/api/media":
         return _handle_media(handler, parsed)
 
@@ -7488,6 +7491,68 @@ def _serve_inline_html_preview(handler, target: Path, cache_control: str, *, csp
     handler.end_headers()
     handler.wfile.write(body)
     return True
+
+
+def _handle_tts(handler, parsed):
+    """Generate TTS audio via Edge TTS and return it as audio/mpeg."""
+    from api.auth import is_auth_enabled, parse_cookie, verify_session
+
+    if is_auth_enabled():
+        cv = parse_cookie(handler)
+        if not (cv and verify_session(cv)):
+            return j(handler, {"error": "Authentication required"}, status=401) or True
+
+    qs = parse_qs(parsed.query or "")
+    text = qs.get("text", [""])[0].strip()
+    voice = qs.get("voice", ["zh-CN-XiaoxiaoNeural"])[0].strip() or "zh-CN-XiaoxiaoNeural"
+    rate_str = qs.get("rate", [""])[0].strip()
+    pitch_str = qs.get("pitch", [""])[0].strip()
+
+    if not text:
+        return bad(handler, "text parameter required", status=400) or True
+    if len(text) > 5000:
+        text = text[:5000]
+    if len(voice) > 100 or not re.fullmatch(r"[A-Za-z0-9-]+Neural", voice):
+        return bad(handler, "invalid voice", status=400) or True
+    if rate_str and not re.fullmatch(r"[+-](?:[0-9]{1,2}|100)%", rate_str):
+        return bad(handler, "invalid rate", status=400) or True
+    if pitch_str and not re.fullmatch(r"[+-](?:[0-9]{1,3}|1000)Hz", pitch_str):
+        return bad(handler, "invalid pitch", status=400) or True
+
+    tmp = Path("/tmp") / f"hermes_tts_{uuid.uuid4().hex}.mp3"
+    try:
+        try:
+            import edge_tts
+        except ImportError:
+            return bad(handler, "Edge TTS dependency missing", status=503) or True
+
+        kwargs = {}
+        if rate_str:
+            kwargs["rate"] = rate_str
+        if pitch_str:
+            kwargs["pitch"] = pitch_str
+        comm = edge_tts.Communicate(text, voice, **kwargs)
+        comm.save_sync(str(tmp))
+        if not tmp.exists() or tmp.stat().st_size == 0:
+            return bad(handler, "TTS generation failed", status=500) or True
+
+        body = tmp.read_bytes()
+        handler.send_response(200)
+        handler.send_header("Content-Type", "audio/mpeg")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.end_headers()
+        handler.wfile.write(body)
+        return True
+    except Exception:
+        logger.exception("Edge TTS error")
+        return bad(handler, "TTS generation failed", status=500) or True
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _handle_media(handler, parsed):
