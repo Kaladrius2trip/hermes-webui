@@ -1083,7 +1083,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // Allowed URL schemes for anchors and images rendered from agent-streamed markdown.
   // Raw file:// anchors are rewritten to /api/media before the user can click them.
   const _SMD_SAFE_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.|api)/i;
-  const _SMD_SAFE_IMG_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.)/i;
+  const _SMD_SAFE_IMG_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.|api\/media(?:\?|$))/i;
   const _WORKSPACE_SECRET_PATH_RE=/(^|\/)(?:\.env(?:[.\w-]*)?|\.netrc|id_(?:rsa|dsa|ecdsa|ed25519)|[^/]+\.(?:pem|key|p12|pfx)|auth\.json|credentials(?:\.[^/]*)?|secrets?(?:\.[^/]*)?)$/i;
   const _WORKSPACE_SECRET_DIR_RE=/(^|\/)(?:\.ssh|\.gnupg|\.aws|\.hermes)(?:\/|$)/i;
   function _smdWorkspaceRelFromHref(raw){

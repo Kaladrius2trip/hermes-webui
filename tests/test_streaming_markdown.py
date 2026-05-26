@@ -737,6 +737,22 @@ for (const [name, input, expected] of samples) {{
             "MEDIA live render should memoize identical text/body to avoid reloading media every tick"
         )
 
+    def test_smd_image_sanitizer_keeps_render_md_media_endpoint(self):
+        script = """
+const m = /const _SMD_SAFE_IMG_URL_RE=([^;]+);/.exec(require('fs').readFileSync('static/messages.js','utf8'));
+if(!m) throw new Error('missing _SMD_SAFE_IMG_URL_RE');
+const re = eval(m[1]);
+const allowed = ['api/media?path=%2Ftmp%2Fprobe.png&inline=1', '/api/media?path=x', 'https://example.com/x.png'];
+const blocked = ['javascript:alert(1)', 'api/other?path=x', 'api.evil/media?path=x'];
+for (const value of allowed) {
+  if (!re.test(value)) throw new Error(`expected allowed image src ${value}`);
+}
+for (const value of blocked) {
+  if (re.test(value)) throw new Error(`expected blocked image src ${value}`);
+}
+"""
+        subprocess.run(["node", "-e", script], check=True, text=True, capture_output=True)
+
 
 # ── XSS: smd does NOT sanitize URL schemes — we must do it ourselves ──────────
 
