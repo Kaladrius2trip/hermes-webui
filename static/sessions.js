@@ -1347,7 +1347,8 @@ function _mergeInflightTailMessages(baseMessages, inflightMessages){
 }
 
 // Load older messages when the user scrolls to the top of the conversation.
-// Prepends them to S.messages and re-renders, preserving scroll position.
+// Expands S.messages to a larger authoritative tail window and re-renders,
+// preserving scroll position as older messages appear above the viewport.
 let _loadingOlder = false;
 // _oldestIdx tracks the index (in the server's full message array) of the
 // oldest message currently loaded in S.messages. Starts at 0 when all
@@ -1379,7 +1380,15 @@ async function _loadOlderMessages() {
   // rebuilt transcript (#1937).
   const startGeneration = _messagesGeneration;
   try {
-    const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`);
+    // Ask the server for a larger authoritative tail window instead of a
+    // separate msg_before page. The same /api/session contract handles both —
+    // post-#2716 the backend always runs the full append-only merge, so a
+    // larger msg_limit on the same call produces the same merged transcript
+    // we'd get by stitching pages, but without client-side index bookkeeping.
+    // Cumulative growth: each "load more" asks for currentLoaded + 30, and the
+    // newly exposed head is what we expose to the user.
+    const requestedLimit = Math.max(_INITIAL_MSG_LIMIT, (S.messages || []).length + _INITIAL_MSG_LIMIT);
+    const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${requestedLimit}`);
     // Guard: api() may have redirected (401) and returned undefined.
     if (!data || !data.session) { _loadingOlder = false; return; }
     //  - response shape sane
@@ -1397,13 +1406,50 @@ async function _loadOlderMessages() {
     // counter and abort cleanly. _oldestIdx and _messagesTruncated were
     // already reset by the wholesale-replace path, so no rollback needed.
     if (_messagesGeneration !== startGeneration) return;
-    const olderMsgs = (data.session.messages || []).filter(m => m && m.role);
-    if (!olderMsgs.length) { _messagesTruncated = false; return; }
-    // Prepend older messages
+    let responseSession = data.session;
+    let expandedMsgs = (responseSession.messages || []).filter(m => m && m.role);
+    const currentMsgs = (S.messages || []).filter(m => m && m.role);
+    const currentLen = currentMsgs.length;
+    // Suffix-continuity check: the cumulative tail is only safe to wholesale-
+    // replace when our currently-displayed messages are still its suffix. If
+    // the server appended new messages (or merge filtered something) while we
+    // were awaiting, the suffix won't line up — fall back to the legacy
+    // msg_before page so we never drop visible older messages on the floor.
+    let tailMatches = expandedMsgs.length >= currentLen;
+    if (tailMatches && currentLen > 0) {
+      const start = expandedMsgs.length - currentLen;
+      for (let i = 0; i < currentLen; i++) {
+        if (!_sameTranscriptMessage(expandedMsgs[start + i], currentMsgs[i])) {
+          tailMatches = false;
+          break;
+        }
+      }
+    }
+    let olderCount = Math.max(0, expandedMsgs.length - currentLen);
+    let olderMsgs = expandedMsgs.slice(0, olderCount);
+    let nextMessages = expandedMsgs;
+    if (!tailMatches) {
+      // Race fallback: keep the legacy index-page request as the
+      // correctness-preserving alternative. Same guards reapplied because
+      // we just awaited again.
+      const fallback = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`);
+      if (!fallback || !fallback.session) { _loadingOlder = false; return; }
+      if (!S.session || S.session.session_id !== sid) return;
+      if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
+      if (_messagesGeneration !== startGeneration) return;
+      responseSession = fallback.session;
+      olderMsgs = (responseSession.messages || []).filter(m => m && m.role);
+      nextMessages = [...olderMsgs, ...S.messages];
+    }
+    if (!olderMsgs.length) { _messagesTruncated = !!responseSession._messages_truncated; return; }
+    // Replace with the larger tail window and preserve scroll as if older
+    // messages were prepended. When the suffix check fails, nextMessages
+    // already encodes the legacy prepend fallback so the visible behavior
+    // matches the old msg_before page path exactly.
     // Use $('messages') — the scrollable container (#msgInner is not scrollable).
     const container = $('messages');
     const prevScrollH = container ? container.scrollHeight : 0;
-    S.messages = [...olderMsgs, ...S.messages];
+    S.messages = nextMessages;
     // renderMessages() windows long transcripts from the end. If we do not
     // expand that window before rendering, the newly prepended page stays
     // hidden and the "hidden" counter rises while the viewport appears stuck.
@@ -1417,8 +1463,8 @@ async function _loadOlderMessages() {
       return !!(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||(typeof _messageHasReasoningPayload==='function'&&_messageHasReasoningPayload(m)))));
     }).length;
     _messageRenderWindowSize=_currentMessageRenderWindowSize()+Math.max(addedRenderable, MESSAGE_RENDER_WINDOW_DEFAULT);
-    _messagesTruncated = !!data.session._messages_truncated;
-    _oldestIdx = data.session._messages_offset || 0;
+    _messagesTruncated = !!responseSession._messages_truncated;
+    _oldestIdx = responseSession._messages_offset || 0;
     renderMessages({ preserveScroll: true });
     if (container) {
       // Prepending older messages must not teleport the reader. Preserve the
