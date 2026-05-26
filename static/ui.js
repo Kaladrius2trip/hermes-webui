@@ -2297,7 +2297,7 @@ function _setActivityElapsedStartedAt(group){
 }
 function _updateActiveActivityElapsedTimer(){
   const group=_activityElapsedTimerGroup;
-  if(!group||!group.isConnected||group.getAttribute('data-live-tool-call-group')!=='1'){
+  if(!group||!group.isConnected||group.getAttribute('data-live-tool-call-group')!=='1'||group.getAttribute('data-live-activity-current')!=='1'){
     _clearActivityElapsedTimer();
     return;
   }

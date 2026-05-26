@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Compact tool activity now keeps visible interim assistant progress in the live Session timeline instead of making that progress effectively collapsed-only inside Activity details. The interim assistant stream path creates and flushes a visible assistant segment before resetting for later tool/compression activity.
+
 ## [v0.51.134] — 2026-05-25 — Release DF (stage-batch16 — single-PR Windows path defaults)
 
 ### Fixed
