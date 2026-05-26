@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Tasks panel "Gateway not configured" banner now includes a direct link to the new `docs/docker.md#scheduled-jobs-and-the-gateway-daemon` section that walks through running the gateway container so scheduled cron jobs actually tick. (Refs #2785)
+
 ## [v0.51.134] — 2026-05-25 — Release DF (stage-batch16 — single-PR Windows path defaults)
 
 ### Fixed
