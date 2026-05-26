@@ -1002,8 +1002,35 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _smdWrittenLen=0;
     _smdWrittenText='';
     if(!window.smd){_smdParser=null;return;}
-    const renderer=fade ? _streamFadeRenderer(el) : window.smd.default_renderer(el);
+    const baseRenderer=fade ? _streamFadeRenderer(el) : window.smd.default_renderer(el);
+    const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
     _smdParser=window.smd.parser(renderer);
+  }
+  function _smdRendererWithoutUnderscoreEmphasis(renderer){
+    if(!renderer||!window.smd) return renderer;
+    const baseAddToken=renderer.add_token;
+    const baseEndToken=renderer.end_token;
+    const baseAddText=renderer.add_text;
+    const tokenStack=[];
+    renderer.add_token=(data,token)=>{
+      if(token===window.smd.ITALIC_UND||token===window.smd.STRONG_UND){
+        const marker=token===window.smd.STRONG_UND?'__':'_';
+        tokenStack.push(marker);
+        baseAddText(data,marker);
+        return;
+      }
+      tokenStack.push(null);
+      baseAddToken(data,token);
+    };
+    renderer.end_token=(data)=>{
+      const marker=tokenStack.pop();
+      if(marker){
+        baseAddText(data,marker);
+        return;
+      }
+      baseEndToken(data);
+    };
+    return renderer;
   }
   // Helper: end the current smd parser (flushes remaining state) and null it out.
   function _smdEndParser(){
