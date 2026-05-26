@@ -6874,7 +6874,19 @@ async function _removeProviderKey(providerId){
       if(els.saveBtn){els.saveBtn.disabled=false;els.saveBtn.textContent=t('providers_save');}
     }
   }catch(e){
-    showToast('Error: '+e.message);
+    // A 403 from /api/providers/delete fires when the CSRF cookie/header
+    // pair has drifted. The server distinguishes three reasons in
+    // api/routes.py:_csrf_rejection_error ("Session expired - reload the
+    // page", "Cross-origin mismatch - check reverse proxy headers", and
+    // the fallback "Cross-origin request rejected"); api()'s catch lifts
+    // that string onto e.message. Pass it through verbatim so the
+    // deployment-shape failure #2572 calls out keeps its actionable hint
+    // instead of being flattened to a single generic toast.
+    if(e&&e.status===403){
+      showToast(e.message||'Session expired. Reload the page and try again.',6000,'error');
+    }else{
+      showToast('Error: '+e.message);
+    }
     if(els.saveBtn){els.saveBtn.disabled=false;els.saveBtn.textContent=t('providers_save');}
   }
 }
