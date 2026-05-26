@@ -699,6 +699,8 @@ const samples = [
   ['audio', 'MEDIA:/tmp/hermes_media_probe.wav', true],
   ['remote', 'MEDIA:https://example.com/render?id=123', true],
   ['parenthesized', 'See (MEDIA:/tmp/hermes_media_probe.png)', true],
+  ['bare_non_path', 'A log says MEDIA:READY and keeps streaming.', false],
+  ['embedded_literal', 'const marker = "xMEDIA:/tmp/hermes_media_probe.png";', false],
   ['lowercase', 'media:/tmp/hermes_media_probe.png', false],
   ['markdown_image', '![x](https://example.com/x.png)', false],
   ['ordinary', 'No media token here.', false],

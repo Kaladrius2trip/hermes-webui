@@ -1137,7 +1137,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
   }
   function _liveSegmentRequiresRenderMd(displayText){
-    return /MEDIA:[^\s\)\]]+/.test(String(displayText||''));
+    return /(^|[\s\(\[])(MEDIA:(?:https?:\/\/|\/)[^\s\)\]]+)/.test(String(displayText||''));
   }
   function _renderLiveSegmentWithRenderMd(displayText){
     if(!assistantBody) return;
