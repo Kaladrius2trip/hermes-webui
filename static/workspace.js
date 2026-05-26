@@ -255,10 +255,55 @@ function renderSessionArtifacts(){
   root.innerHTML = items.map(item => `<button type="button" class="workspace-artifact-item" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)"><div class="workspace-artifact-path">${esc(item.path)}</div><div class="workspace-artifact-meta">${esc(item.source || 'session')}</div></button>`).join('');
 }
 
-function openArtifactPath(path){
+const _WORKSPACE_PREVIEW_SECRET_PATH_RE=/(^|\/)(?:\.env(?:[.\w-]*)?|\.netrc|id_(?:rsa|dsa|ecdsa|ed25519)|[^/]+\.(?:pem|key|p12|pfx)|auth\.json|credentials(?:\.[^/]*)?|secrets?(?:\.[^/]*)?)$/i;
+const _WORKSPACE_PREVIEW_SECRET_DIR_RE=/(^|\/)(?:\.ssh|\.gnupg|\.aws|\.hermes)(?:\/|$)/i;
+
+function _workspacePreviewRelPath(path, opts={}){
+  let rel=String(path||'').replace(/\\/g,'/').trim();
+  rel=rel.replace(/^~\//,'').replace(/^\.\//,'');
+  if(!rel||rel.length>4096||/[\x00-\x1f\x7f]/.test(rel)) return '';
+  if(/^\/+/.test(rel)||/^[a-zA-Z]:\//.test(rel)||/^[a-z][a-z0-9+.-]*:/i.test(rel)||/(^|\/)[a-z][a-z0-9+.-]*:/i.test(rel)) return '';
+  const parts=[];
+  for(const part of rel.split('/')){
+    if(!part||part==='.') continue;
+    if(part==='..') return '';
+    parts.push(part);
+  }
+  rel=parts.join('/');
+  if(!rel) return '';
+  if(opts.fromWorkspaceLink&&(_WORKSPACE_PREVIEW_SECRET_DIR_RE.test(rel)||_WORKSPACE_PREVIEW_SECRET_PATH_RE.test(rel))) return '';
+  return rel;
+}
+
+async function _workspacePathExists(path){
+  if(!S.session||!path) return false;
+  const rel=_workspacePreviewRelPath(path);
+  if(!rel) return false;
+  const parts=rel.split('/').filter(Boolean);
+  const name=parts.pop();
+  if(!name) return false;
+  const dir=parts.length?parts.join('/'):'.';
+  const data=await api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(dir)}`);
+  return (data.entries||[]).some(entry=>entry&&((entry.path===rel)||entry.name===name));
+}
+
+async function openArtifactPath(path, opts={}){
   if(!path) return;
   switchWorkspacePanelTab('files');
-  const rel = path.replace(/^~\//,'').replace(/^\.\//,'');
+  const rel = _workspacePreviewRelPath(path, opts);
+  if(!rel){
+    setStatus(t('file_open_failed'));
+    return;
+  }
+  try{
+    if(!(await _workspacePathExists(rel))){
+      setStatus(t('file_open_failed'));
+      return;
+    }
+  }catch(_){
+    setStatus(t('file_open_failed'));
+    return;
+  }
   openFile(rel);
 }
 

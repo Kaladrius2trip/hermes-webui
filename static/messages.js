@@ -1082,8 +1082,33 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // Raw file:// anchors are rewritten to /api/media before the user can click them.
   const _SMD_SAFE_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.|api)/i;
   const _SMD_SAFE_IMG_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.)/i;
-  function _smdFileHref(raw){
+  const _WORKSPACE_SECRET_PATH_RE=/(^|\/)(?:\.env(?:[.\w-]*)?|\.netrc|id_(?:rsa|dsa|ecdsa|ed25519)|[^/]+\.(?:pem|key|p12|pfx)|auth\.json|credentials(?:\.[^/]*)?|secrets?(?:\.[^/]*)?)$/i;
+  const _WORKSPACE_SECRET_DIR_RE=/(^|\/)(?:\.ssh|\.gnupg|\.aws|\.hermes)(?:\/|$)/i;
+  function _workspaceRelFromHref(raw){
+    try{
+      let rel=decodeURIComponent(String(raw||'').replace(/^workspace:\/\//i,'')).replace(/\\/g,'/').trim();
+      rel=rel.replace(/^~\//,'').replace(/^\.\//,'');
+      if(!rel||rel.length>4096||/[\x00-\x1f\x7f]/.test(rel)) return '';
+      if(/^\/+/.test(rel)||/^[a-zA-Z]:\//.test(rel)||/^[a-z][a-z0-9+.-]*:/i.test(rel)||/(^|\/)[a-z][a-z0-9+.-]*:/i.test(rel)) return '';
+      const parts=[];
+      for(const part of rel.split('/')){
+        if(!part||part==='.') continue;
+        if(part==='..') return '';
+        parts.push(part);
+      }
+      rel=parts.join('/');
+      if(!rel||_WORKSPACE_SECRET_DIR_RE.test(rel)||_WORKSPACE_SECRET_PATH_RE.test(rel)) return '';
+      return rel;
+    }catch(_){
+      return '';
+    }
+  }
+  function _smdLinkHref(raw){
     const href=String(raw||'');
+    if(/^workspace:\/\//i.test(href)){
+      const rel=_workspaceRelFromHref(href);
+      return rel?'#workspace='+encodeURIComponent(rel):'#';
+    }
     if(!/^file:\/\//i.test(href)) return href;
     try{
       const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
@@ -1092,12 +1117,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
     }
   }
+  function _smdFileHref(raw){
+    return _smdLinkHref(raw);
+  }
   function _sanitizeSmdLinks(root){
     if(!root||!root.querySelectorAll) return;
     const _a=root.querySelectorAll('a[href]');
     for(let i=0;i<_a.length;i++){
       const n=_a[i],v=n.getAttribute('href')||'';
-      if(/^file:\/\//i.test(v)){n.setAttribute('href',_smdFileHref(v));continue;}
+      if(/^(file|workspace):\/\//i.test(v)){n.setAttribute('href',_smdLinkHref(v));continue;}
       if(!_SMD_SAFE_URL_RE.test(v)){n.removeAttribute('href');n.setAttribute('data-blocked-scheme','1');}
     }
     const _im=root.querySelectorAll('img[src]');
@@ -1208,8 +1236,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const isHref=window.smd&&attr===window.smd.HREF;
       const isSrc=window.smd&&attr===window.smd.SRC;
       const safeUrl=isSrc?_SMD_SAFE_IMG_URL_RE:_SMD_SAFE_URL_RE;
-      if(isHref&&/^file:\/\//i.test(String(value||''))){
-        baseSetAttr(data,attr,_smdFileHref(value));
+      if(isHref&&/^(file|workspace):\/\//i.test(String(value||''))){
+        baseSetAttr(data,attr,_smdLinkHref(value));
         return;
       }
       if((isHref||isSrc)&&!safeUrl.test(String(value||''))){
