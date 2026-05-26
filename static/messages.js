@@ -900,6 +900,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _streamFadeReduceMotionMql=null;
   let _streamFadeReduceMotion=false;
   let _streamFadeReduceMotionOnChange=null;
+  let _renderMdLiveSegmentText=null;
+  let _renderMdLiveSegmentBody=null;
   let _lastRunJournalSeq=0;
   const _STREAM_FADE_MS=200;
   const _STREAM_FADE_MAX_MS=350;
@@ -1084,7 +1086,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   const _SMD_SAFE_IMG_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.)/i;
   const _WORKSPACE_SECRET_PATH_RE=/(^|\/)(?:\.env(?:[.\w-]*)?|\.netrc|id_(?:rsa|dsa|ecdsa|ed25519)|[^/]+\.(?:pem|key|p12|pfx)|auth\.json|credentials(?:\.[^/]*)?|secrets?(?:\.[^/]*)?)$/i;
   const _WORKSPACE_SECRET_DIR_RE=/(^|\/)(?:\.ssh|\.gnupg|\.aws|\.hermes)(?:\/|$)/i;
-  function _workspaceRelFromHref(raw){
+  function _smdWorkspaceRelFromHref(raw){
     try{
       let rel=decodeURIComponent(String(raw||'').replace(/^workspace:\/\//i,'')).replace(/\\/g,'/').trim();
       rel=rel.replace(/^~\//,'').replace(/^\.\//,'');
@@ -1106,7 +1108,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _smdLinkHref(raw){
     const href=String(raw||'');
     if(/^workspace:\/\//i.test(href)){
-      const rel=_workspaceRelFromHref(href);
+      const rel=_smdWorkspaceRelFromHref(href);
       return rel?'#workspace='+encodeURIComponent(rel):'#';
     }
     if(!/^file:\/\//i.test(href)) return href;
@@ -1133,6 +1135,23 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const n=_im[i],v=n.getAttribute('src')||'';
       if(!_SMD_SAFE_IMG_URL_RE.test(v)){n.removeAttribute('src');n.setAttribute('data-blocked-scheme','1');}
     }
+  }
+  function _liveSegmentRequiresRenderMd(displayText){
+    return /MEDIA:[^\s\)\]]+/.test(String(displayText||''));
+  }
+  function _renderLiveSegmentWithRenderMd(displayText){
+    if(!assistantBody) return;
+    const text=String(displayText||'');
+    if(assistantBody===_renderMdLiveSegmentBody&&text===_renderMdLiveSegmentText&&assistantBody.childNodes&&assistantBody.childNodes.length) return;
+    if(_smdParser) _smdEndParser();
+    _smdReconnect=false;
+    _resetStreamFadeState();
+    assistantBody.classList.remove('stream-fade-active');
+    assistantBody.innerHTML=renderMd ? renderMd(text) : esc(text);
+    _sanitizeSmdLinks(assistantBody);
+    if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(assistantBody);
+    _renderMdLiveSegmentText=text;
+    _renderMdLiveSegmentBody=assistantBody;
   }
 
   function _resetStreamFadeState(){
@@ -1353,6 +1372,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _renderStreamingFadeMarkdown(displayText){
     if(!assistantBody) return true;
+    if(_liveSegmentRequiresRenderMd(displayText)){
+      _renderLiveSegmentWithRenderMd(displayText);
+      return true;
+    }
     const next=_streamFadeNextText(displayText);
     if(!next.changed) return next.caughtUp;
     assistantBody.classList.add('stream-fade-active');
@@ -1413,7 +1436,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const displayText=segmentStart===0
       ? _parseStreamState().displayText
       : _stripXmlToolCalls(assistantText.slice(segmentStart));
-    if(_smdParser){
+    if(_liveSegmentRequiresRenderMd(displayText)){
+      _renderLiveSegmentWithRenderMd(displayText);
+    } else if(_smdParser){
       _smdWrite(displayText);
     } else if(renderMd){
       assistantBody.innerHTML=renderMd(displayText);
@@ -1424,6 +1449,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _resetAssistantSegment(){
     assistantRow=null;
     assistantBody=null;
+    _renderMdLiveSegmentText=null;
+    _renderMdLiveSegmentBody=null;
     segmentStart=assistantText.length;
     _freshSegment=true;
     _smdEndParser();
@@ -1480,22 +1507,26 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         } else {
           assistantBody.classList.remove('stream-fade-active');
           _resetStreamFadeState();
-          if(!_smdParser&&window.smd){
-            // On reconnect: prior content in assistantBody came from a different smd parser run.
-            // Clear it and start fresh — renderMessages() on done will restore the full content.
-            if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
-            _smdNewParser(assistantBody);
-          }
-          if(_smdParser){
-            _smdWrite(displayText);
+          if(_liveSegmentRequiresRenderMd(displayText)){
+            _renderLiveSegmentWithRenderMd(displayText);
           } else {
-            // Fallback: smd not loaded yet, reconnect session, or smd unavailable — use renderMd
-            // for every live segment. Without this, the first segment inserts raw
-            // parsed.displayText and users see unformatted markdown until done.
-            const fallbackText = segmentStart===0
-              ? parsed.displayText
-              : _stripXmlToolCalls(assistantText.slice(segmentStart));
-            assistantBody.innerHTML = renderMd ? renderMd(fallbackText) : esc(fallbackText);
+            if(!_smdParser&&window.smd){
+              // On reconnect: prior content in assistantBody came from a different smd parser run.
+              // Clear it and start fresh — renderMessages() on done will restore the full content.
+              if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
+              _smdNewParser(assistantBody);
+            }
+            if(_smdParser){
+              _smdWrite(displayText);
+            } else {
+              // Fallback: smd not loaded yet, reconnect session, or smd unavailable — use renderMd
+              // for every live segment. Without this, the first segment inserts raw
+              // parsed.displayText and users see unformatted markdown until done.
+              const fallbackText = segmentStart===0
+                ? parsed.displayText
+                : _stripXmlToolCalls(assistantText.slice(segmentStart));
+              assistantBody.innerHTML = renderMd ? renderMd(fallbackText) : esc(fallbackText);
+            }
           }
         }
       }

@@ -55,6 +55,39 @@ def extract_fn(src, name, *, brace_depth=1):
     return src[start:pos]
 
 
+def extract_fn_after_signature(src, name):
+    """Return a JS function body, ignoring braces in default parameters."""
+    pattern = rf"function {re.escape(name)}\s*\("
+    m = re.search(pattern, src)
+    if not m:
+        return None
+    start = m.start()
+    pos = m.end()
+    paren_depth = 1
+    while pos < len(src) and paren_depth > 0:
+        ch = src[pos]
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+        pos += 1
+    if paren_depth != 0:
+        return None
+    brace_pos = src.find("{", pos)
+    if brace_pos < 0:
+        return None
+    depth = 1
+    pos = brace_pos + 1
+    while pos < len(src) and depth > 0:
+        ch = src[pos]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        pos += 1
+    return src[start:pos]
+
+
 def extract_event_handler(src, event_name):
     """Return the text of a source.addEventListener('<event_name>', ...) block."""
     pattern = rf"source\.addEventListener\('{re.escape(event_name)}'"
@@ -643,6 +676,64 @@ class TestExistingStreamingGuardsIntact:
         assert fn and (
             "_freshSegment=true" in fn or "_freshSegment = true" in fn
         ), "_freshSegment must still be set on tool events"
+
+
+# ── MEDIA: tokens are renderMd-only, not markdown/smd ────────────────────────
+
+class TestStreamingMediaTokensUseRenderMd:
+    """MEDIA: tokens are a Hermes renderMd extension, not Markdown.
+
+    streaming-markdown treats `MEDIA:/tmp/x.wav` as plain text and can even
+    parse underscores in paths as emphasis. The live stream must therefore
+    switch that segment to the same renderMd path used by persisted messages;
+    otherwise media appears only after a done/session-refresh DOM replacement.
+    """
+
+    def test_live_segment_requires_render_md_for_media_tokens(self):
+        fn = extract_fn(MESSAGES_JS, "_liveSegmentRequiresRenderMd")
+        assert fn, "messages.js must define _liveSegmentRequiresRenderMd(displayText)"
+        script = f"""
+{fn}
+const samples = [
+  ['image', 'Here is it\\nMEDIA:/tmp/hermes_media_probe.png', true],
+  ['audio', 'MEDIA:/tmp/hermes_media_probe.wav', true],
+  ['remote', 'MEDIA:https://example.com/render?id=123', true],
+  ['parenthesized', 'See (MEDIA:/tmp/hermes_media_probe.png)', true],
+  ['lowercase', 'media:/tmp/hermes_media_probe.png', false],
+  ['markdown_image', '![x](https://example.com/x.png)', false],
+  ['ordinary', 'No media token here.', false],
+];
+for (const [name, input, expected] of samples) {{
+  const actual = _liveSegmentRequiresRenderMd(input);
+  if (actual !== expected) {{
+    throw new Error(`${{name}} expected ${{expected}} got ${{actual}}`);
+  }}
+}}
+"""
+        subprocess.run(["node", "-e", script], check=True, text=True, capture_output=True)
+
+    def test_stream_render_paths_route_media_tokens_around_smd(self):
+        for name in ("_flushPendingSegmentRender", "_renderStreamingFadeMarkdown", "_scheduleRender"):
+            fn = extract_fn_after_signature(MESSAGES_JS, name)
+            assert fn, f"{name} not found"
+            assert "_liveSegmentRequiresRenderMd" in fn, (
+                f"{name} must check _liveSegmentRequiresRenderMd(...) before feeding "
+                "MEDIA: output to streaming-markdown"
+            )
+            assert "_renderLiveSegmentWithRenderMd" in fn, (
+                f"{name} must render MEDIA: live output through renderMd, not smd"
+            )
+
+    def test_render_md_live_helper_tears_down_smd_and_memoizes(self):
+        fn = extract_fn(MESSAGES_JS, "_renderLiveSegmentWithRenderMd")
+        assert fn, "messages.js must define _renderLiveSegmentWithRenderMd(displayText)"
+        assert "_smdEndParser" in fn, "MEDIA live render must close any existing smd parser"
+        assert "_smdReconnect=false" in fn.replace(" ", ""), "MEDIA live render must clear reconnect handoff"
+        assert "renderMd" in fn, "MEDIA live render must use renderMd expansion"
+        assert "_sanitizeSmdLinks" in fn, "MEDIA live render must keep URL sanitizer"
+        assert "_renderMdLiveSegmentText" in MESSAGES_JS and "_renderMdLiveSegmentBody" in MESSAGES_JS, (
+            "MEDIA live render should memoize identical text/body to avoid reloading media every tick"
+        )
 
 
 # ── XSS: smd does NOT sanitize URL schemes — we must do it ourselves ──────────

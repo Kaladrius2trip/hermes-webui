@@ -110,6 +110,9 @@ def test_start_writes_pid_under_hermes_home_runs_foreground_no_browser_and_logs(
             "FAKE_PYTHON_LOG": str(fake_log),
             "HERMES_WEBUI_HOST": "0.0.0.0",
             "HERMES_WEBUI_PORT": "18991",
+            # The real checkout can have a repo .env that sets HERMES_WEBUI_STATE_DIR.
+            # Keep this test focused on ctl defaults under the temp HERMES_HOME.
+            "HERMES_WEBUI_STATE_DIR": str(tmp_path / ".hermes" / "webui"),
         },
     )
 

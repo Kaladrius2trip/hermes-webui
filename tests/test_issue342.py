@@ -15,6 +15,25 @@ def read_ui_js():
         return f.read()
 
 
+def extract_js_function(src: str, name: str) -> str:
+    marker = f"function {name}("
+    start = src.find(marker)
+    assert start != -1, f"{name} function not found in ui.js"
+    brace = src.find("{", start)
+    assert brace != -1, f"{name} opening brace not found"
+    depth = 1
+    pos = brace + 1
+    while pos < len(src) and depth:
+        ch = src[pos]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        pos += 1
+    assert depth == 0, f"{name} function body did not close"
+    return src[start:pos]
+
+
 def test_autolink_comment_present():
     """The Autolink comment should be present in renderMd() to document the feature."""
     content = read_ui_js()
@@ -27,11 +46,7 @@ def test_autolink_comment_present():
 def test_autolink_regex_in_rendermd():
     """The autolink regex pattern (https?://) should appear in renderMd()."""
     content = read_ui_js()
-    # Locate the renderMd function body
-    rendermd_start = content.find('function renderMd(raw){')
-    assert rendermd_start != -1, "renderMd function not found in ui.js"
-    # Find the closing brace after renderMd (look for the autolink pattern within it)
-    rendermd_body = content[rendermd_start:rendermd_start + 15000]
+    rendermd_body = extract_js_function(content, 'renderMd')
     assert 'https?:\\/\\/' in rendermd_body, (
         "Autolink regex (https?:\\/\\/) not found inside renderMd() body."
     )
@@ -61,13 +76,7 @@ def test_autolink_uses_esc_for_xss_safety():
 def test_autolink_in_inline_md():
     """The autolink pass should also be present inside the inlineMd() helper."""
     content = read_ui_js()
-    # Find inlineMd function
-    inline_start = content.find('function inlineMd(t){')
-    assert inline_start != -1, "inlineMd function not found in ui.js"
-    # Find closing brace of inlineMd by looking for 'return t;' followed by '}'
-    inline_end = content.find('return t;\n  }', inline_start)
-    assert inline_end != -1, "Could not locate end of inlineMd function"
-    inline_body = content[inline_start:inline_end + 20]
+    inline_body = extract_js_function(content, 'inlineMd')
     assert 'https?:\\/\\/' in inline_body, (
         "Autolink regex not found inside inlineMd() — plain URLs in list items "
         "and blockquotes won't be autolinked."

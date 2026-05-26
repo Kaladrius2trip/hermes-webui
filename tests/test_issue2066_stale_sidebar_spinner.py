@@ -38,15 +38,18 @@ def test_cache_render_purges_stale_non_streaming_inflight_entries():
     # ghost-entry cleanup); the guard check for !sessionsById.has(sid) must come
     # before the non-streaming check for code clarity and correctness.
     assert "if (!sessionsById.has(sid))" in purge_block
-    assert "!s.is_streaming" in purge_block
+    assert "!_isSessionEffectivelyStreaming(s)" in purge_block
     assert "delete INFLIGHT[sid];" in purge_block
     assert "clearInflightState(sid);" in purge_block
     assert "_purgeStaleInflightEntries();" in render_block
 
 
 def test_stale_inflight_purge_executes_without_undeclared_session_map():
+    local_block = _function_block("_isSessionLocallyStreaming", "_isSessionEffectivelyStreaming")
+    effective_block = _function_block("_isSessionEffectivelyStreaming", "_isServerIdleSessionRow")
     purge_block = _function_block("_purgeStaleInflightEntries", "_rememberRenderedStreamingState")
     script = f"""
+let S = {{session: {{session_id: 'active-session'}}, busy: false}};
 let _allSessions = [
   {{session_id: 'done-session', is_streaming: false}},
   {{session_id: 'running-session', is_streaming: true}}
@@ -60,6 +63,8 @@ let cleared = [];
 function clearInflightState(sid) {{
   cleared.push(sid);
 }}
+{local_block}
+{effective_block}
 {purge_block}
 _purgeStaleInflightEntries();
 console.log(JSON.stringify({{inflight: INFLIGHT, cleared}}));
