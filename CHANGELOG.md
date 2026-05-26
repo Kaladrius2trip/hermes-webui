@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Performance
+
+- **PR #2899** by @franksong2702 — Loading older session history now grows the authoritative tail window cumulatively instead of stitching separate client-side pages, with a suffix-continuity fallback to the legacy `msg_before` path when active updates race the request.
+
 ## [v0.51.134] — 2026-05-25 — Release DF (stage-batch16 — single-PR Windows path defaults)
 
 ### Fixed
