@@ -3519,6 +3519,7 @@ function setBusy(v){
 // normal user bubble in the chat — the chip is removed at drain time.
 const _queueRenderKeys={};  // per-session fingerprint to avoid redundant rebuilds
 const _queueCollapsed={};   // per-session: true when user explicitly collapsed the card
+let _queueRenderedSid=null; // session id that currently owns the shared queue DOM
 
 function _renderQueueChips(sid){
   const card=document.getElementById('queueCard');
@@ -3526,13 +3527,15 @@ function _renderQueueChips(sid){
   if(!card||!inner) return;
   const q=_getSessionQueue(sid,false);
   const key=q.map(e=>{const t=e&&(e.text||e.message||e.content||'');return(e&&e._queued_at||0)+':'+t.length+':'+t.slice(0,20);}).join('|');
-  if(key===(_queueRenderKeys[sid]||'')&&key!='') return;
+  if(key===(_queueRenderKeys[sid]||'')&&_queueRenderedSid===sid&&key!='') return;
   // Skip re-render if user is actively editing inside the queue panel
   if(inner.contains(document.activeElement)&&document.activeElement!==inner) return;
   _queueRenderKeys[sid]=key;
+  _queueRenderedSid=sid;
   inner.innerHTML='';
   if(!q.length){
     card.classList.remove('visible');
+    if(_queueRenderedSid===sid)_queueRenderedSid=null;
     const _msgs=document.getElementById('messages');
     if(_msgs) _msgs.classList.remove('queue-open');
     return;
@@ -3768,6 +3771,8 @@ function updateQueueBadge(sessionId){
     // Only wipe global DOM if this is the currently active session
     const isActive=S.session&&sid===S.session.session_id;
     if(isActive){
+      if(_queueRenderedSid){delete _queueRenderKeys[_queueRenderedSid];}
+      _queueRenderedSid=null;
       const card=document.getElementById('queueCard');
       const chips=document.getElementById('queueChips');
       if(card) card.classList.remove('visible');

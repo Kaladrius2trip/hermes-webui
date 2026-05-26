@@ -696,6 +696,7 @@ async function loadSession(sid){
     // switching away from and back to an active chat (#1715).
     S.activeStreamId=activeStreamId;
     syncTopbar();renderMessages();
+    updateQueueBadge(sid);
     const restoredLiveTurn=typeof restoreLiveTurnHtmlForSession==='function'&&restoreLiveTurnHtmlForSession(sid);
     if(!restoredLiveTurn){
       appendThinking();
