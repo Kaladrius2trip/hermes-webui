@@ -9,9 +9,9 @@ Four invariants this file locks in place:
 2. The reasoning chip label uses an SVG icon (`stroke="currentColor"`) instead
    of the `🧠` emoji, matching every other composer chip.
 
-3. `cmdReasoning()` calls `_applyReasoningChip(eff)` directly with the
-   server-confirmed effort, not `syncReasoningChip()` which re-applies the
-   stale cached value.
+3. `cmdReasoning()` calls `_applyReasoningChip(...)` directly with the
+   server-confirmed effort (preserving an active session override when present),
+   not `syncReasoningChip()` which re-applies the stale cached value.
 
 4. `attachBtwStream()` sets a `_streamDone` flag in `done`/`apperror` and
    gates `onerror`'s row removal on `!_streamDone` — otherwise the browser's
@@ -72,9 +72,12 @@ class TestReasoningDropdownEscapesComposerLeft:
         ]
         for name, pos in positions:
             assert pos > -1, f"{name} not found in index.html"
-        # They should all be in the same area of the document — within ~1.5 KB
+        # They should all be in the same area of the document — within ~3 KB
+        # (the reasoning dropdown grew when the per-session scope picker landed
+        # in #2697; the structural invariant — siblings, not nested inside
+        # composer-left's overflow-hidden — is still enforced by the test above).
         window = [p for _, p in positions]
-        assert max(window) - min(window) < 2000, (
+        assert max(window) - min(window) < 3000, (
             "composer dropdowns are no longer grouped — reasoning dropdown may "
             "have drifted back inside a nested container"
         )
@@ -175,8 +178,8 @@ class TestReasoningCommandUpdatesChip:
 
     def test_cmd_reasoning_calls_apply_not_sync(self):
         # Locate cmdReasoning and verify the success branch calls
-        # _applyReasoningChip(eff) directly, not syncReasoningChip() which
-        # would read stale _currentReasoningEffort.
+        # _applyReasoningChip(...) directly with the server-confirmed effort,
+        # not syncReasoningChip() which would read stale _currentReasoningEffort.
         m = re.search(
             r"function\s+cmdReasoning\b[\s\S]*?(?=^function\s|\Z)",
             COMMANDS_JS,
@@ -184,9 +187,14 @@ class TestReasoningCommandUpdatesChip:
         )
         assert m, "cmdReasoning not found in commands.js"
         fn = m.group(0)
-        assert "_applyReasoningChip(eff)" in fn, (
-            "cmdReasoning must call _applyReasoningChip(eff) with the "
-            "server-confirmed effort from the /api/reasoning POST response"
+        assert "syncReasoningChip()" not in fn, (
+            "cmdReasoning must not call syncReasoningChip(), which can reapply "
+            "a stale cached effort after /api/reasoning confirms the new value"
+        )
+        assert "_applyReasoningChip(override||eff,override)" in fn, (
+            "cmdReasoning must apply the server-confirmed effort from the "
+            "/api/reasoning POST response while preserving an active session "
+            "override as the effective chip value"
         )
 
 
