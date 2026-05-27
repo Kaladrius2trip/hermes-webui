@@ -77,12 +77,17 @@
 ## [v0.51.132] — 2026-05-24 — Release DD (stage-batch14 — 4-PR replayed-context + interrupted-response + shutdown affordance + passkey opt-in)
 
 ### Added
+- **Cursor ACP provider integration** — Add `cursor-acp` to the WebUI model picker and route slash model IDs (for example `cursor/composer-2.5`) through explicit `@cursor-acp:` provider hints so they do not fall through to the configured default HTTP provider.
 
 - **PR #2859** by @AJV20 — Optional passkey/WebAuthn sign-in for password-protected WebUI instances. Authenticated users can register/remove passkeys from Settings -> System, and `/login` shows a passwordless sign-in button only after a passkey exists. Password auth remains the default-off bootstrap and recovery path. **Opt-in default-off behind `HERMES_WEBUI_PASSKEY=1` env var or `webui_passkey_enabled: true` config flag** — when disabled, the UI block hides, all 6 `/api/auth/passkey/*` endpoints return 404, and `is_auth_enabled()` ignores any pre-existing credential file so the auth posture cannot silently flip if the flag is unset later.
 
 - **PR #2824** by @gavinssr — A "Stop server" affordance in Settings → System that gracefully shuts down the local WebUI server. Useful when WebUI was launched via `./ctl.sh start` or the native macOS/Windows app and the user wants to stop it without context-switching to a terminal. Confirmation dialog before the actual shutdown. The `/api/shutdown` route is CSRF-gated and intended for local-loopback use. Originally a title-bar button; relocated to Settings per the project's deep-UX rule (default-hidden for niche destructive actions on always-visible surfaces).
 
 ### Fixed
+
+### Fixed
+- **Reasoning effort chip visibility** — `/api/reasoning` now accepts `model` and `provider` query params and returns `supported_efforts` so the composer chip hides for models without configurable reasoning levels (for example Cursor Composer) while remaining available for models like GPT-5.5. Model picker changes now re-sync the chip after the session model/provider update instead of querying with stale session state. Composer dropdown selections now pass the provider id into `selectModelFromDropdown()` so duplicate bare model ids (for example `gpt-5.5` under OpenAI Codex vs OpenRouter) no longer fall back to the profile default provider when refreshing the chip.
+- **Cursor ACP routing and new-chat defaults** — New conversations now carry the visible composer picker selection into `POST /api/session/new`, persist model changes before a session exists, and evict cached session agents when the model/provider changes mid-session.
 
 - **PR #2685** by @LumenYoung — Prevent replayed context in chat reconciliation and metering. When a WebUI session is recovered (e.g., after a process restart, network drop, or browser reload), the sidebar/`state.db` reconciliation logic walks the sidecar transcript in order and only skips rows that can actually be aligned with the remaining sidecar context. The prior set-membership check was too broad: a legitimate fresh message that happened to share a key with any older repeated short message in the sidecar was mis-classified as already-seen and dropped from the replay, leading to lost context and inconsistent metering. Also caps the per-turn live-tool-prompt token estimate at 12,000 to prevent unbounded growth on bursts of large tool reads before exact provider accounting overrides.
 

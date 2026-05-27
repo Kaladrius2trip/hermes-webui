@@ -628,9 +628,10 @@ class Session:
             'reasoning_effort',
         ]
         meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
+        meta['message_count'] = len(self.messages or [])
         meta['messages'] = self.messages
         meta['tool_calls'] = self.tool_calls
-        # Fields not in METADATA_FIELDS (e.g. last_usage, message_count) go at the end
+        # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end
         extra = {k: v for k, v in self.__dict__.items()
                  if k not in METADATA_FIELDS and k not in ('messages', 'tool_calls')
                  and not k.startswith('_')}
@@ -3241,6 +3242,53 @@ def get_state_db_session_messages(sid, *, stitch_continuations: bool = False, pr
     return msgs
 
 
+def get_state_db_session_summary(sid, *, profile=None) -> dict:
+    """Return a cheap message count/timestamp summary for one state.db session."""
+    try:
+        import sqlite3
+    except ImportError:
+        return {"message_count": 0, "last_message_at": 0.0}
+
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not sid or not db_path.exists():
+        return {"message_count": 0, "last_message_at": 0.0}
+
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row['name']) for row in cur.fetchall()}
+            if 'session_id' not in available:
+                return {"message_count": 0, "last_message_at": 0.0}
+            if 'timestamp' in available:
+                cur.execute(
+                    "SELECT COUNT(*) AS message_count, MAX(timestamp) AS last_message_at "
+                    "FROM messages WHERE session_id = ?",
+                    (str(sid),),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"message_count": 0, "last_message_at": 0.0}
+                return {
+                    "message_count": max(0, int(row["message_count"] or 0)),
+                    "last_message_at": float(row["last_message_at"] or 0) if row["last_message_at"] is not None else 0.0,
+                }
+            cur.execute("SELECT COUNT(*) AS message_count FROM messages WHERE session_id = ?", (str(sid),))
+            row = cur.fetchone()
+            return {
+                "message_count": max(0, int(row["message_count"] or 0)) if row else 0,
+                "last_message_at": 0.0,
+            }
+    except Exception:
+        return {"message_count": 0, "last_message_at": 0.0}
+
+
 def _normalized_message_timestamp_for_key(value):
     if value is None or value == "":
         return ""
@@ -3374,8 +3422,9 @@ def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], _c
             continue
         if content in existing_content or existing_content in content:
             return (existing_role, existing_content)
-        loose_content = _loose_session_message_content(content)
-        loose_existing = _loose_session_message_content(existing_content)
+        if loose_content is None:
+            loose_content = _loose_session_message_content(content)
+        loose_existing = lookup.get("loose_by_key", {}).get((existing_role, existing_content), "")
         if loose_content and loose_existing and (
             loose_content in loose_existing or loose_existing in loose_content
         ):

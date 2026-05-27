@@ -1036,7 +1036,6 @@ function _applySessionContextMetadataUpdate(data){
 }
 
 $('modelSelect').onchange=async()=>{
-  if(!S.session)return;
   const selectedModel=$('modelSelect').value;
   const modelState=(typeof _modelStateForSelect==='function')
     ? _modelStateForSelect($('modelSelect'),selectedModel)
@@ -1044,10 +1043,16 @@ $('modelSelect').onchange=async()=>{
   if(typeof closeModelDropdown==='function') closeModelDropdown();
   if(typeof _writePersistedModelState==='function') _writePersistedModelState(modelState.model,modelState.model_provider);
   else try{localStorage.setItem('hermes-webui-model',modelState.model)}catch{}
+  if(!S.session){
+    if(typeof syncModelChip==='function') syncModelChip();
+    if(typeof syncReasoningChip==='function') syncReasoningChip();
+    return;
+  }
   if(typeof _rememberPendingSessionModel==='function') _rememberPendingSessionModel(S.session.session_id,modelState.model,modelState.model_provider);
   S.session.model=modelState.model;
   S.session.model_provider=modelState.model_provider||null;
   if(typeof syncModelChip==='function') syncModelChip();
+  if(typeof syncReasoningChip==='function') syncReasoningChip();
   syncTopbar();
   // Clarify scope: composer model changes are session-local, not the global default.
   if(typeof showToast==='function'){

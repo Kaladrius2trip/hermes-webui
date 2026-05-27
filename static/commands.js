@@ -1157,7 +1157,8 @@ function cmdReasoning(args){
   }
   if(!arg){
     // Status — read from the same config.yaml keys the CLI uses.
-    api('/api/reasoning').then(function(st){showToast(_fmtStatus(st));})
+    const q=(typeof _reasoningEffortQuery==='function')?_reasoningEffortQuery():'';
+    api('/api/reasoning'+q).then(function(st){showToast(_fmtStatus(st));})
       .catch(function(){showToast(BRAIN+' /reasoning — status unavailable');});
     return true;
   }
