@@ -105,12 +105,42 @@ def test_force_title_route_rejects_sessions_without_complete_exchange(tmp_path, 
     assert saved.title == "Manual title"
 
 
+def test_force_title_route_rejects_duplicate_inflight_request(tmp_path, monkeypatch):
+    """A second manual title request should not queue or race another active request."""
+    _isolate_session_store(tmp_path, monkeypatch)
+    session = _session()
+    captured = _capture_post(monkeypatch, {"session_id": session.session_id})
+    monkeypatch.setattr(routes, "_generate_forced_session_title", lambda *_args: ("Should Not Run", "llm_aux", ""))
+
+    routes._TITLE_REFRESH_INFLIGHT.add(session.session_id)
+    try:
+        assert routes.handle_post(object(), SimpleNamespace(path="/api/session/title/refresh")) is True
+    finally:
+        routes._TITLE_REFRESH_INFLIGHT.discard(session.session_id)
+
+    assert captured["status"] == 409
+    assert captured["payload"]["status"] == "already_generating"
+    assert "already generating" in captured["payload"]["error"].lower()
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert saved.title == "Manual title"
+
+
 def test_session_context_menu_exposes_force_title_action():
     assert "/api/session/title/refresh" in SESSIONS_JS
     assert "session_generate_title" in SESSIONS_JS
     assert "session_generate_title_desc" in SESSIONS_JS
     assert "session_title_generated" in SESSIONS_JS
     assert "await renderSessionList()" in SESSIONS_JS
+    assert "_titleRefreshInFlightSids" in SESSIONS_JS
+    assert "session_title_already_generating" in SESSIONS_JS
+
+
+def test_session_title_generation_status_renders_next_to_title():
+    assert "session-title-status" in SESSIONS_JS
+    assert "session-title-status" in STYLE_CSS
+    assert "session_title_generating_short" in SESSIONS_JS
+    assert "session_title_generating_short" in I18N_JS
 
 
 def test_session_context_menu_scrollbar_is_viewport_driven():
@@ -132,5 +162,7 @@ def test_force_title_i18n_keys_have_english_fallbacks():
         "session_title_generating",
         "session_title_generated",
         "session_title_generate_failed",
+        "session_title_already_generating",
+        "session_title_generating_short",
     ]:
         assert f"{key}:" in I18N_JS

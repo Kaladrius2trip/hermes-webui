@@ -59,6 +59,8 @@ _RUNNING_CRON_LOCK = threading.Lock()
 _MANUAL_COMPRESSION_JOBS: dict[str, dict] = {}
 _MANUAL_COMPRESSION_JOBS_LOCK = threading.Lock()
 _MANUAL_COMPRESSION_JOB_TTL_SECONDS = 10 * 60
+_TITLE_REFRESH_INFLIGHT: set[str] = set()
+_TITLE_REFRESH_INFLIGHT_LOCK = threading.Lock()
 _CRON_OUTPUT_CONTENT_LIMIT = 8000
 _CRON_OUTPUT_HEADER_CONTEXT = 200
 _MESSAGING_RAW_SOURCES = {str(s).strip().lower() for s in MESSAGING_SOURCES}
@@ -1291,34 +1293,16 @@ def _handle_session_title_refresh(handler, body):
         require(body, "session_id")
     except ValueError as e:
         return bad(handler, str(e))
-    sid = body["session_id"]
+    sid = str(body["session_id"])
+    with _TITLE_REFRESH_INFLIGHT_LOCK:
+        if sid in _TITLE_REFRESH_INFLIGHT:
+            return j(handler, {
+                "ok": False,
+                "status": "already_generating",
+                "error": "Title is already generating for this session",
+            }, 409)
+        _TITLE_REFRESH_INFLIGHT.add(sid)
     try:
-        s = get_session(sid)
-        if s is None:
-            raise KeyError(sid)
-        s = _ensure_full_session_before_mutation(sid, s)
-    except KeyError:
-        return bad(handler, "Session not found", 404)
-
-    from api.streaming import _latest_exchange_snippets
-
-    user_text, assistant_text = _latest_exchange_snippets(s.messages)
-    if not (user_text and assistant_text):
-        return bad(handler, "Need at least one complete user/assistant exchange before generating a title")
-
-    try:
-        from api import profiles as profiles_api
-
-        with profiles_api.profile_env_for_background_worker(s, "forced session title", logger_override=logger):
-            next_title, status, raw_preview = _generate_forced_session_title(user_text, assistant_text)
-    except Exception as exc:
-        logger.debug("Forced title generation failed for session %s", sid, exc_info=True)
-        return bad(handler, f"Title generation failed: {exc}", 500)
-
-    if not next_title:
-        return bad(handler, f"Could not generate a title ({status or 'empty'})", 502)
-
-    with _get_session_agent_lock(sid):
         try:
             s = get_session(sid)
             if s is None:
@@ -1326,14 +1310,44 @@ def _handle_session_title_refresh(handler, body):
             s = _ensure_full_session_before_mutation(sid, s)
         except KeyError:
             return bad(handler, "Session not found", 404)
-        s.title = str(next_title).strip()[:80] or "Untitled"
-        s.llm_title_generated = True
-        s.save(touch_updated_at=False)
-    publish_session_list_changed("session_title_refresh")
-    payload = {"ok": True, "status": status, "session": s.compact()}
-    if raw_preview:
-        payload["raw_preview"] = raw_preview
-    return j(handler, payload)
+
+        from api.streaming import _latest_exchange_snippets
+
+        user_text, assistant_text = _latest_exchange_snippets(s.messages)
+        if not (user_text and assistant_text):
+            return bad(handler, "Need at least one complete user/assistant exchange before generating a title")
+
+        try:
+            from api import profiles as profiles_api
+
+            with profiles_api.profile_env_for_background_worker(s, "forced session title", logger_override=logger):
+                next_title, status, raw_preview = _generate_forced_session_title(user_text, assistant_text)
+        except Exception as exc:
+            logger.debug("Forced title generation failed for session %s", sid, exc_info=True)
+            return bad(handler, f"Title generation failed: {exc}", 500)
+
+        if not next_title:
+            return bad(handler, f"Could not generate a title ({status or 'empty'})", 502)
+
+        with _get_session_agent_lock(sid):
+            try:
+                s = get_session(sid)
+                if s is None:
+                    raise KeyError(sid)
+                s = _ensure_full_session_before_mutation(sid, s)
+            except KeyError:
+                return bad(handler, "Session not found", 404)
+            s.title = str(next_title).strip()[:80] or "Untitled"
+            s.llm_title_generated = True
+            s.save(touch_updated_at=False)
+        publish_session_list_changed("session_title_refresh")
+        payload = {"ok": True, "status": status, "session": s.compact()}
+        if raw_preview:
+            payload["raw_preview"] = raw_preview
+        return j(handler, payload)
+    finally:
+        with _TITLE_REFRESH_INFLIGHT_LOCK:
+            _TITLE_REFRESH_INFLIGHT.discard(sid)
 
 
 def _reconcile_stale_stream_state_for_session_rows(session_rows) -> bool:

@@ -17,6 +17,19 @@ const ICONS={
 // responses from in-flight requests when the user switches sessions again
 // before the first request completes (#1060).
 let _loadingSessionId = null;
+const _titleRefreshInFlightSids = new Set();
+
+function _setSessionTitleRefreshInFlight(sid, active){
+  if(!sid) return;
+  if(active) _titleRefreshInFlightSids.add(sid);
+  else _titleRefreshInFlightSids.delete(sid);
+  if(Array.isArray(_allSessions)){
+    const idx=_allSessions.findIndex(item=>item&&item.session_id===sid);
+    if(idx>=0) _allSessions[idx]={..._allSessions[idx],title_refresh_inflight:!!active};
+  }
+  if(S.session&&S.session.session_id===sid) S.session.title_refresh_inflight=!!active;
+  if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+}
 
 // ── Composer draft persistence ────────────────────────────────────────────────
 
@@ -1895,10 +1908,17 @@ function _appendSessionDuplicateAction(menu, session){
 
 async function _forceGenerateSessionTitle(session){
   if(!session || !session.session_id) return;
+  const sid=session.session_id;
   closeSessionActionMenu();
+  if(_titleRefreshInFlightSids.has(sid)){
+    if(typeof showToast==='function') showToast(t('session_title_already_generating'));
+    renderSessionListFromCache();
+    return;
+  }
+  _setSessionTitleRefreshInFlight(sid,true);
   if(typeof showToast==='function') showToast(t('session_title_generating'));
   try{
-    const res=await api('/api/session/title/refresh',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
+    const res=await api('/api/session/title/refresh',{method:'POST',body:JSON.stringify({session_id:sid}),timeoutMs:120000});
     if(res && res.session){
       const updated=res.session;
       const idx=_allSessions.findIndex(item=>item&&item.session_id===updated.session_id);
@@ -1913,8 +1933,14 @@ async function _forceGenerateSessionTitle(session){
     await renderSessionList();
     if(typeof showToast==='function') showToast(t('session_title_generated'));
   }catch(err){
-    const detail=err&&err.message?err.message:String(err||'');
-    if(typeof showToast==='function') showToast(t('session_title_generate_failed')+detail,3000,'error');
+    if(err&&err.status===409){
+      if(typeof showToast==='function') showToast(t('session_title_already_generating'));
+    }else{
+      const detail=err&&err.message?err.message:String(err||'');
+      if(typeof showToast==='function') showToast(t('session_title_generate_failed')+detail,3000,'error');
+    }
+  }finally{
+    _setSessionTitleRefreshInFlight(sid,false);
   }
 }
 
@@ -3524,8 +3550,9 @@ function renderSessionListFromCache(){
     _rememberRenderedStreamingState(s, isStreaming);
     _rememberRenderedSessionSnapshot(s);
     const hasUnread=_hasUnreadForSession(s)&&!isActive;
+    const isTitleGenerating=_titleRefreshInFlightSids.has(s.session_id)||!!s.title_refresh_inflight;
     const readOnly=_isReadOnlySession(s);
-    el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+(isStreaming?' streaming':'')+(hasUnread?' unread':'');
+    el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+(isStreaming?' streaming':'')+(hasUnread?' unread':'')+(isTitleGenerating?' title-generating':'');
     if(animateRefresh&&(enterAllAnimatedRows||!(flipBefore&&flipBefore.has(s.session_id)))){
       el.classList.add('session-list-flip-enter');
     }
@@ -3594,6 +3621,13 @@ function renderSessionListFromCache(){
     ts.className='session-time'+(hasAttentionState?' is-hidden':'');
     ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);
     titleRow.appendChild(title);
+    if(isTitleGenerating){
+      const status=document.createElement('span');
+      status.className='session-title-status';
+      status.textContent=t('session_title_generating_short');
+      status.title=t('session_title_generating');
+      titleRow.appendChild(status);
+    }
     // Project color dot: placed BETWEEN title and timestamp, not inside the
     // title span. Inside the title span it would be clipped by the ellipsis
     // truncation, becoming invisible exactly when the title is long enough
