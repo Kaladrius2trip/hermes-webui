@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import api.models as models
 import api.routes as routes
+import api.streaming as streaming
 from api.models import SESSIONS, Session
 
 
@@ -16,6 +17,7 @@ def _capture_post(monkeypatch, body):
     captured = {}
     monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
     monkeypatch.setattr(routes, "read_body", lambda _handler: body)
+    monkeypatch.setattr(routes, "_forced_title_context_window", lambda: 1, raising=False)
     monkeypatch.setattr(
         routes,
         "j",
@@ -89,6 +91,86 @@ def test_force_title_route_overwrites_current_title_and_marks_llm_generated(tmp_
     assert saved is not None
     assert saved.title == "Forced Context Menu Titles"
     assert saved.llm_title_generated is True
+
+
+def test_force_title_route_uses_recent_configured_exchange_window(tmp_path, monkeypatch):
+    """Manual title refresh should use the last N exchanges from the title refresh setting."""
+    _isolate_session_store(tmp_path, monkeypatch)
+    messages = [
+        {"role": "user", "content": "Discuss lunch options"},
+        {"role": "assistant", "content": "Pizza or salad would work."},
+        {"role": "user", "content": "Plan WebUI forced title context"},
+        {"role": "assistant", "content": "Use recent configured exchanges."},
+        {"role": "user", "content": "Also prevent stale one-line titles"},
+        {"role": "assistant", "content": "Collect enough recent topic evidence."},
+    ]
+    session = _session(messages=messages)
+    captured = _capture_post(monkeypatch, {"session_id": session.session_id})
+    monkeypatch.setattr(routes, "_forced_title_context_window", lambda: 2)
+    generated = []
+
+    def fake_generate(user_text, assistant_text):
+        generated.append((user_text, assistant_text))
+        return "Recent Context Titles", "llm_aux", ""
+
+    monkeypatch.setattr(routes, "_generate_forced_session_title", fake_generate)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda reason: None)
+
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/title/refresh")) is True
+
+    assert captured["status"] == 200
+    user_context, assistant_context = generated[0]
+    assert "Plan WebUI forced title context" in user_context
+    assert "Also prevent stale one-line titles" in user_context
+    assert "Discuss lunch options" not in user_context
+    assert "Use recent configured exchanges" in assistant_context
+    assert "Collect enough recent topic evidence" in assistant_context
+    assert "Pizza or salad" not in assistant_context
+
+
+def test_adaptive_title_refresh_uses_recent_configured_exchange_window(monkeypatch):
+    """Automatic refresh should pass the same last-N exchange window it uses as cadence."""
+    messages = [
+        {"role": "user", "content": "Old topic one"},
+        {"role": "assistant", "content": "Old answer one"},
+        {"role": "user", "content": "Old topic two"},
+        {"role": "assistant", "content": "Old answer two"},
+        {"role": "user", "content": "Recent title context three"},
+        {"role": "assistant", "content": "Recent answer three"},
+        {"role": "user", "content": "Recent title context four"},
+        {"role": "assistant", "content": "Recent answer four"},
+    ]
+    session = Session(
+        session_id="autotitlewindow",
+        title="Existing LLM Title",
+        messages=messages,
+        llm_title_generated=True,
+    )
+    monkeypatch.setattr(streaming, "_get_title_refresh_interval", lambda: 2)
+    scheduled = {}
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon):
+            scheduled["target"] = target
+            scheduled["args"] = args
+            scheduled["daemon"] = daemon
+
+        def start(self):
+            scheduled["started"] = True
+
+    monkeypatch.setattr(streaming.threading, "Thread", FakeThread)
+
+    streaming._maybe_schedule_title_refresh(session, lambda *_args: None, agent=None)
+
+    assert scheduled["started"] is True
+    user_context = scheduled["args"][1]
+    assistant_context = scheduled["args"][2]
+    assert "Recent title context three" in user_context
+    assert "Recent title context four" in user_context
+    assert "Old topic" not in user_context
+    assert "Recent answer three" in assistant_context
+    assert "Recent answer four" in assistant_context
+    assert "Old answer" not in assistant_context
 
 
 def test_force_title_route_rejects_sessions_without_complete_exchange(tmp_path, monkeypatch):

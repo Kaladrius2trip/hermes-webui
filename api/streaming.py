@@ -1481,26 +1481,57 @@ def _latest_exchange_snippets(messages):
     Walks the message list backwards to find the last user+assistant pair,
     skipping empty or tool-call-only assistant messages.
     """
-    user_text = ''
-    asst_text = ''
+    return _recent_exchange_snippets(messages, 1)
+
+
+def _recent_exchange_snippets(messages, exchange_limit: int = 1):
+    """Return recent complete user/assistant exchanges for title refresh.
+
+    ``exchange_limit`` is the same exchange count used by auto-title cadence.
+    The returned strings stay role-split for the existing title-generation APIs,
+    but include up to the last N complete visible exchanges in chronological
+    order. Incomplete trailing user turns and tool-call-only assistant messages
+    are ignored.
+    """
+    try:
+        limit = int(exchange_limit)
+    except (TypeError, ValueError):
+        limit = 1
+    limit = max(1, min(limit, 20))
+    pairs = []
+    pending_assistant = ''
     for m in reversed(messages or []):
         if not isinstance(m, dict):
             continue
         role = m.get('role')
-        if role == 'assistant' and not asst_text:
+        if role == 'assistant' and not pending_assistant:
             candidate = _message_text(m.get('content'))
             # Skip tool-call-only preambles
             if m.get('tool_calls') and (not candidate or _looks_invalid_generated_title(candidate)):
                 continue
             if candidate:
-                asst_text = candidate
-        elif role == 'user' and not user_text:
+                pending_assistant = candidate
+        elif role == 'user' and pending_assistant:
             candidate = _message_text(m.get('content'))
             if candidate:
-                user_text = candidate
-        if user_text and asst_text:
-            break
-    return user_text[:500], asst_text[:500]
+                pairs.append((candidate, pending_assistant))
+                pending_assistant = ''
+                if len(pairs) >= limit:
+                    break
+    if not pairs:
+        return '', ''
+    pairs.reverse()
+    if len(pairs) == 1:
+        user_text, asst_text = pairs[0]
+        return user_text[:500], asst_text[:500]
+
+    per_message_limit = 500
+    user_parts = []
+    assistant_parts = []
+    for idx, (user_text, asst_text) in enumerate(pairs, 1):
+        user_parts.append(f"User {idx}: {user_text[:per_message_limit]}")
+        assistant_parts.append(f"Assistant {idx}: {asst_text[:per_message_limit]}")
+    return '\n\n'.join(user_parts)[:4000], '\n\n'.join(assistant_parts)[:4000]
 
 
 def _count_exchanges(messages):
@@ -1540,11 +1571,15 @@ def _is_provisional_title(current_title: str, messages) -> bool:
 
 
 def _title_prompts(user_text: str, assistant_text: str) -> tuple[str, list[str]]:
-    qa = f"User question:\n{user_text[:500]}\n\nAssistant answer:\n{assistant_text[:500]}"
+    qa = (
+        f"Recent user context:\n{str(user_text or '').strip()[:4000]}\n\n"
+        f"Recent assistant context:\n{str(assistant_text or '').strip()[:4000]}"
+    )
     prompts = [
         (
-            "Generate a short session title from this conversation start.\n"
-            "Use BOTH the user's question and the assistant's visible answer.\n"
+            "Generate a short session title from this conversation context.\n"
+            "Use BOTH the user's messages and the assistant's visible answers.\n"
+            "Prefer the latest recurring topic when several recent exchanges are present.\n"
             "Return only the title text, 3-8 words, as a topic label.\n"
             "Do not use markdown, bullets, labels, or prefixes like Session Title:.\n"
             "Do not output a full sentence.\n"
@@ -1554,7 +1589,7 @@ def _title_prompts(user_text: str, assistant_text: str) -> tuple[str, list[str]]
             "Good: Title Generation Test, Clarify Dialog Layout, GitHub Issue Triage"
         ),
         (
-            "Rewrite this conversation start as a concise noun-phrase title.\n"
+            "Rewrite this conversation context as a concise noun-phrase title.\n"
             "Use the actual topic, not the task outcome.\n"
             "Return title text only.\n"
             "Do not use markdown, bullets, labels, or prefixes like Session Title:.\n"
@@ -2303,7 +2338,7 @@ def _maybe_schedule_title_refresh(session, put_event, agent):
     exchange_count = _count_exchanges(session.messages)
     if exchange_count <= 0 or exchange_count % refresh_interval != 0:
         return
-    last_u, last_a = _latest_exchange_snippets(session.messages)
+    last_u, last_a = _recent_exchange_snippets(session.messages, refresh_interval)
     if not last_u and not last_a:
         return
     threading.Thread(

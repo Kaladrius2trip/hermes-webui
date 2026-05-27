@@ -1264,6 +1264,21 @@ def _ensure_full_session_before_mutation(sid: str, session):
     return full_session
 
 
+def _forced_title_context_window() -> int:
+    """Return recent exchange window for manual title generation.
+
+    Reuses the adaptive title refresh cadence setting as the manual context
+    window. If auto refresh is disabled, keep legacy one-exchange behavior.
+    """
+    try:
+        from api.streaming import _get_title_refresh_interval
+
+        interval = _get_title_refresh_interval()
+        return interval if interval > 0 else 1
+    except Exception:
+        return 1
+
+
 def _generate_forced_session_title(user_text: str, assistant_text: str):
     """Generate an explicit user-requested session title.
 
@@ -1311,9 +1326,9 @@ def _handle_session_title_refresh(handler, body):
         except KeyError:
             return bad(handler, "Session not found", 404)
 
-        from api.streaming import _latest_exchange_snippets
+        from api.streaming import _recent_exchange_snippets
 
-        user_text, assistant_text = _latest_exchange_snippets(s.messages)
+        user_text, assistant_text = _recent_exchange_snippets(s.messages, _forced_title_context_window())
         if not (user_text and assistant_text):
             return bad(handler, "Need at least one complete user/assistant exchange before generating a title")
 
