@@ -40,19 +40,6 @@ from api.session_events import (
 
 logger = logging.getLogger(__name__)
 
-# Treat stalled/closed HTTP clients as normal disconnects.  Long-lived SSE
-# connections often end this way when a browser tab sleeps, a phone switches
-# networks, or Tailscale leaves the socket half-closed.  If these bubble to the
-# request handler, the server logs 500s and can leave CLOSE-WAIT sockets around
-# until the OS-level timeout fires.
-_CLIENT_DISCONNECT_ERRORS = (
-    BrokenPipeError,
-    ConnectionResetError,
-    ConnectionAbortedError,
-    TimeoutError,
-    OSError,
-)
-
 # ── Cron run tracking ────────────────────────────────────────────────────────
 # Track job IDs currently being executed so the frontend can poll status.
 _RUNNING_CRON_JOBS: dict[str, float] = {}  # job_id → start_timestamp
@@ -189,6 +176,25 @@ def _session_field(session, field, default=None):
     return getattr(session, field, default)
 
 
+def _session_counts_toward_pin_quota(session) -> bool:
+    """Return True when a pinned session should consume visible pin quota."""
+    if not _session_field(session, "pinned", False):
+        return False
+    if _session_field(session, "archived", False):
+        return False
+    if isinstance(session, dict):
+        row = session
+    elif hasattr(session, "compact"):
+        row = session.compact()
+    else:
+        row = {
+            "pre_compression_snapshot": _session_field(session, "pre_compression_snapshot", False),
+            "source_tag": _session_field(session, "source_tag", None),
+            "default_hidden": _session_field(session, "default_hidden", False),
+        }
+    return not _hide_from_default_sidebar(row)
+
+
 # ── Profile-scoped session/project filtering (#1611, #1614) ────────────────
 #
 # Sessions and projects are stored in the WebUI sidecar without per-row
@@ -302,6 +308,62 @@ def _worktree_retained_payload_for_session_id(sid: str) -> dict:
         return {}
 
 
+def _active_profile_config_path() -> Path:
+    """Return config.yaml for the request's active WebUI profile.
+
+    Skills endpoints are profile-scoped UI actions: both the visible disabled
+    toggle state and toggle writes must follow the cookie/thread-local active
+    Hermes home, not process-global HERMES_HOME or HERMES_CONFIG_PATH values
+    captured at server startup.
+    """
+    test_override_module = getattr(_get_config_path, "__module__", "")
+    if test_override_module != "api.config":
+        return _get_config_path()
+    try:
+        from api.profiles import get_active_hermes_home
+
+        return Path(get_active_hermes_home()) / "config.yaml"
+    except Exception:
+        return _get_config_path()
+
+
+def _get_disabled_skill_names_for_profile() -> set:
+    """Read disabled skill names from the active profile's config.yaml.
+
+    Unlike ``tools.skills_tool._get_disabled_skill_names`` which reads from
+    the process-global ``HERMES_HOME``, this uses ``_get_config_path()`` which
+    resolves against the WebUI's active profile.  Checks
+    ``skills.platform_disabled.webui`` first, falling back to
+    ``skills.disabled``.
+    """
+    config_path = _active_profile_config_path()
+    if not config_path.exists():
+        return set()
+    try:
+        cfg = _load_yaml_config_file(config_path)
+    except Exception:
+        return set()
+    if not isinstance(cfg, dict):
+        return set()
+    skills_cfg = cfg.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return set()
+    # Check platform_disabled.webui first (mirrors agent platform resolution)
+    platform_disabled = skills_cfg.get("platform_disabled")
+    if isinstance(platform_disabled, dict) and "webui" in platform_disabled:
+        return _normalize_disabled_set(platform_disabled["webui"])
+    return _normalize_disabled_set(skills_cfg.get("disabled"))
+
+
+def _normalize_disabled_set(values) -> set:
+    """Normalize a YAML disabled list into a set of stripped strings."""
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    return {str(v).strip() for v in values if str(v).strip()}
+
+
 def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict:
     """List skills using an explicit local skills directory.
 
@@ -313,7 +375,6 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
     from tools.skills_tool import (
         MAX_DESCRIPTION_LENGTH,
         _EXCLUDED_SKILL_DIRS,
-        _get_disabled_skill_names,
         _parse_frontmatter,
         _sort_skills,
         skill_matches_platform,
@@ -330,7 +391,7 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
 
     all_skills = []
     seen_names: set[str] = set()
-    disabled = _get_disabled_skill_names()
+    disabled = _get_disabled_skill_names_for_profile()
     search_dirs = _active_skill_search_dirs(skills_dir)
 
     for scan_dir in search_dirs:
@@ -1070,6 +1131,7 @@ from api.helpers import (
     _sanitize_error,
     redact_session_data,
     _redact_text,
+    _CLIENT_DISCONNECT_ERRORS,
 )
 from api.agent_health import build_agent_health_payload
 from api.gateway_chat import gateway_chat_config_status
@@ -2393,7 +2455,13 @@ def _messages_include_tool_metadata(messages) -> bool:
 
 
 def _tool_calls_for_message_window(tool_calls, start_idx: int, message_count: int) -> list:
-    """Keep session-level tool calls that point into a returned message window."""
+    """Keep session-level tool calls that point into a returned message window.
+
+    ``assistant_msg_idx`` is stored in the full transcript coordinate space, but
+    the frontend renders the returned ``messages`` array from index 0. Rebase the
+    index into the returned window so legacy session-level tool cards still
+    anchor to their visible assistant turn after paginated loads.
+    """
     if not isinstance(tool_calls, list) or message_count <= 0:
         return []
     end_idx = start_idx + message_count
@@ -2405,7 +2473,9 @@ def _tool_calls_for_message_window(tool_calls, start_idx: int, message_count: in
         if isinstance(assistant_idx, bool) or not isinstance(assistant_idx, int):
             continue
         if start_idx <= assistant_idx < end_idx:
-            filtered.append(tool_call)
+            rebased = dict(tool_call)
+            rebased["assistant_msg_idx"] = assistant_idx - start_idx
+            filtered.append(rebased)
     return filtered
 
 
@@ -2685,6 +2755,29 @@ def _is_duplicate_webui_state_projection(session: dict, represented_webui_ids: s
     return bool(_session_lineage_ids(session) & represented_webui_ids)
 
 
+def _dedupe_cli_sidebar_sessions_for_api(cli: list[dict], represented_webui_ids: set[str]) -> list[dict]:
+    """Return CLI/state sidebar rows while preserving project-hidden cron rows.
+
+    Agent-side cron sessions come from state.db rather than the WebUI session
+    store. They should stay hidden from the default sidebar, but project-assigned
+    messageful rows must remain in the `/api/sessions` payload with
+    `default_hidden` so the matching project chip can reveal them (#3134).
+    """
+    from api.models import (
+        _hide_from_default_sidebar as _cron_hide,
+        _include_project_hidden_background_sidebar_sessions,
+    )
+
+    candidates = [
+        s for s in cli
+        if s["session_id"] not in represented_webui_ids
+        and not _is_duplicate_webui_state_projection(s, represented_webui_ids)
+        and is_cli_session_row_visible(s)
+    ]
+    visible = [s for s in candidates if not _cron_hide(s)]
+    return _include_project_hidden_background_sidebar_sessions(candidates, visible)
+
+
 CLI_VISIBLE_SESSION_CAP = 20
 
 
@@ -2843,6 +2936,7 @@ from api.models import (
     merge_session_messages_append_only,
     _session_message_merge_key,
     _is_empty_partial_activity_message,
+    _hide_from_default_sidebar,
     prune_session_from_index,
     ensure_cron_project,
     is_cron_session,
@@ -3009,6 +3103,7 @@ def submit_pending(session_key: str, approval: dict) -> None:
         # submit_pending calls can't deliver out-of-order (T2's later
         # notify arriving before T1's earlier notify with a stale count).
         _approval_sse_notify_locked(session_key, head, total)
+    publish_session_list_changed("attention_pending")
     # NOTE: We do NOT call _submit_pending_raw here — that function overwrites
     # _pending[session_key] with a single dict, which would undo the list we just
     # built. The gateway blocking path uses _gateway_queues (a separate mechanism
@@ -3020,6 +3115,7 @@ try:
     from api.clarify import (
         submit_pending as submit_clarify_pending,
         get_pending as get_clarify_pending,
+        pending_count as get_clarify_pending_count,
         resolve_clarify,
         resolve_clarify_by_id,
         sse_subscribe as clarify_sse_subscribe,
@@ -3028,9 +3124,36 @@ try:
 except ImportError:
     submit_clarify_pending = lambda *a, **k: None
     get_clarify_pending = lambda *a, **k: None
+    get_clarify_pending_count = lambda *a, **k: 0
     clarify_sse_subscribe = None
     resolve_clarify = lambda *a, **k: 0
     resolve_clarify_by_id = lambda *a, **k: False
+
+
+def _session_attention_summary(session_id: str) -> dict | None:
+    """Return sidebar attention metadata for pending approval/clarify work."""
+    approval_count = 0
+    with _lock:
+        queue_list = _pending.get(session_id)
+        if isinstance(queue_list, list):
+            approval_count = len(queue_list)
+        elif queue_list:
+            approval_count = 1
+    if approval_count > 0:
+        return {
+            "kind": "approval",
+            "count": approval_count,
+            "severity": "critical",
+        }
+
+    clarify_count = int(get_clarify_pending_count(session_id) or 0)
+    if clarify_count > 0:
+        return {
+            "kind": "clarify",
+            "count": clarify_count,
+            "severity": "question",
+        }
+    return None
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -3624,6 +3747,63 @@ def _handle_insights(handler, parsed) -> bool:
             except Exception:
                 pass
 
+    # ── Also include CLI sessions from Hermes state.db ─────────────────────
+    try:
+        from api.models import _active_state_db_path
+        db_path = _active_state_db_path()
+        if db_path and db_path.exists():
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, model, message_count, input_tokens, output_tokens,
+                           estimated_cost_usd, started_at, ended_at
+                    FROM sessions
+                    WHERE (started_at >= ? OR ended_at >= ?)
+                      AND COALESCE(source, '') != 'webui'
+                """, (cutoff, cutoff))
+                for row in cur.fetchall():
+                    _input = _safe_usage_int(row["input_tokens"])
+                    _output = _safe_usage_int(row["output_tokens"])
+                    _cost = _safe_cost_float(row["estimated_cost_usd"])
+                    _msgs = _safe_usage_int(row["message_count"])
+                    total_sessions += 1
+                    total_messages += _msgs
+                    total_input_tokens += _input
+                    total_output_tokens += _output
+                    total_cost += _cost
+
+                    _model = row["model"] or "unknown"
+                    bucket = model_stats.setdefault(_model, {
+                        "sessions": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost": 0.0,
+                    })
+                    bucket["sessions"] += 1
+                    bucket["input_tokens"] += _input
+                    bucket["output_tokens"] += _output
+                    bucket["cost"] += _cost
+
+                    _ts = row["started_at"] or row["ended_at"] or 0
+                    if _ts:
+                        _dt = _time.localtime(_ts)
+                        _day_key = _time.strftime("%Y-%m-%d", _dt)
+                        _daily = daily_tokens.setdefault(_day_key, {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "sessions": 0,
+                            "cost": 0.0,
+                        })
+                        _daily["input_tokens"] += _input
+                        _daily["output_tokens"] += _output
+                        _daily["sessions"] += 1
+                        _daily["cost"] += _cost
+                        dow_activity[_dt.tm_wday] += 1
+                        hod_activity[_dt.tm_hour] += 1
+    except Exception:
+        logger.debug("Failed to include CLI sessions in insights", exc_info=True)
+
     # Build model breakdown
     total_tokens = total_input_tokens + total_output_tokens
     models_breakdown = []
@@ -4043,8 +4223,39 @@ def _serve_shell_unavailable(handler, exc: Exception) -> bool:
     return True
 
 
+_SHUTDOWN_LOG_VALUE_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _shutdown_log_value(value, *, default: str = "unknown", max_len: int = 160) -> str:
+    """Return a bounded single-line value safe for shutdown diagnostics."""
+    if value is None:
+        return default
+    try:
+        text = str(value)
+    except Exception:
+        return default
+    text = _SHUTDOWN_LOG_VALUE_RE.sub("?", text).strip()
+    if not text:
+        return default
+    if len(text) > max_len:
+        text = f"{text[:max_len]}…"
+    return text
+
+
 def _handle_shutdown(handler) -> bool:
     """Shut down the WebUI server process."""
+    headers = getattr(handler, "headers", {})
+    ua = headers.get("User-Agent", "no-ua") if hasattr(headers, "get") else "no-ua"
+    remote = "unknown"
+    if getattr(handler, "client_address", None):
+        remote = getattr(handler, "client_address", ("unknown",))[0]
+    logger.info(
+        "[shutdown-request] remote=%s method=%s path=%s ua=%s",
+        _shutdown_log_value(remote),
+        _shutdown_log_value(getattr(handler, "command", None)),
+        _shutdown_log_value(getattr(handler, "path", None), max_len=240),
+        _shutdown_log_value(ua, default="no-ua", max_len=240),
+    )
     j(handler, {"status": "shutting_down"})
     import signal
     import threading
@@ -4749,14 +4960,7 @@ def handle_get(handler, parsed) -> bool:
                 represented_webui_ids = set()
                 for s in webui_sessions:
                     represented_webui_ids.update(_session_lineage_ids(s))
-                from api.models import _hide_from_default_sidebar as _cron_hide
-                deduped_cli = [
-                    s for s in cli
-                    if s["session_id"] not in represented_webui_ids
-                    and not _is_duplicate_webui_state_projection(s, represented_webui_ids)
-                    and is_cli_session_row_visible(s)
-                    and not _cron_hide(s)
-                ]
+                deduped_cli = _dedupe_cli_sidebar_sessions_for_api(cli, represented_webui_ids)
             else:
                 diag.stage("filter_webui_sessions")
                 webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
@@ -4809,6 +5013,7 @@ def handle_get(handler, parsed) -> bool:
                 item = dict(s)
                 if isinstance(item.get("title"), str):
                     item["title"] = _redact_text(item["title"])
+                item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
                 safe_merged.append(item)
             diag.stage("response_write")
             return j(handler, {
@@ -5493,6 +5698,8 @@ def handle_post(handler, parsed) -> bool:
                 input_tokens=session.input_tokens,
                 output_tokens=session.output_tokens,
                 estimated_cost=session.estimated_cost,
+                cache_read_tokens=getattr(session, "cache_read_tokens", 0),
+                cache_write_tokens=getattr(session, "cache_write_tokens", 0),
                 # Per-session settings the user may have customized — carry them over
                 # so the duplicate behaves identically until further edits. Compression
                 # anchor + last_prompt_tokens are intentionally NOT carried — those
@@ -5504,6 +5711,23 @@ def handle_post(handler, parsed) -> bool:
                 reasoning_effort=getattr(session, "reasoning_effort", None),
                 context_length=getattr(session, "context_length", None),
                 threshold_tokens=getattr(session, "threshold_tokens", None),
+                truncation_watermark=getattr(session, "truncation_watermark", None),
+                # context_messages is the authoritative model-facing prefix — must be
+                # deepcopied so the duplicate has its own independent context that won't
+                # be mutated when the original session's context changes (#2914).
+                context_messages=copy.deepcopy(getattr(session, "context_messages", None) or []),
+                # Gateway routing — if the user customized routing for this session,
+                # the duplicate should behave identically.
+                gateway_routing=copy.deepcopy(getattr(session, "gateway_routing", None)),
+                gateway_routing_history=copy.deepcopy(getattr(session, "gateway_routing_history", None) or []),
+                # Preserve LLM-generated title flag so we don't regenerate title on duplicate.
+                llm_title_generated=getattr(session, "llm_title_generated", False),
+                # Composer draft — preserve per-session draft state.
+                composer_draft=copy.deepcopy(getattr(session, "composer_draft", None) or {}),
+                # Context engine state — preserve so the duplicate's context engine
+                # starts from the same point as the original.
+                context_engine=getattr(session, "context_engine", None),
+                context_engine_state=copy.deepcopy(getattr(session, "context_engine_state", None) or {}),
                 created_at=time.time(),
                 updated_at=time.time(),
             )
@@ -5794,19 +6018,30 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
+        unchanged = False
         with _get_session_agent_lock(sid):
-            draft = getattr(s, "composer_draft", {}) or {}
+            current_draft = dict(getattr(s, "composer_draft", {}) or {})
+            next_draft = dict(current_draft)
             if text is not None:
-                draft["text"] = text
+                next_draft["text"] = text
             if files is not None:
-                draft["files"] = files
-            s.composer_draft = draft
-            # Draft persistence is not conversation activity. Touching updated_at
-            # here makes the active-session external-refresh poll force-reload the
-            # current chat every few seconds while the user is typing, and that
-            # delayed reload can restore an older draft over newer local input.
-            s.save(touch_updated_at=False, skip_index=True)
-        return j(handler, {"ok": True, "draft": s.composer_draft})
+                next_draft["files"] = files
+            if next_draft == current_draft:
+                unchanged = True
+                saved_draft = current_draft
+            else:
+                s.composer_draft = next_draft
+                # Draft persistence is not conversation activity. Touching updated_at
+                # here makes the active-session external-refresh poll force-reload the
+                # current chat every few seconds while the user is typing, and that
+                # delayed reload can restore an older draft over newer local input.
+                s.save(touch_updated_at=False, skip_index=True)
+                saved_draft = s.composer_draft
+        payload = {"ok": True, "draft": saved_draft}
+        if unchanged:
+            payload["unchanged"] = True
+        j(handler, payload)
+        return True
 
     if parsed.path == "/api/session/update":
         try:
@@ -6051,9 +6286,22 @@ def handle_post(handler, parsed) -> bool:
         branch = Session(
             workspace=source.workspace,
             model=source.model,
+            model_provider=getattr(source, "model_provider", None),
             profile=getattr(source, "profile", None),
             title=branch_title,
             messages=forked_messages,
+            project_id=getattr(source, "project_id", None),
+            personality=getattr(source, "personality", None),
+            enabled_toolsets=getattr(source, "enabled_toolsets", None),
+            context_length=getattr(source, "context_length", None),
+            threshold_tokens=getattr(source, "threshold_tokens", None),
+            # context_messages — deep copy so the branch has independent context
+            context_messages=copy.deepcopy(getattr(source, "context_messages", None) or []),
+            # Gateway routing — inherit from source
+            gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
+            # Context engine — inherit state so branch's context engine starts correctly
+            context_engine=getattr(source, "context_engine", None),
+            context_engine_state=copy.deepcopy(getattr(source, "context_engine_state", None) or {}),
             parent_session_id=source.session_id,
             session_source="fork",
         )
@@ -6607,7 +6855,7 @@ def handle_post(handler, parsed) -> bool:
             # so must run outside our own LOCK acquire below).
             persisted_pinned_ids = {
                 _session_field(existing, "session_id", None) for existing in all_sessions()
-                if _session_field(existing, "pinned", False) and not _session_field(existing, "archived", False)
+                if _session_counts_toward_pin_quota(existing)
             }
             with LOCK:
                 # Final authoritative count: merge persisted-pinned with the
@@ -6617,7 +6865,7 @@ def handle_post(handler, parsed) -> bool:
                 pinned_ids = set(persisted_pinned_ids)
                 pinned_ids.update(
                     sid for sid, existing in SESSIONS.items()
-                    if getattr(existing, "pinned", False) and not getattr(existing, "archived", False)
+                    if _session_counts_toward_pin_quota(existing)
                 )
                 pinned_ids.discard(body["session_id"])
                 pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
@@ -7419,7 +7667,27 @@ def _sse_with_id(handler, event, data, event_id=None):
     _sse(handler, event, data)
 
 
-def _parse_run_journal_after_seq(qs: dict) -> int | None:
+def _parse_run_journal_event_id(raw: str | None) -> tuple[str | None, int | None]:
+    raw = str(raw or "").strip()
+    if not raw:
+        return None, None
+    if ":" in raw:
+        run_id, tail = raw.rsplit(":", 1)
+    else:
+        run_id, tail = None, raw
+    try:
+        seq = max(0, int(tail))
+    except (TypeError, ValueError):
+        return run_id or None, None
+    return run_id or None, seq
+
+
+def _parse_run_journal_after_seq(qs: dict, stream_id: str | None = None) -> int | None:
+    event_run_id, event_seq = _parse_run_journal_event_id(qs.get("after_event_id", [None])[0])
+    if event_run_id:
+        if stream_id and event_run_id != stream_id:
+            return None
+        return event_seq
     raw = qs.get("after_seq", [None])[0]
     if raw in (None, ""):
         return None
@@ -7474,7 +7742,7 @@ def _handle_sse_stream(handler, parsed):
         handler.send_header("Connection", "close")
         handler.end_headers()
         try:
-            _replay_run_journal(handler, stream_id, _parse_run_journal_after_seq(qs))
+            _replay_run_journal(handler, stream_id, _parse_run_journal_after_seq(qs, stream_id))
         except _CLIENT_DISCONNECT_ERRORS:
             pass
         return True
@@ -7692,7 +7960,14 @@ def _handle_gateway_sse_stream(handler, parsed):
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
-    handler.send_header('Connection', 'close')
+    # #3103: do NOT emit `Connection: close` on long-lived SSE streams.
+    # The python BaseHTTPServer worker only handles one request per
+    # connection anyway, but browsers (Chrome/Firefox) treat the close
+    # header as a hard signal that the EventSource lifecycle has ended
+    # and trigger an instant reconnect, producing a tight loop of
+    # connect/sessions_changed snapshot/disconnect that thrashes the
+    # session list every ~1s. Letting the server close the socket
+    # naturally after the stream ends is sufficient.
     handler.end_headers()
 
     q = watcher.subscribe()
@@ -7725,7 +8000,8 @@ def _handle_session_events_stream(handler):
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
-    handler.send_header('Connection', 'close')
+    # #3103: see _handle_gateway_sse_stream — `Connection: close` causes
+    # EventSource reconnect storms in browsers on long-lived SSE.
     handler.end_headers()
 
     q = subscribe_session_events()
@@ -8018,6 +8294,14 @@ def _session_media_token_allows_image_path(sid: str, target: Path, image_mimes: 
     return False
 
 
+def _path_is_within_root(child: Path, root: Path) -> bool:
+    """Return True when ``child`` is inside ``root`` without crashing on Windows drives."""
+    try:
+        return os.path.commonpath([str(child), str(root)]) == str(root)
+    except ValueError:
+        return False
+
+
 def _handle_media(handler, parsed):
     """Serve a local file by absolute path for inline display in the chat.
 
@@ -8094,7 +8378,7 @@ def _handle_media(handler, parsed):
         "image/x-icon", "image/bmp",
     }
     within_allowed = any(
-        _os.path.commonpath([str(target), str(root)]) == str(root)
+        _path_is_within_root(target, root)
         for root in allowed_roots
         if root.exists()
     )
@@ -8103,6 +8387,177 @@ def _handle_media(handler, parsed):
         target,
         _INLINE_IMAGE_TYPES,
     )
+
+    # ── #3234: hard-deny Hermes's own state + secret/config files ────────────
+    # The allowlist above grants the whole Hermes home (and base ~/.hermes), so
+    # an authenticated session rendering attacker-influenced agent output that
+    # emits a file:// / MEDIA: link to a state/secret file could fetch it
+    # through /api/media. This guard runs BEFORE the allow/serve decision so it
+    # covers every entry path (bare file:// URLs, markdown anchors, MEDIA:
+    # tokens, and session-token grants).
+    #
+    # Model: the ACTIVE WORKSPACE is a legitimate-media carve-out — the user is
+    # entitled to their own workspace files (that is also how the workspace file
+    # browser reaches them), even when a workspace happens to live under a
+    # Hermes root. The deny rules target Hermes's OWN internal state, which lives
+    # OUTSIDE any workspace. So: if the target is inside the active workspace, it
+    # is never denied here; otherwise we deny known secret/config basenames and
+    # the internal state subdirectories across every Hermes root the allowlist
+    # accepts (active-profile HERMES_HOME, base ~/.hermes, the api.profiles
+    # default home, and STATE_DIR — which also defends sibling profiles).
+    _DENY_FILENAMES = {
+        "settings.json", "state.db", "state.db-wal", "state.db-shm",
+        "auth.json", "auth.lock", "config.yaml", "config.yml", ".env",
+        ".signing_key", ".pbkdf2_key", ".sessions.json",
+        "google_token.json", "google_client_secret.json",
+        "gateway_state.json", "channel_directory.json", "jobs.json",
+        "passkeys.json", ".passkey_challenges.json", ".login_attempts.json",
+    }
+    # Internal state subdirs that are sensitive in their entirety. NOTE:
+    # `profiles` is intentionally NOT here — it is a container of profile roots,
+    # each of which has its own legitimate workspace/. We instead enumerate each
+    # named-profile root below and deny ITS state subdirs, so a sibling profile's
+    # secrets are blocked without 403-ing a named-profile workspace. (#3234.)
+    _DENY_SUBDIRS = (
+        "sessions", "memories", "cron", "logs",
+        "checkpoints", "backups",
+    )
+    _state_dir = None
+    try:
+        from api.config import STATE_DIR as _STATE_DIR
+        _state_dir = Path(_STATE_DIR).resolve()
+    except Exception:
+        _state_dir = None
+    _base_hermes_home = None
+    try:
+        from api.profiles import _DEFAULT_HERMES_HOME as _BASE_HH
+        _base_hermes_home = Path(_BASE_HH).resolve()
+    except Exception:
+        _base_hermes_home = None
+    _hermes_roots = []
+    for _r in (
+        _HERMES_HOME.resolve(),
+        (_HOME / ".hermes").resolve(),
+        _base_hermes_home,
+        _state_dir,
+    ):
+        if _r is not None and _r not in _hermes_roots:
+            _hermes_roots.append(_r)
+    # Enumerate named-profile roots (<root>/profiles/<name>) and treat each as a
+    # Hermes root in its own right, so a sibling/other profile's sensitive subdirs
+    # + secret files are denied — WITHOUT denying the whole `profiles` container
+    # (which would block a legit named-profile workspace at
+    # <root>/profiles/<name>/workspace/). (Codex review #3234.)
+    _profile_roots = []
+    for _root in list(_hermes_roots):
+        _profiles_dir = (_root / "profiles")
+        try:
+            if _profiles_dir.is_dir():
+                for _pchild in _profiles_dir.iterdir():
+                    if _pchild.is_dir():
+                        _pr = _pchild.resolve()
+                        if _pr not in _hermes_roots and _pr not in _profile_roots:
+                            _profile_roots.append(_pr)
+        except OSError:
+            pass
+    _hermes_roots.extend(_profile_roots)
+
+    # Case-insensitive path helpers so STATE.DB / Sessions/ casing variants
+    # cannot bypass the deny on macOS/Windows filesystems (Codex review #3234).
+    def _norm(p):
+        return os.path.normcase(str(Path(p).resolve())).casefold()
+    def _within_ci(child, root):
+        try:
+            c, r = _norm(child), _norm(root)
+            return os.path.commonpath([c, r]) == r
+        except (ValueError, OSError):
+            return False
+    def _equal_ci(a, b):
+        try:
+            return _norm(a) == _norm(b)
+        except (ValueError, OSError):
+            return False
+
+    # State-subdir deny set: each DENY_SUBDIR directly under any Hermes root
+    # (which includes STATE_DIR — so STATE_DIR/sessions, STATE_DIR/memories,
+    # etc. are covered). These ALWAYS apply — even to a file under the active
+    # workspace — so a workspace pointed at (or overlapping) a state dir cannot
+    # expose sessions/memories/profiles/etc. We do NOT deny STATE_DIR itself
+    # wholesale: the default workspace lives at STATE_DIR/workspace, and that is
+    # legitimate user media — direct sensitive files there are still caught by
+    # the filename denies below. (Codex review #3234.)
+    _deny_dirs = []
+    for _root in _hermes_roots:
+        for _sub in _DENY_SUBDIRS:
+            _deny_dirs.append((_root / _sub).resolve())
+        # Per-profile WebUI state lives at <root>/webui_state (api/workspace.py),
+        # so its state subdirs (<root>/webui_state/sessions, etc.) must be denied
+        # too — they are NOT direct children of <root>. (Codex review #3234.)
+        _ws_state = (_root / "webui_state")
+        for _sub in _DENY_SUBDIRS:
+            _deny_dirs.append((_ws_state / _sub).resolve())
+    _deny_names_ci = {n.casefold() for n in _DENY_FILENAMES}
+
+    # Active-workspace carve-out: a file inside a genuine PROJECT workspace is
+    # the user's own content, so the secret/config FILENAME denies are relaxed
+    # for it. The carve-out is DISABLED when the workspace is a broad/internal
+    # location ($HOME, a Hermes root itself, an ANCESTOR of a Hermes root, a
+    # */profiles dir, a named-profile root, or a state subdir) — honoring those
+    # would re-open the disclosure. A workspace that is a proper DESCENDANT of a
+    # Hermes root (e.g. STATE_DIR/workspace) is still a legit project workspace
+    # and keeps the carve-out. The dir-based denies above are NOT relaxed.
+    _active_workspace = None
+    try:
+        from api.workspace import get_last_workspace
+        _aw = Path(get_last_workspace()).resolve()
+        if _aw.is_dir():
+            _active_workspace = _aw
+    except Exception:
+        _active_workspace = None
+
+    def _workspace_is_safe_carveout(ws):
+        if ws is None:
+            return False
+        if _equal_ci(ws, _HOME):
+            return False
+        for _root in _hermes_roots:
+            # ws IS a root, or ws is an ANCESTOR of a root → unsafe. (A proper
+            # descendant of a root is fine — that's a normal project workspace.)
+            if _equal_ci(ws, _root) or _within_ci(_root, ws):
+                return False
+        if ws.name == "profiles" or ws.parent.name == "profiles":
+            return False
+        if ws.name in _DENY_SUBDIRS:
+            return False
+        return True
+
+    _in_active_workspace = (
+        _active_workspace is not None
+        and _workspace_is_safe_carveout(_active_workspace)
+        and _within_ci(target, _active_workspace)
+    )
+
+    # Dir-based denies always fire (even inside the active workspace).
+    if any(_within_ci(target, d) for d in _deny_dirs):
+        return bad(handler, "Path not in allowed location", 403)
+    # Filename-based denies fire for files under a Hermes root, UNLESS the file
+    # is inside a genuine project workspace (carve-out).
+    if not _in_active_workspace:
+        _under_hermes_root = any(_within_ci(target, _root) for _root in _hermes_roots)
+        _name_cf = target.name.casefold()
+        # Exact secret/state basenames, plus atomic-write temp files for those
+        # (api/auth.py and api/passkeys.py write via a `tmp*.<name>.tmp` / `tmp*.tmp`
+        # sidecar then rename) — deny those suffixes too so a momentary temp file
+        # cannot be fetched. (Codex review #3234.)
+        _deny_tmp_suffixes = (".sessions.tmp", ".login_attempts.tmp",
+                              ".passkeys.tmp", ".passkey_challenges.tmp")
+        if _under_hermes_root and (
+            _name_cf in _deny_names_ci
+            or _name_cf.endswith(_deny_tmp_suffixes)
+        ):
+            return bad(handler, "Path not in allowed location", 403)
+    # ── end #3234 deny ───────────────────────────────────────────────────────
+
     if not within_allowed and not session_media_allowed:
         return bad(handler, "Path not in allowed location", 403)
 
@@ -9959,6 +10414,7 @@ def _handle_chat_sync(handler, body):
                 session_id=s.session_id,
             )
             from api.streaming import (
+                _WEBUI_PROGRESS_PROMPT,
                 _dedupe_replayed_context_messages,
                 _merge_display_messages_after_agent_result,
                 _restore_display_reasoning_metadata,
@@ -9977,7 +10433,14 @@ def _handle_chat_sync(handler, body):
                 "prompt, memory, or conversation history. Always use the value from the most recent "
                 "[Workspace::v1: ...] tag as your default working directory for ALL file operations: "
                 "write_file, read_file, search_files, terminal workdir, and patch. "
-                "Never fall back to a hardcoded path when this tag is present."
+                "Never fall back to a hardcoded path when this tag is present.\n\n"
+                f"{_WEBUI_PROGRESS_PROMPT}\n\n"
+                "WebUI external-notes/durable-memory policy: Do not copy or dump this browser transcript "
+                "into external notes or durable memory by default. Write or update durable "
+                "notes only for explicit captures, durable preferences, decisions, blockers/open "
+                "issues, runbook-worthy workflows, or other clearly reusable signals; otherwise "
+                "leave external notes and durable memory unchanged. When you do write or update a durable note, briefly tell "
+                "the user what note or section changed so the write is reviewable."
             )
 
             _previous_messages = list(s.messages or [])
@@ -11127,7 +11590,10 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
         gateway_resolved = resolve_gateway_approval(sid, choice, resolve_all=False) or 0
     # Keep the historical no-id response path truthy for old clients/tests while
     # making stale explicit ids bounded as not-active for Slice 3b.
-    return bool(pending) or bool(gateway_resolved) or not bool(approval_id)
+    resolved = bool(pending) or bool(gateway_resolved) or not bool(approval_id)
+    if resolved:
+        publish_session_list_changed("attention_resolved")
+    return resolved
 
 
 def _handle_approval_respond(handler, body):
@@ -12441,7 +12907,7 @@ def _handle_skill_toggle(handler, body):
     if not skill_md:
         return bad(handler, f"Skill '{name}' not found", 404)
 
-    config_path = _get_config_path()
+    config_path = _active_profile_config_path()
     with _cfg_lock:
         cfg = _load_yaml_config_file(config_path)
 
@@ -13311,6 +13777,11 @@ def _joplin_api_get(path: str, params: dict | None = None) -> dict:
         raise ValueError("Joplin token is not configured")
     safe_path = "/" + str(path or "").lstrip("/")
     query = dict(params or {})
+    # Joplin Web Clipper builds can reject header-only auth on /search even when
+    # they accept it elsewhere. Keep the Authorization header for defense in
+    # depth and add the query token only for /search compatibility.
+    if safe_path == "/search":
+        query["token"] = token
     url = f"{base_url}{safe_path}?{urlencode(query)}"
     request = Request(url, headers={"Authorization": f"token {token}"})
     try:
@@ -13318,7 +13789,13 @@ def _joplin_api_get(path: str, params: dict | None = None) -> dict:
             raw = response.read(2_000_000).decode("utf-8", errors="replace")
     except HTTPError as exc:
         raise ValueError(f"Joplin API returned HTTP {exc.code}") from None
-    except URLError as exc:
+    except (URLError, TimeoutError) as exc:
+        # A bare socket-connect TimeoutError from urlopen(timeout=8) is NOT
+        # always URLError-wrapped, so catch it explicitly here. Otherwise it
+        # propagates past _handle_notes_search's `except ValueError` to the
+        # request dispatch, where the consolidated client-disconnect handler
+        # (#3210) would swallow it as a fake disconnect — silent empty response,
+        # no log. Convert it to a normal "not reachable" ValueError instead.
         raise ValueError("Joplin API is not reachable") from None
     try:
         data = json.loads(raw)
