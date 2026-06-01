@@ -1002,7 +1002,7 @@ def _run_cron_tracked(job, profile_home=None, execution_profile_home=None):
     except Exception as e:
         logger.exception("Manual cron run failed for job %s", job_id)
         try:
-            _with_cron_home(profile_home, lambda: mark_job_run(job_id, False, str(e)))
+            _with_cron_home(profile_home, lambda: mark_job_run(job_id, False, str(e)))  # noqa: F821  e is bound by the enclosing `except ... as e` and the lambda runs synchronously here
         except Exception:
             logger.debug("Failed to mark manual cron run failure for %s", job_id)
     finally:
@@ -1941,6 +1941,70 @@ def _split_provider_qualified_model(model: str) -> tuple[str, str | None]:
     return model, None
 
 
+def _model_matches_configured_default(
+    session_model: str | None,
+    cfg_default: str | None,
+    provider: str | None = None,
+) -> bool:
+    """Return True when ``session_model`` refers to the configured ``model.default``.
+
+    The global ``model.context_length`` cap applies ONLY to the default model
+    (#3256/#3263). An exact string compare is not enough because ``model.default``
+    and the session model can be stored in different but equivalent shapes:
+      - bare:            ``claude-opus-4.8``
+      - slash-prefixed:  ``anthropic/claude-opus-4.8``  (OpenRouter-style)
+      - @provider:model: ``@anthropic:claude-opus-4.8``
+
+    Matching rule (correct in both directions):
+      1. Identical strings → match.
+      2. Otherwise compare BARE model ids — BUT only after a provider-compatibility
+         check: if BOTH sides carry an identifiable provider (from a ``provider/``
+         prefix, an ``@provider:`` qualifier, or the explicit ``provider`` arg for
+         the session side) and those providers DIFFER, it is NOT a match. This
+         stops a non-default model on a different provider that happens to share a
+         bare name (``openai/gpt-4o`` vs default ``openrouter/gpt-4o``) from being
+         treated as the default and wrongly receiving its cap.
+      3. When a provider can't be identified on one side, fall through to the bare
+         comparison (lenient-when-unknown — a bare default config still matches a
+         bare/prefixed session model).
+    Empty default → no match.
+    """
+    sess = str(session_model or "").strip()
+    default = str(cfg_default or "").strip()
+    if not sess or not default:
+        return False
+    if sess == default:
+        return True
+
+    def _split(value: str) -> tuple[str, str | None]:
+        """Return (bare_model, provider_or_None) for any of the 3 shapes."""
+        value = str(value or "").strip()
+        # @provider:model
+        unq, q_prov = _split_provider_qualified_model(value)
+        if q_prov:
+            return unq.strip(), str(q_prov).strip().lower()
+        # provider/model (single leading slash segment)
+        if "/" in value:
+            prefix, rest = value.split("/", 1)
+            return rest.strip(), prefix.strip().lower()
+        return value, None
+
+    sess_bare, sess_prov = _split(sess)
+    default_bare, default_prov = _split(default)
+    # The explicit provider arg is the session side's provider when the model
+    # string itself didn't carry one.
+    if not sess_prov and provider:
+        sess_prov = str(provider).strip().lower() or None
+
+    if not sess_bare or not default_bare or sess_bare != default_bare:
+        return False
+    # Bare ids match. Reject only when both sides name DIFFERENT providers.
+    if sess_prov and default_prov and sess_prov != default_prov:
+        return False
+    return True
+
+
+
 def _should_attach_codex_provider_context(model: str, raw_active_provider: str, catalog: dict) -> bool:
     """Return True when a bare Codex model needs separate provider context.
 
@@ -2236,8 +2300,16 @@ def _resolve_context_length_for_session_model(
         try:
             _model_cfg_load = _cfg_for_cl.get('model', {}) if isinstance(_cfg_for_cl, dict) else {}
             if isinstance(_model_cfg_load, dict):
+                # Only apply the global model.context_length override when the
+                # session model matches model.default. Otherwise a global cap
+                # set for the default model (e.g. 232000) silently clobbers
+                # other models' real metadata (e.g. a 1M-context variant).
+                _cfg_default_model = str(_model_cfg_load.get('default') or '').strip()
                 _raw_cfg_ctx_load = _model_cfg_load.get('context_length')
-                if _raw_cfg_ctx_load is not None:
+                if _raw_cfg_ctx_load is not None and (
+                    not _cfg_default_model
+                    or _model_matches_configured_default(model_for_lookup, _cfg_default_model, provider)
+                ):
                     try:
                         _parsed_load = int(_raw_cfg_ctx_load)
                         if _parsed_load > 0:
@@ -5441,9 +5513,29 @@ def handle_get(handler, parsed) -> bool:
         elif alive is False:
             running = False
             configured = True
-        else:  # alive is None → gateway not configured / unavailable
+        else:  # alive is None
+            # `alive is None` conflates two very different states:
+            #   (a) no gateway metadata at all → genuinely not configured
+            #   (b) gateway metadata EXISTS but is stale/inconclusive.
+            # A stale-but-RUNNING gateway (freshly started, hasn't ticked
+            # `updated_at` yet, or cross-container) still proves the gateway is
+            # *configured* — the banner must not report "Gateway not configured"
+            # just because no conversation has happened yet and identity_map is
+            # empty (#3194).
+            #
+            # A stale-STOPPED gateway is deliberately NOT treated as configured:
+            # agent_health emits `gateway_stale_stopped_state` precisely so a
+            # stopped service the user isn't running reads like "no root gateway
+            # configured" rather than nagging (#1944). So stale-stopped falls
+            # through to the identity_map signal like the genuinely-unconfigured
+            # case.
+            details = health.get("details") or {}
+            gateway_running_metadata = (
+                details.get("reason") == "gateway_stale_running_state"
+                or details.get("gateway_state") == "running"
+            )
+            configured = True if gateway_running_metadata else bool(identity_map)
             running = bool(identity_map)
-            configured = bool(identity_map)
 
         platforms_set: set[str] = set()
         for meta in identity_map.values():
@@ -7724,11 +7816,106 @@ def _replay_run_journal(handler, stream_id: str, after_seq: int | None) -> bool:
     return True
 
 
+def _runner_stream_cursor_from_query(qs: dict) -> str | None:
+    cursor = str(qs.get("cursor", [""])[0] or "").strip()
+    if cursor:
+        return cursor
+    after_seq = _parse_run_journal_after_seq(qs)
+    return str(after_seq) if after_seq is not None else None
+
+
+def _runner_event_name(entry: dict) -> str:
+    return str(entry.get("event") or entry.get("type") or "message")
+
+
+def _runner_event_payload(entry: dict):
+    if "payload" in entry:
+        return entry.get("payload")
+    if "data" in entry:
+        return entry.get("data")
+    return entry
+
+
+def _runner_event_id(run_id: str, entry: dict) -> str | None:
+    event_id = entry.get("event_id") or entry.get("id")
+    if event_id:
+        return str(event_id)
+    seq = entry.get("seq")
+    if seq not in (None, ""):
+        return f"{run_id}:{seq}"
+    return None
+
+
+def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -> bool:
+    """Stream events from a configured runner without WebUI-owned runtime maps."""
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return False
+    try:
+        from api.runtime_adapter import build_runtime_adapter, runtime_adapter_runner_enabled
+
+        if not runtime_adapter_runner_enabled():
+            return False
+        adapter = build_runtime_adapter(runner_client_factory=_runtime_runner_client_factory)
+    except NotImplementedError:
+        return False
+    if adapter is None:
+        return False
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    cursor_value = cursor
+    try:
+        while True:
+            try:
+                event_stream = adapter.observe_run(run_id, cursor=cursor_value)
+            except Exception as exc:
+                _sse(handler, "error", {"error": _sanitize_error(exc)})
+                break
+            emitted = False
+            terminal = False
+            for entry in list(getattr(event_stream, "events", []) or []):
+                if not isinstance(entry, dict):
+                    continue
+                event = _runner_event_name(entry)
+                _sse_with_id(handler, event, _runner_event_payload(entry), _runner_event_id(run_id, entry))
+                emitted = True
+                if event in ("stream_end", "error", "cancel"):
+                    terminal = True
+            next_cursor = getattr(event_stream, "cursor", None)
+            if next_cursor not in (None, ""):
+                cursor_value = str(next_cursor)
+            if terminal:
+                break
+            if not emitted:
+                status = None
+                try:
+                    status = adapter.get_run(run_id)
+                except Exception:
+                    status = None
+                state = str(getattr(status, "terminal_state", None) or getattr(status, "status", "") or "").lower()
+                if state in ("completed", "complete", "failed", "error", "cancelled", "canceled"):
+                    _sse(handler, "stream_end", {"run_id": run_id, "status": state})
+                    break
+                handler.wfile.write(b": heartbeat\n\n")
+                handler.wfile.flush()
+                time.sleep(_SSE_HEARTBEAT_INTERVAL_SECONDS)
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass
+    return True
+
+
 def _handle_sse_stream(handler, parsed):
     qs = parse_qs(parsed.query)
     stream_id = qs.get("stream_id", [""])[0]
     stream = STREAMS.get(stream_id)
     if stream is None:
+        if _stream_runner_run_events(handler, stream_id, _runner_stream_cursor_from_query(qs)):
+            return True
         try:
             journal_available = bool(find_run_summary(stream_id)) if stream_id else False
         except Exception:
@@ -8794,10 +8981,11 @@ def _handle_file_raw(handler, parsed):
     # CSP sandbox directive applies the same isolation server-side: without
     # allow-same-origin, the document is treated as a unique opaque origin and
     # cannot read WebUI cookies, localStorage, or postMessage to the parent.
-    csp = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox" if html_inline_ok else None
+    sandbox_csp = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"
+    csp = sandbox_csp if (inline_preview and not force_download and disposition == "inline") else None
     # _serve_file_bytes sends Content-Security-Policy when csp is set.
     if html_inline_ok:
-        return _serve_inline_html_preview(handler, target, "no-store", csp=csp)
+        return _serve_inline_html_preview(handler, target, "no-store", csp=sandbox_csp)
     return _serve_file_bytes(handler, target, mime, disposition, "no-store", csp=csp)
 
 
@@ -9980,15 +10168,20 @@ def _start_chat_stream_for_session(
 
 
 def _runtime_runner_client_factory():
-    """Return the runner-local client when a supervised backend exists.
+    """Return the configured runner-local client.
 
-    Slice 4d wires the `/api/chat/start` selection point without silently falling
-    back to the legacy in-process runtime when `runner-local` is explicitly
-    requested. The supervised runner backend itself is intentionally not created
-    in this helper yet; a later slice can replace this factory with the concrete
-    client while keeping the route contract stable.
+    `runner-local` remains default-off and bounded: without an explicit runner
+    endpoint this factory preserves the existing "runner-local chat backend is
+    not configured" 501 path. When
+    `HERMES_WEBUI_RUNNER_BASE_URL` is set, the WebUI process only acts as a
+    transport client; the runner endpoint owns execution, run ids, replay, and
+    controls.
     """
-    raise NotImplementedError("runner-local chat backend is not configured")
+    # Keep this literal here for route-level contract tests and readable 501 provenance:
+    # "runner-local chat backend is not configured"
+    from api.runner_client import HttpRunnerClient
+
+    return HttpRunnerClient.from_env()
 
 
 def _chat_start_response_from_run_start(result):

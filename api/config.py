@@ -26,22 +26,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # ── Basic layout ──────────────────────────────────────────────────────────────
-HOME = Path.home()
+import api.paths as _paths
+
+HOME = _paths.HOME
+_hermes_home_has_webui_state = _paths._hermes_home_has_webui_state
+_platform_default_hermes_home = _paths._platform_default_hermes_home
+
 # REPO_ROOT is the directory that contains this file's parent (api/ -> repo root)
 REPO_ROOT = Path(__file__).parent.parent.resolve()
-
-
-def _platform_default_hermes_home() -> Path:
-    """Return the platform-aware default Hermes home when HERMES_HOME is unset.
-
-    Native Windows Hermes Agent installs default to %LOCALAPPDATA%\\hermes,
-    while POSIX installs use ~/.hermes.
-    """
-    if os.name == "nt":
-        local_app_data = os.getenv("LOCALAPPDATA", "").strip()
-        if local_app_data:
-            return Path(local_app_data) / "hermes"
-    return HOME / ".hermes"
 
 # ── Network config (env-overridable) ─────────────────────────────────────────
 HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
@@ -2527,7 +2519,7 @@ _cache_build_in_progress = False  # True while a cold path is actively building
 # session is expensive (~10s for zai due to endpoint probing).  The credential pool
 # only changes when the user adds/removes credentials, which is rare; a 24h TTL
 # is plenty safe and ensures get_available_models() cold paths are fast.
-_CREDENTIAL_POOL_CACHE: dict[str, tuple[float, "CredentialPool"]] = {}  # pid -> (ts, pool)
+_CREDENTIAL_POOL_CACHE: dict[str, tuple[float, "CredentialPool"]] = {}  # noqa: F821  forward-ref string annotation, resolved at runtime  # pid -> (ts, pool)
 _provider_models_invalidated_ts: dict[str, float] = {}  # provider_id -> timestamp of last invalidation
 
 # Disk-backed in-memory cache for get_available_models().
