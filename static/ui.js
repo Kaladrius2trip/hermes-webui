@@ -4166,6 +4166,14 @@ const _queueRenderKeys={};  // per-session fingerprint to avoid redundant rebuil
 const _queueCollapsed={};   // per-session: true when user explicitly collapsed the card
 let _queueRenderedSid=null; // session id that currently owns the shared queue DOM
 
+function _queuePanelHasEditingFocus(inner){
+  const active=document.activeElement;
+  if(!active||!inner||active===inner||!inner.contains(active)) return false;
+  if(active.isContentEditable) return true;
+  const tag=active.tagName;
+  return tag==='TEXTAREA'||tag==='INPUT';
+}
+
 function _renderQueueChips(sid){
   const card=document.getElementById('queueCard');
   const inner=document.getElementById('queueChips');
@@ -4173,8 +4181,9 @@ function _renderQueueChips(sid){
   const q=_getSessionQueue(sid,false);
   const key=q.map(e=>{const t=e&&(e.text||e.message||e.content||'');return(e&&e._queued_at||0)+':'+t.length+':'+t.slice(0,20);}).join('|');
   if(key===(_queueRenderKeys[sid]||'')&&_queueRenderedSid===sid&&key!='') return;
-  // Skip re-render if user is actively editing inside the queue panel
-  if(inner.contains(document.activeElement)&&document.activeElement!==inner) return;
+  // Skip re-render only if user is actively editing queued text; header buttons
+  // (Combine/Clear/Hide) live in the same panel and must be allowed to refresh it.
+  if(_queuePanelHasEditingFocus(inner)) return;
   _queueRenderKeys[sid]=key;
   _queueRenderedSid=sid;
   inner.innerHTML='';
