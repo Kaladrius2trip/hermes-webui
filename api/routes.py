@@ -2992,6 +2992,7 @@ def _keep_latest_messaging_session_per_source(
 from api.models import (
     Session,
     get_session,
+    get_session_for_file_ops,
     new_session,
     all_sessions,
     title_from,
@@ -3030,12 +3031,13 @@ from api.workspace import (
     _strip_surrounding_quotes,
     _workspace_blocked_roots,
 )
-from api.upload import handle_upload, handle_upload_extract, handle_transcribe
+from api.upload import handle_upload, handle_upload_extract, handle_transcribe, handle_workspace_upload
 from api.streaming import (
     _sse,
     _run_agent_streaming,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
+    generate_session_title_for_session,
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
 from api.run_journal import (
@@ -4203,6 +4205,8 @@ def _plugin_visibility_payload(manager=None) -> dict:
     manager.discover_and_load(force=False)
 
     plugins = []
+
+    # Hermes Agent lifecycle-hook plugins
     raw_plugins = getattr(manager, "_plugins", {}) or {}
     for key, loaded in sorted(raw_plugins.items(), key=lambda item: str(item[0])):
         manifest = getattr(loaded, "manifest", None)
@@ -4250,9 +4254,41 @@ def _plugin_visibility_payload(manager=None) -> dict:
     }
 
 
+# WebUI dashboard plugins (from manifest.json discovery)
+def _dashboard_plugin_enabled(plugin_name: str) -> bool:
+    """True if a dashboard plugin is enabled in settings.
+
+    Dashboard plugins are opt-in (default off). Enforced server-side so a
+    disabled plugin's page + asset URLs are fully 404'd, not merely hidden in
+    the Settings UI.
+    """
+    try:
+        from api.config import load_settings
+        prefs = (load_settings() or {}).get("dashboard_plugins", {}) or {}
+        return bool(prefs.get(plugin_name, False))
+    except Exception:
+        return False
+
+
+def _webui_plugin_payload() -> list[dict]:
+    try:
+        from api.plugins import get_plugin_metadata
+        return get_plugin_metadata()
+    except Exception:
+        return []
+
+
 def _handle_plugins(handler, parsed) -> bool:
     try:
-        return j(handler, _plugin_visibility_payload())
+        hermes_plugins = _plugin_visibility_payload()
+        webui = _webui_plugin_payload()
+        all_plugins = hermes_plugins["plugins"] + webui
+        return j(handler, {
+            "plugins": all_plugins,
+            "empty": not bool(all_plugins),
+            "supported_hooks": hermes_plugins["supported_hooks"],
+            "read_only": True,
+        })
     except Exception as exc:
         logger.warning("Failed to build plugin visibility payload: %s", exc)
         return j(
@@ -5615,6 +5651,130 @@ def handle_get(handler, parsed) -> bool:
             logger.exception("rollback/diff failed")
             return bad(handler, str(e), status=500)
 
+    # ── Plugin shared assets (e.g. /plugins/plugin.css) ──
+    # Restricted to shared plugin assets only — no cross-plugin file access.
+    if parsed.path.startswith("/plugins/"):
+        from api.plugins import _get_plugin_base
+        plugin_base = _get_plugin_base()
+        rel = parsed.path[len("/plugins/"):]
+        allowed = {"plugin.css"}
+        if rel not in allowed:
+            return False  # 404
+        safe = (plugin_base / rel).resolve()
+        try:
+            safe.relative_to(plugin_base.resolve())
+        except ValueError:
+            return False  # path traversal — 404
+        if safe.is_file():
+            import os as _os
+            data = safe.read_bytes()
+            ext = _os.path.splitext(rel.lower())[1]
+            ct = {
+                ".css": "text/css; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+                ".json": "application/json; charset=utf-8",
+                ".png": "image/png",
+                ".svg": "image/svg+xml",
+            }.get(ext, "application/octet-stream")
+            handler.send_response(200)
+            handler.send_header("Content-Type", ct)
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+            return True
+
+    # ── Plugin static assets ──
+    if parsed.path.startswith("/dashboard-plugins/"):
+        parts = parsed.path.split("/", 3)
+        if len(parts) >= 3:
+            plugin_name = parts[2]
+            rel_path = parts[3] if len(parts) > 3 else ""
+            # Server-side enable-gate: a plugin disabled in Settings must have its
+            # entire URL surface shut off, not merely hidden in the UI.
+            if not _dashboard_plugin_enabled(plugin_name):
+                return False  # 404 — disabled plugins serve nothing
+            from api.plugins import serve_plugin_static
+            result = serve_plugin_static(plugin_name, rel_path)
+            if result:
+                data, content_type = result
+                handler.send_response(200)
+                handler.send_header("Content-Type", content_type)
+                # Defense-in-depth: plugin-controlled assets are served from the
+                # WebUI's own origin. Sandbox them (null origin) so a plugin's
+                # .html/.svg can't run privileged same-origin script if navigated
+                # to directly (the in-panel iframe sandbox doesn't cover direct
+                # navigation). nosniff prevents content-type confusion.
+                handler.send_header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups")
+                handler.send_header("X-Content-Type-Options", "nosniff")
+                handler.send_header("Content-Length", str(len(data)))
+                handler.end_headers()
+                handler.wfile.write(data)
+                return True
+
+    # ── Plugin pages (HTML shell) ──
+    from api.plugins import PLUGIN_MANIFESTS, _PLUGIN_STATIC_ROOTS
+    for name, manifest in PLUGIN_MANIFESTS.items():
+        tab = manifest.get("tab", {})
+        tab_path = tab.get("path", f"/{name}")
+        if parsed.path == tab_path:
+            # Server-side enable-gate (opt-in): a disabled plugin's page 404s.
+            if not _dashboard_plugin_enabled(name):
+                return False
+            dashboard_dir = _PLUGIN_STATIC_ROOTS.get(name)
+            if dashboard_dir:
+                # 1) dashboard/dist/index.html (full SPA build)
+                index_html = dashboard_dir / "dist" / "index.html"
+                if index_html.is_file():
+                    data = index_html.read_bytes()
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "text/html; charset=utf-8")
+                    handler.send_header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups")
+                    handler.send_header("Content-Length", str(len(data)))
+                    handler.end_headers()
+                    handler.wfile.write(data)
+                    return True
+                # 2) static/index.html in plugin root (content page for IIFE loader)
+                plugin_root = dashboard_dir.parent
+                static_html = plugin_root / "static" / "index.html"
+                if static_html.is_file():
+                    data = static_html.read_bytes()
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "text/html; charset=utf-8")
+                    handler.send_header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups")
+                    handler.send_header("Content-Length", str(len(data)))
+                    handler.end_headers()
+                    handler.wfile.write(data)
+                    return True
+                # 3) Fallback: generate shell that loads the IIFE bundle
+                index_js = dashboard_dir / "dist" / "index.js"
+                if index_js.is_file():
+                    import html
+                    label = html.escape(manifest.get("label") or name)
+                    css = html.escape(manifest.get("css", ""))
+                    name_escaped = html.escape(name)
+                    css_tag = f'<link rel="stylesheet" href="/dashboard-plugins/{name_escaped}/{css}">' if css else ""
+                    html_content = (
+                        f"<!doctype html>\n"
+                        f"<html lang=\"en\">\n"
+                        f"<head>\n"
+                        f"  <meta charset=\"utf-8\">\n"
+                        f"  <title>{label}</title>\n"
+                        f"  {css_tag}\n"
+                        f"</head>\n"
+                        f"<body>\n"
+                        f'  <div id="pluginPageContainer"></div>\n'
+                        f'  <script src="/dashboard-plugins/{name_escaped}/dist/index.js"></script>\n'
+                        f"</body>\n"
+                        f"</html>\n"
+                    ).encode("utf-8")
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "text/html; charset=utf-8")
+                    handler.send_header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups")
+                    handler.send_header("Content-Length", str(len(html_content)))
+                    handler.end_headers()
+                    handler.wfile.write(html_content)
+                    return True
+
     return False  # 404
 
 
@@ -5651,9 +5811,14 @@ def handle_post(handler, parsed) -> bool:
         return handle_upload(handler)
     if parsed.path == "/api/upload/extract":
         return handle_upload_extract(handler)
+    if parsed.path == "/api/workspace/upload":
+        return handle_workspace_upload(handler)
 
     if parsed.path == "/api/transcribe":
         return handle_transcribe(handler)
+
+    if parsed.path == "/api/tts":
+        return _handle_tts(handler, parsed)
 
     if parsed.path == "/api/client-events/log":
         if diag:
@@ -5934,6 +6099,27 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/sessions/cleanup_zero_message":
         return _handle_sessions_cleanup(handler, body, zero_only=True)
 
+    def _sync_session_title_to_insights(session):
+        """Write title-only session metadata updates through to state.db when enabled."""
+        try:
+            if not load_settings().get("sync_to_insights"):
+                return
+            from api.state_sync import sync_session_usage
+
+            messages = getattr(session, "messages", None) or []
+            sync_session_usage(
+                session_id=session.session_id,
+                input_tokens=getattr(session, "input_tokens", None) or 0,
+                output_tokens=getattr(session, "output_tokens", None) or 0,
+                estimated_cost=getattr(session, "estimated_cost", 0.0),
+                model=getattr(session, "model", ""),
+                title=session.title,
+                message_count=len(messages),
+                profile=getattr(session, "profile", None),
+            )
+        except Exception:
+            logger.debug("Failed to update session title in state.db", exc_info=True)
+
     if parsed.path == "/api/session/rename":
         try:
             require(body, "session_id", "title")
@@ -5953,6 +6139,36 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/session/title/refresh":
         _handle_session_title_refresh(handler, body)
         return True
+
+    if parsed.path == "/api/session/title/regenerate":
+        try:
+            require(body, "session_id")
+        except ValueError as e:
+            return bad(handler, str(e))
+        sid = body["session_id"]
+        prefer_latest = bool(body.get("prefer_latest", False))
+        try:
+            s = get_session(sid)
+            s = _ensure_full_session_before_mutation(sid, s)
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+        if getattr(s, "read_only", False) or getattr(s, "is_imported", False):
+            return bad(handler, "Read-only imported sessions cannot be renamed", 403)
+        next_title, reason, raw_preview = generate_session_title_for_session(s, prefer_latest=prefer_latest)
+        if not next_title:
+            return bad(handler, f"Could not generate a better title ({reason or 'empty'})", 422)
+        with _get_session_agent_lock(sid):
+            s.title = str(next_title).strip()[:80] or "Untitled"
+            s.llm_title_generated = True
+            s.save(touch_updated_at=False)
+        _sync_session_title_to_insights(s)
+        publish_session_list_changed("session_title_regenerate")
+        return j(handler, {
+            "session": s.compact(),
+            "title": s.title,
+            "status": reason,
+            "raw_preview": (raw_preview or "")[:240],
+        })
 
     if parsed.path == "/api/personality/set":
         try:
@@ -6300,13 +6516,28 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         keep = int(body["keep_count"])
         with _get_session_agent_lock(body["session_id"]):
+            old_msg_count = len(s.messages or [])
+            old_ctx_count = len(getattr(s, 'context_messages', None) or [])
             s.messages = s.messages[:keep]
+            # Truncate context_messages in sync with messages so the agent's
+            # model-facing context doesn't retain rows the user removed via
+            # Edit / Regenerate.  Without this, context_messages still contains
+            # the full pre-truncation history and the agent sees "deleted"
+            # turns on the next turn (#2914).
+            if isinstance(getattr(s, 'context_messages', None), list):
+                s.context_messages = s.context_messages[:keep]
             try:
                 from api.session_ops import _truncation_watermark_for
                 s.truncation_watermark = _truncation_watermark_for(s.messages)
             except Exception:
                 s.truncation_watermark = 0.0
             s.save()
+            logger.info(
+                "truncate %s: messages %d→%d, context_messages %d→%d, watermark=%.2f",
+                body["session_id"], old_msg_count, len(s.messages or []),
+                old_ctx_count, len(getattr(s, 'context_messages', None) or []),
+                s.truncation_watermark or 0,
+            )
         return j(
             handler, {"ok": True, "session": s.compact() | {"messages": s.messages}}
         )
@@ -7067,14 +7298,20 @@ def handle_post(handler, parsed) -> bool:
         target_pid = body.get("project_id") or None
         if target_pid:
             from api.profiles import get_active_profile_name
-            active_profile = get_active_profile_name()
+            # Use the session's own profile for authorization, not the global
+            # active profile. A session belongs to a specific profile set at
+            # creation; projects from that profile should always be assignable,
+            # regardless of which profile is "active" at the process level.
+            # Matches the same principle as the profile chip fix — prefer
+            # session-scoped state over global active profile. (#3325 follow-up)
+            _session_profile = getattr(s, 'profile', None) or get_active_profile_name()
             target = next(
                 (p for p in load_projects() if p["project_id"] == target_pid),
                 None,
             )
             if not target:
                 return bad(handler, "Project not found", 404)
-            if not _profiles_match(target.get("profile"), active_profile):
+            if not _profiles_match(target.get("profile"), _session_profile):
                 return bad(handler, "Project not found", 404)
         with _get_session_agent_lock(body["session_id"]):
             s.project_id = target_pid
@@ -7098,11 +7335,20 @@ def handle_post(handler, parsed) -> bool:
         if color and not _re.match(r"^#[0-9a-fA-F]{3,8}$", color):
             return bad(handler, "Invalid color format")
         projects = load_projects()
+        # #3331 follow-up (Codex+Opus gate): validate the optional client-supplied
+        # `profile` before stamping it, mirroring /api/profile/switch — otherwise a
+        # client could create a project tagged with an arbitrary/unknown profile,
+        # producing hidden cross-profile rows that can't be managed normally.
+        _requested_profile = str(body.get('profile') or "").strip()
+        if _requested_profile and _requested_profile != "default":
+            from api.profiles import _PROFILE_ID_RE
+            if not _PROFILE_ID_RE.fullmatch(_requested_profile):
+                return bad(handler, "invalid profile")
         proj = {
             "project_id": uuid.uuid4().hex[:12],
             "name": name,
             "color": color,
-            "profile": get_active_profile_name() or 'default',
+            "profile": _requested_profile or get_active_profile_name() or 'default',
             "created_at": time.time(),
         }
         projects.append(proj)
@@ -8319,6 +8565,143 @@ def _serve_file_bytes(handler, target: Path, mime: str, disposition: str, cache_
     return True
 
 
+
+def _handle_tts(handler, parsed):
+    """Generate TTS audio via Edge TTS. POST JSON body only.
+
+    Design note addressing deep review blocker #4 (synchronous I/O):
+    The server uses ThreadingHTTPServer (see server.py:173), so each request
+    already runs in its own dedicated thread. A TTS request therefore occupies
+    only its own thread during Microsoft network I/O + streaming; other clients
+    are unaffected. Combined with early auth, a strict per-client 2 s rate
+    limit, 5000-char cap, and voice allowlist, the blocking cost is bounded and
+    intentional. Streaming chunks directly via stream_sync() keeps memory
+    usage low. A cross-thread pool + queue would add complexity and wfile
+    thread-safety issues with no practical gain under the current model.
+    If the HTTP layer ever moves to asyncio we can adopt edge_tts's native
+    async API at that time.
+    """
+    text = ""
+    voice = "zh-CN-XiaoxiaoNeural"
+    rate_str = ""
+    pitch_str = ""
+
+    if handler.command != "POST":
+        from api.helpers import bad as _bad
+        return _bad(handler, "POST required for /api/tts", 405)
+
+    try:
+        data = read_body(handler)
+        text = (data.get("text") or "").strip()
+        voice = data.get("voice") or voice
+        rate_str = data.get("rate") or ""
+        pitch_str = data.get("pitch") or ""
+    except Exception:
+        from api.helpers import bad as _bad
+        return _bad(handler, "invalid request body", 400)
+
+    if not text:
+        from api.helpers import bad as _bad
+        return _bad(handler, "text is required", 400)
+    if len(text) > 5000:
+        from api.helpers import bad as _bad
+        return _bad(handler, "text too long (max 5000 characters)", 400)
+
+    from api.auth import is_auth_enabled, parse_cookie, verify_session
+    cv = None
+    if is_auth_enabled():
+        cv = parse_cookie(handler)
+        if not (cv and verify_session(cv)):
+            from api.helpers import bad as _bad
+            return _bad(handler, "unauthorized", 401)
+
+    # High-quality per-client rate limiting for TTS.
+    if not hasattr(_handle_tts, "_tts_limiter"):
+        import time as _time, threading as _threading
+        class _TtsRateLimiter:
+            def __init__(self, window_seconds=2.0, prune_interval=50):
+                self.window = window_seconds
+                self.prune_interval = prune_interval
+                self._hits = {}
+                self._lock = _threading.Lock()
+                self._checks = 0
+
+            def _get_client_key(self, h):
+                for hdr in ("X-Forwarded-For", "X-Real-IP", "Forwarded"):
+                    val = h.headers.get(hdr)
+                    if val:
+                        ip = val.split(",")[0].strip().split(";")[0].strip()
+                        if ip:
+                            return ip
+                return getattr(h, "client_address", ("unknown",))[0]
+
+            def check(self, handler, session_cookie=None):
+                key = self._get_client_key(handler)
+                if session_cookie and "." in str(session_cookie):
+                    key = str(session_cookie).split(".", 1)[0]
+                now = _time.time()
+                with self._lock:
+                    self._checks += 1
+                    if self._checks % self.prune_interval == 0:
+                        cutoff = now - (self.window * 10)
+                        self._hits = {k: v for k, v in self._hits.items() if v > cutoff}
+                    last = self._hits.get(key, 0)
+                    if now - last < self.window:
+                        return False
+                    self._hits[key] = now
+                    return True
+
+        _handle_tts._tts_limiter = _TtsRateLimiter(window_seconds=2.0)
+
+    limiter = _handle_tts._tts_limiter
+    if not limiter.check(handler, cv):
+        logger.warning("TTS rate limit hit for client=%s", limiter._get_client_key(handler))
+        from api.helpers import bad as _bad
+        return _bad(handler, "rate limit exceeded — please wait", 429)
+
+    allowed = {
+        "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunxiNeural",
+        "zh-CN-YunjianNeural", "zh-CN-YunyangNeural",
+        "en-US-AriaNeural", "en-US-GuyNeural"
+    }
+    if voice not in allowed:
+        from api.helpers import bad as _bad
+        return _bad(handler, "invalid voice", 400)
+
+    try:
+        try:
+            import edge_tts
+        except ImportError:
+            from api.helpers import bad as _bad
+            return _bad(handler, "Edge TTS engine not installed on the server. Install it with: pip install edge-tts", 503)
+
+        kwargs = {}
+        if rate_str:
+            kwargs["rate"] = rate_str
+        if pitch_str:
+            kwargs["pitch"] = pitch_str
+
+        comm = edge_tts.Communicate(text, voice, **kwargs)
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", "audio/mpeg")
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+
+        for chunk in comm.stream_sync():
+            if chunk.get("type") == "audio" and chunk.get("data"):
+                try:
+                    handler.wfile.write(chunk["data"])
+                except (BrokenPipeError, ConnectionResetError):
+                    return True
+        return True
+
+    except BrokenPipeError:
+        return True
+    except Exception:
+        logger.exception("Edge TTS generation failed")
+        from api.helpers import bad as _bad
+        return _bad(handler, "TTS generation failed", 500)
 def _html_preview_with_blank_base(raw: bytes) -> bytes:
     base = '<base target="_blank">'
     text = raw.decode("utf-8", errors="replace")
@@ -8883,7 +9266,7 @@ def _handle_folder_download(handler, parsed):
     if not sid:
         return bad(handler, "session_id is required")
     try:
-        s = get_session(sid)
+        s = get_session_for_file_ops(sid)
     except KeyError:
         return bad(handler, "Session not found", 404)
 
@@ -8956,7 +9339,7 @@ def _handle_file_raw(handler, parsed):
     if not sid:
         return bad(handler, "session_id is required")
     try:
-        s = get_session(sid)
+        s = get_session_for_file_ops(sid)
     except KeyError:
         return bad(handler, "Session not found", 404)
     rel = qs.get("path", [""])[0]
@@ -8995,7 +9378,7 @@ def _handle_file_read(handler, parsed):
     if not sid:
         return bad(handler, "session_id is required")
     try:
-        s = get_session(sid)
+        s = get_session_for_file_ops(sid)
     except KeyError:
         return bad(handler, "Session not found", 404)
     rel = qs.get("path", [""])[0]
@@ -11343,7 +11726,7 @@ def _handle_file_delete(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        s = get_session_for_file_ops(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
@@ -11367,7 +11750,7 @@ def _handle_file_save(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        s = get_session_for_file_ops(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
@@ -11390,7 +11773,7 @@ def _handle_file_create(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        s = get_session_for_file_ops(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
@@ -11412,7 +11795,7 @@ def _handle_file_rename(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        s = get_session_for_file_ops(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
@@ -11438,7 +11821,7 @@ def _handle_create_dir(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        s = get_session_for_file_ops(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
@@ -11459,7 +11842,7 @@ def _handle_file_reveal(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        s = get_session_for_file_ops(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
@@ -11506,7 +11889,7 @@ def _handle_file_path(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        s = get_session_for_file_ops(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
@@ -11536,7 +11919,7 @@ def _handle_file_open_vscode(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     try:
-        s = get_session(body["session_id"])
+        s = get_session_for_file_ops(body["session_id"])
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
