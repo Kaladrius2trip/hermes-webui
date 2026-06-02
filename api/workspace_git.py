@@ -364,6 +364,8 @@ def git_status(workspace: str | Path) -> dict:
 
         old_path = None
         renamed = False
+        mode_head = mode_index = mode_worktree = ""
+        oid_head = oid_index = ""
         if rec.startswith("? "):
             xy = "??"
             repo_path = rec[2:]
@@ -379,6 +381,8 @@ def git_status(workspace: str | Path) -> dict:
             if len(parts) < 9:
                 continue
             xy = parts[1]
+            mode_head, mode_index, mode_worktree = parts[3], parts[4], parts[5]
+            oid_head, oid_index = parts[6], parts[7]
             repo_path = parts[8]
             untracked = False
             ignored = False
@@ -387,6 +391,8 @@ def git_status(workspace: str | Path) -> dict:
             if len(parts) < 10:
                 continue
             xy = parts[1]
+            mode_head, mode_index, mode_worktree = parts[3], parts[4], parts[5]
+            oid_head, oid_index = parts[6], parts[7]
             repo_path = parts[9]
             if i < len(tokens):
                 old_path = tokens[i]
@@ -430,8 +436,11 @@ def git_status(workspace: str | Path) -> dict:
                 old_workspace_path is not None and old_workspace_path in staged_diff_paths
             )
             if raw_staged and not staged:
-                if workspace_path in staged_raw_stats or (
+                raw_has_content = workspace_path in staged_raw_stats or (
                     old_workspace_path is not None and old_workspace_path in staged_raw_stats
+                )
+                if raw_has_content or (
+                    mode_head == mode_index == mode_worktree and oid_head == oid_index
                 ):
                     filtered_noise["crlf_only"] += 1
                 else:
@@ -442,8 +451,11 @@ def git_status(workspace: str | Path) -> dict:
                 old_workspace_path is not None and old_workspace_path in unstaged_diff_paths
             )
             if raw_unstaged and not unstaged:
-                if workspace_path in unstaged_raw_stats or (
+                raw_has_content = workspace_path in unstaged_raw_stats or (
                     old_workspace_path is not None and old_workspace_path in unstaged_raw_stats
+                )
+                if raw_has_content or (
+                    mode_head == mode_index == mode_worktree and oid_head == oid_index
                 ):
                     filtered_noise["crlf_only"] += 1
                 else:

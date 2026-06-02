@@ -29,7 +29,8 @@ def _load_repo_dotenv() -> None:
     Variables are set unconditionally (matching shell source semantics), so a
     value in .env overrides one already present in the shell environment.
     ``ctl.sh`` sets HERMES_WEBUI_PRESERVE_ENV=1 when it has already resolved
-    launcher-specific values such as HERMES_HOME or HERMES_WEBUI_STATE_DIR.
+    launcher-specific values such as HERMES_HOME or HERMES_WEBUI_STATE_DIR;
+    ordinary user-facing .env values like host/port still load normally.
 
     Only loads the webui repo .env — not ~/.hermes/.env, which the server
     loads independently at startup for provider credentials.
@@ -58,7 +59,14 @@ def _load_repo_dotenv() -> None:
                 k = k[7:].strip()
             v = v.strip().strip('"').strip("'")
             if k:
-                if preserve_existing and k in os.environ:
+                preserve_keys = {
+                    "HERMES_HOME",
+                    "HERMES_WEBUI_AGENT_DIR",
+                    "HERMES_WEBUI_STATE_DIR",
+                    "HERMES_WEBUI_PASSWORD",
+                    "HERMES_WEBUI_NO_DOTENV",
+                }
+                if preserve_existing and k in preserve_keys and k in os.environ:
                     continue
                 os.environ[k] = v
     except Exception as exc:

@@ -1924,12 +1924,30 @@ function _syncReasoningScopeUI(){
   }
 }
 
+function _reasoningEffortQuery(){
+  const params=new URLSearchParams();
+  const sid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)||null;
+  let model=sid&&S.session?String(S.session.model||'').trim():'';
+  let provider=sid&&S.session?String(S.session.model_provider||'').trim():'';
+  if(!model){
+    const sel=typeof $==='function' ? $('modelSelect') : null;
+    if(sel) model=String(sel.value||'').trim();
+  }
+  if(model&&!provider&&typeof _modelProviderForSend==='function'){
+    try{provider=String(_modelProviderForSend(model)||'').trim();}catch(_){}
+  }
+  if(model) params.set('model',model);
+  if(provider) params.set('provider',provider);
+  const qs=params.toString();
+  return qs?`?${qs}`:'';
+}
+
 function fetchReasoningChip(){
   // #2697 — prefer the session-scoped value when a session is loaded. The
   // profile default is the fallback (matches streaming.py resolution order).
   const sid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)||null;
   const sessionOverride=sid&&S.session?_normalizeReasoningEffort(S.session.reasoning_effort||''):'';
-  api('/api/reasoning').then(function(st){
+  api('/api/reasoning'+_reasoningEffortQuery()).then(function(st){
     const profileEffort=(st&&st.reasoning_effort)||'';
     const effective=sessionOverride||profileEffort;
     _applyReasoningChip(effective,sessionOverride||null);

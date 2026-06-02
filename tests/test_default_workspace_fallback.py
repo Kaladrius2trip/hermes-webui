@@ -12,8 +12,10 @@ def test_resolve_default_workspace_falls_back_to_existing_home_work(monkeypatch,
     monkeypatch.setattr(config, "HOME", tmp_path)
     monkeypatch.setattr(config, "STATE_DIR", state_dir)
     monkeypatch.delenv("HERMES_WEBUI_DEFAULT_WORKSPACE", raising=False)
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
 
-    resolved = config.resolve_default_workspace("/definitely/not/usable")
+    resolved = config.resolve_default_workspace(blocked / "child")
 
     assert resolved == preferred.resolve()
 
@@ -30,8 +32,10 @@ def test_save_settings_rewrites_bad_default_workspace_to_fallback(monkeypatch, t
     monkeypatch.setattr(config, "SETTINGS_FILE", settings_file)
     monkeypatch.setattr(config, "DEFAULT_WORKSPACE", preferred)
     monkeypatch.delenv("HERMES_WEBUI_DEFAULT_WORKSPACE", raising=False)
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
 
-    saved = config.save_settings({"default_workspace": "/definitely/not/usable"})
+    saved = config.save_settings({"default_workspace": str(blocked / "child")})
     on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
 
     assert saved["default_workspace"] == str(preferred.resolve())
@@ -51,19 +55,17 @@ def test_resolve_default_workspace_creates_home_workspace_when_missing(monkeypat
 
 
 def test_resolve_default_workspace_raises_when_all_candidates_fail(monkeypatch, tmp_path):
-    """RuntimeError is raised when every candidate is unwritable."""
-    import stat, pytest
-    # Make tmp_path read-only so mkdir inside it fails
-    tmp_path.chmod(stat.S_IRUSR | stat.S_IXUSR)
-    state_dir = tmp_path / "state"
-    monkeypatch.setattr(config, "HOME", tmp_path)
-    monkeypatch.setattr(config, "STATE_DIR", state_dir)
+    """RuntimeError is raised when every candidate cannot be created."""
+    import pytest
+    home_file = tmp_path / "home-file"
+    state_file = tmp_path / "state-file"
+    home_file.write_text("not a directory", encoding="utf-8")
+    state_file.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(config, "HOME", home_file)
+    monkeypatch.setattr(config, "STATE_DIR", state_file)
     monkeypatch.delenv("HERMES_WEBUI_DEFAULT_WORKSPACE", raising=False)
-    try:
-        with pytest.raises(RuntimeError, match="Could not create or access"):
-            config.resolve_default_workspace(None)
-    finally:
-        tmp_path.chmod(stat.S_IRWXU)  # restore for cleanup
+    with pytest.raises(RuntimeError, match="Could not create or access"):
+        config.resolve_default_workspace(None)
 
 
 def test_workspace_candidates_deduplicates_home_workspace(monkeypatch, tmp_path):
@@ -94,16 +96,10 @@ def test_env_var_workspace_takes_priority_over_passed_raw(monkeypatch, tmp_path)
 
 def test_ensure_workspace_dir_returns_false_for_unwritable_path(monkeypatch, tmp_path):
     """_ensure_workspace_dir returns False for a path that can't be created."""
-    import stat
-    # Make parent read-only so mkdir fails
-    parent = tmp_path / "ro_parent"
-    parent.mkdir()
-    parent.chmod(stat.S_IRUSR | stat.S_IXUSR)
-    try:
-        result = config._ensure_workspace_dir(parent / "child")
-        assert result is False
-    finally:
-        parent.chmod(stat.S_IRWXU)
+    parent = tmp_path / "file_parent"
+    parent.write_text("not a directory", encoding="utf-8")
+    result = config._ensure_workspace_dir(parent / "child")
+    assert result is False
 
 
 def test_env_var_wins_over_settings_json_on_startup(monkeypatch, tmp_path):

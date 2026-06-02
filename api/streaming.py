@@ -1741,12 +1741,32 @@ def _first_exchange_snippets(messages):
 
 
 def _latest_exchange_snippets(messages):
-    """Return (last_user_text, last_assistant_text) snippets for title refresh.
+    """Return latest visible user and assistant snippets for title refresh.
 
-    Walks the message list backwards to find the last user+assistant pair,
-    skipping empty or tool-call-only assistant messages.
+    The two snippets are intentionally discovered independently. A trailing
+    user turn with only an empty/tool-call assistant placeholder should still
+    contribute that user text while falling back to the previous substantive
+    assistant answer.
     """
-    return _recent_exchange_snippets(messages, 1)
+    user_text = ''
+    asst_text = ''
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            continue
+        role = m.get('role')
+        if role == 'assistant' and not asst_text:
+            candidate = _message_text(m.get('content'))
+            if m.get('tool_calls') and (not candidate or _looks_invalid_generated_title(candidate)):
+                continue
+            if candidate:
+                asst_text = candidate
+        elif role == 'user' and not user_text:
+            candidate = _message_text(m.get('content'))
+            if candidate:
+                user_text = candidate
+        if user_text and asst_text:
+            break
+    return user_text[:500], asst_text[:500]
 
 
 def _recent_exchange_snippets(messages, exchange_limit: int = 1):
@@ -2685,9 +2705,12 @@ def _maybe_schedule_title_refresh(session, put_event, agent):
     exchange_count = _count_exchanges(session.messages)
     if exchange_count <= 0 or exchange_count % refresh_interval != 0:
         return
+    latest_u, latest_a = _latest_exchange_snippets(session.messages)
+    if not latest_u and not latest_a:
+        return
     last_u, last_a = _recent_exchange_snippets(session.messages, refresh_interval)
     if not last_u and not last_a:
-        return
+        last_u, last_a = latest_u, latest_a
     threading.Thread(
         target=_run_background_title_refresh,
         args=(session.session_id, last_u, last_a, current_title, put_event, agent),

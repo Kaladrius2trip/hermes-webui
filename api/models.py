@@ -107,6 +107,12 @@ def _cleanup_stale_tmp_files() -> None:
 _PERSISTED_SESSION_IDS_CACHE: tuple[Path | None, int | None, frozenset[str]] = (None, None, frozenset())
 
 
+def _invalidate_persisted_session_ids_cache() -> None:
+    """Force the next persisted-ID lookup to rescan the session directory."""
+    global _PERSISTED_SESSION_IDS_CACHE
+    _PERSISTED_SESSION_IDS_CACHE = (None, None, frozenset())
+
+
 def _persisted_session_ids_snapshot() -> frozenset[str]:
     """Return persisted session ids, caching the directory snapshot by mtime.
 
@@ -235,6 +241,7 @@ def _write_session_index(updates=None):
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(_tmp, SESSION_INDEX_FILE)
+                _invalidate_persisted_session_ids_cache()
             except Exception:
                 # Best-effort cleanup of stale tmp on failure
                 try:
@@ -281,6 +288,7 @@ def _write_session_index(updates=None):
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(_tmp, SESSION_INDEX_FILE)
+                _invalidate_persisted_session_ids_cache()
             except Exception:
                 try:
                     _tmp.unlink(missing_ok=True)
@@ -320,6 +328,7 @@ def prune_session_from_index(session_id: str) -> None:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(_tmp, SESSION_INDEX_FILE)
+                _invalidate_persisted_session_ids_cache()
             except Exception:
                 try:
                     _tmp.unlink(missing_ok=True)
@@ -3966,15 +3975,21 @@ def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], _c
                 return (role, existing_content)
         return None
     # Legacy O(n) path for callers that did not build the cache.
+    loose_content = None
     for existing_role, existing_content in visible_keys:
         if role != existing_role or not existing_content:
             continue
         if content in existing_content or existing_content in content:
             return (existing_role, existing_content)
+        existing_len = len(existing_content)
+        if existing_len > 3 * content_len or content_len > 3 * existing_len:
+            continue
         if loose_content is None:
             loose_content = _loose_session_message_content(content)
-        loose_existing = lookup.get("loose_by_key", {}).get((existing_role, existing_content), "")
-        if loose_content and loose_existing and (
+        if not loose_content:
+            continue
+        loose_existing = _loose_session_message_content(existing_content)
+        if loose_existing and (
             loose_content in loose_existing or loose_existing in loose_content
         ):
             return (existing_role, existing_content)

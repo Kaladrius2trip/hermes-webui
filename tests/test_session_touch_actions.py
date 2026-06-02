@@ -19,9 +19,14 @@ def _sessions_block(start_marker: str, end_marker: str) -> str:
 
 
 def test_session_menu_uses_viewport_height_not_fixed_scroll_cap():
-    assert "max-height:calc(100vh - 16px)" in STYLE_CSS
     session_menu = STYLE_CSS[STYLE_CSS.find(".session-action-menu{"):STYLE_CSS.find(".session-action-menu.open")]
     assert "max-height:320px" not in session_menu
+    assert "max-height:" not in session_menu
+    assert "overflow-y:auto" not in session_menu
+    assert "const viewportH=window.innerHeight || document.documentElement.clientHeight || 0;" in SESSIONS_JS
+    assert "_sessionActionMenu.style.maxHeight=constrainedH+'px';" in SESSIONS_JS
+    assert "_sessionActionMenu.style.overflowY='auto';" in SESSIONS_JS
+    assert "_sessionActionMenu.style.overflowY='hidden';" in SESSIONS_JS
 
 
 def test_session_menu_respects_motion_preferences():
