@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- Message scroll position now persists per tab (sessionStorage, keyed by session) and the workspace panel's active tab persists per workspace (localStorage), so a refresh, tab restore, or session switch no longer resets the reader's scroll position or the chosen Files/Artifacts tab.
 - Local fork integration stack: provider-key 403 removal errors now show a clearer toast, streaming preserves underscores, interim progress remains visible, and older-history tail loading keeps cumulative windows stable.
 ## [v0.51.293] — 2026-06-06 — Release JI (stage-s5 — thinking card no longer renders twice)
 

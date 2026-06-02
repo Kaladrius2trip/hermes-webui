@@ -2592,6 +2592,7 @@ if(typeof window!=='undefined'){
       const btn=$('scrollToBottomBtn');
       const showBottomButton=!_scrollPinned && el.scrollHeight-top-el.clientHeight>80;
       if(btn) btn.style.display=showBottomButton?'flex':'none';
+      _saveMessageScrollState();
       if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
       // Prefetch older messages before the reader hits the hard top. Prepending
       // then preserving scrollTop is seamless only if there is runway left for
@@ -2603,6 +2604,11 @@ if(typeof window!=='undefined'){
     });
   });
 })();
+
+// Flush the per-tab message scroll offset when the tab is unloaded or hidden so
+// a refresh or mobile tab-discard returns the reader to position (#2361).
+window.addEventListener('pagehide',_saveMessageScrollState);
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') _saveMessageScrollState(); });
 function _fmtTokens(n){if(!n||n<0)return'0';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n);}
 function _formatTurnDuration(seconds){
   const n=Number(seconds);
@@ -7089,6 +7095,62 @@ function _renderMessagesWithScrollSnapshot(options){
   const scrollSnapshot=_captureMessageScrollSnapshot();
   renderMessages({...(options||{}),preserveScroll:true});
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
+}
+
+// State owner: per-tab message scroll position is presentation state kept in
+// sessionStorage, keyed by session id (#2361 reconciliation slice). It is NOT
+// runtime truth — the session transcript remains authoritative; this only
+// restores where the reader was looking. Invalidation trigger: a transcript
+// message-count change makes the saved offset stale and it is ignored.
+function _messageScrollStateKey(sid){
+  const id=sid||(S.session&&S.session.session_id)||null;
+  return id?'hermes-webui-msg-scroll:'+id:null;
+}
+function _saveMessageScrollState(){
+  try{
+    const el=$('messages');
+    const key=_messageScrollStateKey();
+    if(!el||!key) return;
+    sessionStorage.setItem(key,JSON.stringify({
+      top:el.scrollTop,
+      messageCount:Array.isArray(S.messages)?S.messages.length:0,
+    }));
+  }catch(_){}
+}
+function _loadMessageScrollState(sid){
+  try{
+    const key=_messageScrollStateKey(sid);
+    if(!key) return null;
+    const raw=sessionStorage.getItem(key);
+    if(raw===null||raw==='') return null;
+    let data=null;
+    try{ data=JSON.parse(raw); }catch(_){ data={top:Number(raw)}; }
+    const top=Number(data&&data.top);
+    if(!Number.isFinite(top)) return null;
+    const storedCount=Number(data&&data.messageCount);
+    const currentCount=Array.isArray(S.messages)?S.messages.length:0;
+    if(Number.isFinite(storedCount)&&storedCount!==currentCount) return null;
+    return {top};
+  }catch(_){ return null; }
+}
+function _restoreMessageScrollStateForSession(sid){
+  // Only restore for the session still in view; a late render for a session the
+  // user already navigated away from must not move the viewport. No bottom snap:
+  // _restoreMessageScrollSnapshot clamps and applies the exact persisted offset.
+  const activeSid=S.session&&S.session.session_id;
+  if(!sid||!activeSid||sid!==activeSid) return;
+  const snapshot=_loadMessageScrollState(sid);
+  if(!snapshot) return;
+  if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
+  _restoreMessageScrollSnapshot(snapshot);
+  const el=$('messages');
+  const distance=el?el.scrollHeight-el.scrollTop-el.clientHeight:0;
+  const nearBottom=distance<250;
+  _scrollPinned=nearBottom;
+  _messageUserUnpinned=!nearBottom;
+  const btn=$('scrollToBottomBtn');
+  if(btn) btn.style.display=(!nearBottom&&distance>80)?'flex':'none';
+  if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
 }
 function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   // Terminal stream renders can happen after S.activeStreamId is cleared.

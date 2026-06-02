@@ -131,6 +131,29 @@ function _setWorkspacePanelTabDataset(){
   if(panel) panel.dataset.activeTab = _workspacePanelActiveTab;
 }
 
+// State owner: the workspace panel active tab (files | artifacts) is a
+// per-browser workspace presentation preference stored in localStorage, keyed by
+// workspace — exactly like expanded-directory state above. It is NOT runtime
+// truth. Invalidation trigger: switchWorkspacePanelTab rewrites it; loading a
+// session in a different workspace reads that workspace's stored value on root
+// loadDir.
+function _wsActiveTabKey(){
+  const ws=S.session&&S.session.workspace;
+  return ws?'hermes-webui-wstab:'+ws:null;
+}
+function _saveWorkspacePanelActiveTab(){
+  const key=_wsActiveTabKey();if(!key)return;
+  try{localStorage.setItem(key,_workspacePanelActiveTab);}catch(e){}
+}
+function _restoreWorkspacePanelActiveTab(){
+  const key=_wsActiveTabKey();
+  if(!key){_workspacePanelActiveTab='files';return;}
+  try{
+    const raw=localStorage.getItem(key);
+    _workspacePanelActiveTab = raw==='artifacts' ? 'artifacts' : 'files';
+  }catch(e){_workspacePanelActiveTab='files';}
+}
+
 function scheduleRenderSessionArtifacts(){
   if(_renderSessionArtifactsTimer) clearTimeout(_renderSessionArtifactsTimer);
   _renderSessionArtifactsTimer = setTimeout(()=>{
@@ -146,6 +169,7 @@ if(typeof document !== 'undefined'){
 
 function switchWorkspacePanelTab(tab){
   _workspacePanelActiveTab = tab === 'artifacts' ? 'artifacts' : 'files';
+  _saveWorkspacePanelActiveTab();
   _setWorkspacePanelTabDataset();
   const filesTab = $('workspaceFilesTab');
   const artifactsTab = $('workspaceArtifactsTab');
@@ -392,6 +416,8 @@ async function loadDir(path, opts={}){
     if(!path||path==='.'){
       S._dirCache={};
       _restoreExpandedDirs();  // restore per-workspace expanded state on root load
+      _restoreWorkspacePanelActiveTab();  // restore per-workspace active tab before rendering tabs (#2361)
+      switchWorkspacePanelTab(_workspacePanelActiveTab);  // apply restored tab to the DOM
     }
     S.currentDir=path||'.';
     const data=await api(`/api/list?session_id=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`);

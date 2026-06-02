@@ -1061,6 +1061,10 @@ async function loadSession(sid){
       setComposerStatus('');
       updateQueueBadge(sid);
       syncTopbar();renderMessages(sameSessionForceReload?{preserveScroll:true}:undefined);
+      // Restore the per-tab persisted scroll offset for this session after the
+      // transcript renders (#2361). Gated to the still-active session and never
+      // snaps to bottom — see _restoreMessageScrollStateForSession in ui.js.
+      if(typeof _restoreMessageScrollStateForSession==='function') _restoreMessageScrollStateForSession(sid);
       if(typeof resumeManualCompressionForSession==='function') resumeManualCompressionForSession(sid);
       const _dirP=loadDir('.');
       // Workspace refresh is guarded by session id inside loadDir(); do not
