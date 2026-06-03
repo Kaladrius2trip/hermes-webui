@@ -66,23 +66,23 @@ def _session(session_id="forcetitle1", *, title="Manual title", messages=None):
     return s
 
 
-def test_force_title_route_overwrites_current_title_and_marks_llm_generated(tmp_path, monkeypatch):
-    """Explicit user action should force a fresh LLM title now, not wait for the 5-exchange refresh."""
+def test_force_title_route_updates_default_title_and_marks_llm_generated(tmp_path, monkeypatch):
+    """Explicit user action should generate a fresh title for default/generated titles now."""
     _isolate_session_store(tmp_path, monkeypatch)
-    session = _session()
+    session = _session(title="Untitled")
     captured = _capture_post(monkeypatch, {"session_id": session.session_id})
     generated = []
 
-    def fake_generate(user_text, assistant_text):
-        generated.append((user_text, assistant_text))
+    def fake_generate(session_obj, **kwargs):
+        generated.append((session_obj.session_id, kwargs.get("recent_exchange_limit")))
         return "Forced Context Menu Titles", "llm_aux", ""
 
-    monkeypatch.setattr(routes, "_generate_forced_session_title", fake_generate)
-    monkeypatch.setattr(routes, "publish_session_list_changed", lambda reason: None)
+    monkeypatch.setattr(routes, "generate_session_title_for_session", fake_generate)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda reason, **kwargs: None)
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/title/refresh")) is True
 
-    assert generated == [("Can we add a context menu title refresh?", "Yes, add a forced title action and API endpoint.")]
+    assert generated == [(session.session_id, 1)]
     assert captured["status"] == 200
     assert captured["payload"]["ok"] is True
     assert captured["payload"]["status"] == "llm_aux"
@@ -93,8 +93,8 @@ def test_force_title_route_overwrites_current_title_and_marks_llm_generated(tmp_
     assert saved.llm_title_generated is True
 
 
-def test_force_title_route_uses_recent_configured_exchange_window(tmp_path, monkeypatch):
-    """Manual title refresh should use the last N exchanges from the title refresh setting."""
+def test_force_title_route_uses_configured_context_window(tmp_path, monkeypatch):
+    """Manual title refresh should pass the configured context window into canonical generation."""
     _isolate_session_store(tmp_path, monkeypatch)
     messages = [
         {"role": "user", "content": "Discuss lunch options"},
@@ -104,28 +104,22 @@ def test_force_title_route_uses_recent_configured_exchange_window(tmp_path, monk
         {"role": "user", "content": "Also prevent stale one-line titles"},
         {"role": "assistant", "content": "Collect enough recent topic evidence."},
     ]
-    session = _session(messages=messages)
+    session = _session(title="Untitled", messages=messages)
     captured = _capture_post(monkeypatch, {"session_id": session.session_id})
     monkeypatch.setattr(routes, "_forced_title_context_window", lambda: 2)
     generated = []
 
-    def fake_generate(user_text, assistant_text):
-        generated.append((user_text, assistant_text))
+    def fake_generate(session_obj, **kwargs):
+        generated.append((session_obj.session_id, kwargs.get("recent_exchange_limit")))
         return "Recent Context Titles", "llm_aux", ""
 
-    monkeypatch.setattr(routes, "_generate_forced_session_title", fake_generate)
-    monkeypatch.setattr(routes, "publish_session_list_changed", lambda reason: None)
+    monkeypatch.setattr(routes, "generate_session_title_for_session", fake_generate)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda reason, **kwargs: None)
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/title/refresh")) is True
 
     assert captured["status"] == 200
-    user_context, assistant_context = generated[0]
-    assert "Plan WebUI forced title context" in user_context
-    assert "Also prevent stale one-line titles" in user_context
-    assert "Discuss lunch options" not in user_context
-    assert "Use recent configured exchanges" in assistant_context
-    assert "Collect enough recent topic evidence" in assistant_context
-    assert "Pizza or salad" not in assistant_context
+    assert generated == [(session.session_id, 2)]
 
 
 def test_adaptive_title_refresh_uses_recent_configured_exchange_window(monkeypatch):
@@ -167,24 +161,27 @@ def test_adaptive_title_refresh_uses_recent_configured_exchange_window(monkeypat
     assistant_context = scheduled["args"][2]
     assert "Recent title context three" in user_context
     assert "Recent title context four" in user_context
-    assert "Old topic" not in user_context
+    assert "Opening goal User: Old topic one" in user_context
+    assert "Recent recurring topic User 1: Old topic two" in user_context
+    assert "Latest exchange User: Recent title context four" in user_context
     assert "Recent answer three" in assistant_context
     assert "Recent answer four" in assistant_context
-    assert "Old answer" not in assistant_context
+    assert "Opening goal Assistant: Old answer one" in assistant_context
+    assert "Latest exchange Assistant: Recent answer four" in assistant_context
 
 
 def test_force_title_route_rejects_sessions_without_complete_exchange(tmp_path, monkeypatch):
     _isolate_session_store(tmp_path, monkeypatch)
-    session = _session(messages=[{"role": "user", "content": "Only user so far"}])
+    session = _session(title="Untitled", messages=[{"role": "user", "content": "Only user so far"}])
     captured = _capture_post(monkeypatch, {"session_id": session.session_id})
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/title/refresh")) is True
 
-    assert captured["status"] == 400
-    assert "Need at least one complete user/assistant exchange" in captured["payload"]["error"]
+    assert captured["status"] == 422
+    assert "empty_assistant_message" in captured["payload"]["error"]
     saved = Session.load(session.session_id)
     assert saved is not None
-    assert saved.title == "Manual title"
+    assert saved.title == "Untitled"
 
 
 def test_force_title_route_rejects_duplicate_inflight_request(tmp_path, monkeypatch):
@@ -210,9 +207,11 @@ def test_force_title_route_rejects_duplicate_inflight_request(tmp_path, monkeypa
 
 def test_session_context_menu_exposes_force_title_action():
     assert "/api/session/title/refresh" in SESSIONS_JS
-    assert "session_generate_title" in SESSIONS_JS
-    assert "session_generate_title_desc" in SESSIONS_JS
-    assert "session_title_generated" in SESSIONS_JS
+    assert "session_title_regenerate" in SESSIONS_JS
+    assert "session_title_regenerate_desc" in SESSIONS_JS
+    assert "session_title_regenerated" in SESSIONS_JS
+    assert "session_generate_title" not in SESSIONS_JS
+    assert "_forceGenerateSessionTitle(session)" in SESSIONS_JS
     assert "await renderSessionList()" in SESSIONS_JS
     assert "_titleRefreshInFlightSids" in SESSIONS_JS
     assert "session_title_already_generating" in SESSIONS_JS

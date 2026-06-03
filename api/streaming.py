@@ -2050,6 +2050,74 @@ def _recent_exchange_snippets(messages, exchange_limit: int = 1):
     return '\n\n'.join(user_parts)[:4000], '\n\n'.join(assistant_parts)[:4000]
 
 
+def _visible_exchange_pairs(messages) -> list[tuple[str, str]]:
+    """Return complete visible user/assistant exchange pairs in chronological order."""
+    pairs: list[tuple[str, str]] = []
+    pending_user = ''
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get('role')
+        if role == 'user':
+            candidate = _message_text(m.get('content'))
+            if candidate:
+                pending_user = candidate
+        elif role == 'assistant' and pending_user:
+            candidate = _message_text(m.get('content'))
+            if m.get('tool_calls') and (not candidate or _looks_invalid_generated_title(candidate)):
+                continue
+            if candidate:
+                pairs.append((pending_user, candidate))
+                pending_user = ''
+    return pairs
+
+
+def _balanced_title_context_snippets(
+    messages,
+    recent_exchange_limit: int = 3,
+    max_chars: int = 4000,
+):
+    """Return balanced role-split context for conversation-level title generation.
+
+    The title prompt needs the session's opening goal, recurring/recent topic,
+    and latest exchange. Using only the first exchange misses how a long chat
+    evolved; using only the latest exchange overfits titles to status updates
+    like "tests passed" or the last tool result.
+    """
+    try:
+        limit = int(recent_exchange_limit)
+    except (TypeError, ValueError):
+        limit = 3
+    limit = max(1, min(limit, 20))
+    try:
+        budget = int(max_chars)
+    except (TypeError, ValueError):
+        budget = 4000
+    budget = max(500, min(budget, 12000))
+
+    pairs = _visible_exchange_pairs(messages)
+    if not pairs:
+        latest_u, latest_a = _latest_exchange_snippets(messages)
+        return latest_u[:budget], latest_a[:budget]
+
+    opening = pairs[0]
+    latest = pairs[-1]
+    middle = pairs[1:-1]
+    recent = middle[-limit:] if middle else []
+
+    per_snippet = max(120, min(700, budget // max(2, 2 + len(recent))))
+    user_parts: list[str] = [f"Opening goal User: {opening[0][:per_snippet]}"]
+    assistant_parts: list[str] = [f"Opening goal Assistant: {opening[1][:per_snippet]}"]
+
+    for idx, (user_text, asst_text) in enumerate(recent, 1):
+        user_parts.append(f"Recent recurring topic User {idx}: {user_text[:per_snippet]}")
+        assistant_parts.append(f"Recent recurring topic Assistant {idx}: {asst_text[:per_snippet]}")
+
+    user_parts.append(f"Latest exchange User: {latest[0][:per_snippet]}")
+    assistant_parts.append(f"Latest exchange Assistant: {latest[1][:per_snippet]}")
+    return '\n\n'.join(user_parts)[:budget], '\n\n'.join(assistant_parts)[:budget]
+
+
 def _count_exchanges(messages):
     """Count the number of user messages (rough exchange count)."""
     count = 0
@@ -2212,27 +2280,28 @@ def _title_language_mismatch(user_text: str, title: str) -> bool:
 
 def _title_prompts(user_text: str, assistant_text: str) -> tuple[str, list[str]]:
     qa = (
-        f"Recent user context:\n{str(user_text or '').strip()[:4000]}\n\n"
-        f"Recent assistant context:\n{str(assistant_text or '').strip()[:4000]}"
+        f"Balanced user context:\n{str(user_text or '').strip()[:4000]}\n\n"
+        f"Balanced assistant context:\n{str(assistant_text or '').strip()[:4000]}"
     )
     language_rule = _title_prompt_language_rule(user_text)
     prompts = [
         (
-            "Generate a short session title from this conversation context.\n"
+            "Generate a short session title from this balanced conversation context.\n"
+            "Name the overall chat goal or recurring theme, not the last tool result, status update, or completion event.\n"
             "Use BOTH the user's messages and the assistant's visible answers.\n"
-            "Prefer the latest recurring topic when several recent exchanges are present.\n"
+            "Weigh the opening goal, recurring topic, and latest exchange together.\n"
             f"{language_rule}"
             "Return only the title text, 3-8 words, as a topic label.\n"
             "Do not use markdown, bullets, labels, or prefixes like Session Title:.\n"
             "Do not output a full sentence.\n"
-            "Do not output acknowledgements or completion phrases like OK, done, or all set.\n"
+            "Do not output acknowledgements or completion phrases like OK, done, tests passed, or all set.\n"
             "Do not describe internal reasoning.\n"
-            "Bad: The user is asking..., OK, all set.\n"
-            "Good: Title Generation Test, Clarify Dialog Layout, GitHub Issue Triage"
+            "Bad: Tests Passed, Ready For Review, The user is asking..., OK, all set.\n"
+            "Good: Title Generation Architecture, Clarify Dialog Layout, GitHub Issue Triage"
         ),
         (
             "Rewrite this conversation context as a concise noun-phrase title.\n"
-            "Use the actual topic, not the task outcome.\n"
+            "Use the overall chat goal/theme, not the task outcome, latest status, or final tool result.\n"
             f"{language_rule}"
             "Return title text only.\n"
             "Do not use markdown, bullets, labels, or prefixes like Session Title:.\n"
@@ -2659,10 +2728,26 @@ def _put_title_status(put_event, session_id: str, status: str, reason: str = '',
     )
 
 
+_TITLE_CONTEXT_LABEL_RE = re.compile(
+    r'^\s*(?:Opening goal|Recent recurring topic|Latest exchange)\s+(?:User|Assistant)(?:\s+\d+)?\s*:\s*',
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_title_context_labels(text: str) -> str:
+    """Remove role labels used in balanced title context before local fallback."""
+    lines = []
+    for line in str(text or '').splitlines():
+        cleaned = _TITLE_CONTEXT_LABEL_RE.sub('', line).strip()
+        if cleaned:
+            lines.append(cleaned)
+    return '\n'.join(lines).strip()
+
+
 def _fallback_title_from_exchange(user_text: str, assistant_text: str) -> Optional[str]:
     """Generate a readable local fallback title when LLM title generation fails."""
-    user_text = (user_text or '').strip()
-    assistant_text = _strip_thinking_markup(assistant_text or '').strip()
+    user_text = _strip_title_context_labels(user_text or '').strip()
+    assistant_text = _strip_title_context_labels(_strip_thinking_markup(assistant_text or '')).strip()
     if not user_text:
         return None
     user_text = _strip_workspace_prefix(user_text)
@@ -2836,7 +2921,7 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
 
 
 def _run_background_title_refresh(session_id: str, user_text: str, assistant_text: str, current_title: str, put_event, agent=None):
-    """Refresh an existing LLM-generated title using the latest exchange text.
+    """Refresh an existing LLM-generated title using balanced conversation context.
 
     Unlike _run_background_title_update, this does NOT guard on
     llm_title_generated — it assumes the title was already LLM-generated
@@ -2905,20 +2990,31 @@ def _run_background_title_refresh(session_id: str, user_text: str, assistant_tex
 
 
 
-def generate_session_title_for_session(session, *, prefer_latest: bool = False, agent=None) -> tuple[Optional[str], str, str]:
+def generate_session_title_for_session(
+    session,
+    *,
+    prefer_latest: bool = False,
+    agent=None,
+    recent_exchange_limit: int | None = None,
+) -> tuple[Optional[str], str, str]:
     """Generate a session title on demand from persisted conversation messages.
 
-    This helper powers explicit UI title-regeneration controls. It intentionally
-    does not inspect or mutate ``llm_title_generated``; callers decide whether
-    replacing the current title is allowed, then persist the returned title.
+    ``prefer_latest`` remains for API compatibility but no longer changes the
+    title source.  The canonical path always builds balanced context from the
+    opening goal, recent recurring topic, and latest exchange so titles describe
+    the conversation, not only the newest status/tool result.
     """
     messages = getattr(session, 'messages', None) or []
-    if prefer_latest:
-        user_text, assistant_text = _latest_exchange_snippets(messages)
-    else:
-        user_text, assistant_text = _first_exchange_snippets(messages)
+    if recent_exchange_limit is None:
+        recent_exchange_limit = 3
+    user_text, assistant_text = _balanced_title_context_snippets(
+        messages,
+        recent_exchange_limit=recent_exchange_limit,
+    )
     if not user_text:
         return None, 'empty_user_message', ''
+    if not assistant_text:
+        return None, 'empty_assistant_message', ''
     from api import profiles as profiles_api
 
     with profiles_api.profile_env_for_background_worker(session, "manual title regeneration", logger_override=logger):
@@ -3041,15 +3137,15 @@ def _maybe_schedule_title_refresh(session, put_event, agent):
     exchange_count = _count_exchanges(session.messages)
     if exchange_count <= 0 or exchange_count % refresh_interval != 0:
         return
-    latest_u, latest_a = _latest_exchange_snippets(session.messages)
-    if not latest_u and not latest_a:
+    user_context, assistant_context = _balanced_title_context_snippets(
+        session.messages,
+        recent_exchange_limit=refresh_interval,
+    )
+    if not user_context or not assistant_context:
         return
-    last_u, last_a = _recent_exchange_snippets(session.messages, refresh_interval)
-    if not last_u and not last_a:
-        last_u, last_a = latest_u, latest_a
     threading.Thread(
         target=_run_background_title_refresh,
-        args=(session.session_id, last_u, last_a, current_title, put_event, agent),
+        args=(session.session_id, user_context, assistant_context, current_title, put_event, agent),
         daemon=True,
     ).start()
 

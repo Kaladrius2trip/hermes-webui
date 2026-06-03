@@ -1457,10 +1457,9 @@ def _forced_title_context_window() -> int:
 def _generate_forced_session_title(user_text: str, assistant_text: str):
     """Generate an explicit user-requested session title.
 
-    This is the synchronous/manual companion to the automatic background title
-    updater. It intentionally ignores the refresh cadence and the current
-    manual-vs-generated title distinction because the user clicked a force
-    action.
+    Kept as a compatibility wrapper for older tests/callers; canonical route
+    handling now delegates to ``generate_session_title_for_session`` so refresh
+    and regenerate share context and safeguards.
     """
     from api.streaming import (
         _fallback_title_from_exchange,
@@ -1477,8 +1476,49 @@ def _generate_forced_session_title(user_text: str, assistant_text: str):
     return None, status or "empty", raw_preview
 
 
+def _sync_session_title_to_insights(session):
+    """Write title-only session metadata updates through to state.db when enabled."""
+    try:
+        if not load_settings().get("sync_to_insights"):
+            return
+        from api.state_sync import sync_session_usage
+
+        messages = getattr(session, "messages", None) or []
+        sync_session_usage(
+            session_id=session.session_id,
+            input_tokens=getattr(session, "input_tokens", None) or 0,
+            output_tokens=getattr(session, "output_tokens", None) or 0,
+            estimated_cost=getattr(session, "estimated_cost", 0.0),
+            model=getattr(session, "model", ""),
+            title=session.title,
+            message_count=len(messages),
+            profile=getattr(session, "profile", None),
+        )
+    except Exception:
+        logger.debug("Failed to update session title in state.db", exc_info=True)
+
+
+def _manual_title_blocks_generation(session) -> bool:
+    """Return True when a user-managed title should not be overwritten."""
+    current = str(getattr(session, "title", "") or "").strip()
+    if getattr(session, "llm_title_generated", False):
+        return False
+    if not current or current in ("Untitled", "New Chat"):
+        return False
+    try:
+        from api.streaming import _is_provisional_title, _looks_invalid_generated_title
+
+        if _is_provisional_title(current, getattr(session, "messages", None) or []):
+            return False
+        if _looks_invalid_generated_title(current):
+            return False
+    except Exception:
+        logger.debug("Could not evaluate title generation guard for session %s", getattr(session, "session_id", ""), exc_info=True)
+    return True
+
+
 def _handle_session_title_refresh(handler, body):
-    """Force-generate and persist a title for a session now."""
+    """Generate and persist a session title through the canonical title flow."""
     try:
         require(body, "session_id")
     except ValueError as e:
@@ -1501,23 +1541,28 @@ def _handle_session_title_refresh(handler, body):
         except KeyError:
             return bad(handler, "Session not found", 404)
 
-        from api.streaming import _recent_exchange_snippets
-
-        user_text, assistant_text = _recent_exchange_snippets(s.messages, _forced_title_context_window())
-        if not (user_text and assistant_text):
-            return bad(handler, "Need at least one complete user/assistant exchange before generating a title")
+        if getattr(s, "read_only", False) or getattr(s, "is_imported", False):
+            return bad(handler, "Read-only imported sessions cannot be renamed", 403)
+        if _manual_title_blocks_generation(s):
+            return j(handler, {
+                "ok": False,
+                "status": "manual_title",
+                "error": "Manual titles are not overwritten by title generation",
+                "session": s.compact(),
+                "title": str(s.title or ""),
+            }, 409)
 
         try:
-            from api import profiles as profiles_api
-
-            with profiles_api.profile_env_for_background_worker(s, "forced session title", logger_override=logger):
-                next_title, status, raw_preview = _generate_forced_session_title(user_text, assistant_text)
+            next_title, status, raw_preview = generate_session_title_for_session(
+                s,
+                recent_exchange_limit=_forced_title_context_window(),
+            )
         except Exception as exc:
-            logger.debug("Forced title generation failed for session %s", sid, exc_info=True)
+            logger.debug("Session title generation failed for session %s", sid, exc_info=True)
             return bad(handler, f"Title generation failed: {exc}", 500)
 
         if not next_title:
-            return bad(handler, f"Could not generate a title ({status or 'empty'})", 502)
+            return bad(handler, f"Could not generate a title ({status or 'empty'})", 422)
 
         with _get_session_agent_lock(sid):
             try:
@@ -1527,13 +1572,28 @@ def _handle_session_title_refresh(handler, body):
                 s = _ensure_full_session_before_mutation(sid, s)
             except KeyError:
                 return bad(handler, "Session not found", 404)
+            if getattr(s, "read_only", False) or getattr(s, "is_imported", False):
+                return bad(handler, "Read-only imported sessions cannot be renamed", 403)
+            if _manual_title_blocks_generation(s):
+                return j(handler, {
+                    "ok": False,
+                    "status": "manual_title",
+                    "error": "Manual titles are not overwritten by title generation",
+                    "session": s.compact(),
+                    "title": str(s.title or ""),
+                }, 409)
             s.title = str(next_title).strip()[:80] or "Untitled"
             s.llm_title_generated = True
             s.save(touch_updated_at=False)
-        publish_session_list_changed("session_title_refresh")
-        payload = {"ok": True, "status": status, "session": s.compact()}
-        if raw_preview:
-            payload["raw_preview"] = raw_preview
+        _sync_session_title_to_insights(s)
+        publish_session_list_changed("session_title_refresh", profile=getattr(s, "profile", None))
+        payload = {
+            "ok": True,
+            "status": status,
+            "session": s.compact(),
+            "title": s.title,
+            "raw_preview": (raw_preview or "")[:240],
+        }
         return j(handler, payload)
     finally:
         with _TITLE_REFRESH_INFLIGHT_LOCK:
@@ -6755,27 +6815,6 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/sessions/cleanup_zero_message":
         return _handle_sessions_cleanup(handler, body, zero_only=True)
 
-    def _sync_session_title_to_insights(session):
-        """Write title-only session metadata updates through to state.db when enabled."""
-        try:
-            if not load_settings().get("sync_to_insights"):
-                return
-            from api.state_sync import sync_session_usage
-
-            messages = getattr(session, "messages", None) or []
-            sync_session_usage(
-                session_id=session.session_id,
-                input_tokens=getattr(session, "input_tokens", None) or 0,
-                output_tokens=getattr(session, "output_tokens", None) or 0,
-                estimated_cost=getattr(session, "estimated_cost", 0.0),
-                model=getattr(session, "model", ""),
-                title=session.title,
-                message_count=len(messages),
-                profile=getattr(session, "profile", None),
-            )
-        except Exception:
-            logger.debug("Failed to update session title in state.db", exc_info=True)
-
     if parsed.path == "/api/session/rename":
         try:
             require(body, "session_id", "title")
@@ -6799,36 +6838,8 @@ def handle_post(handler, parsed) -> bool:
         return True
 
     if parsed.path == "/api/session/title/regenerate":
-        try:
-            require(body, "session_id")
-        except ValueError as e:
-            return bad(handler, str(e))
-        sid = body["session_id"]
-        prefer_latest = bool(body.get("prefer_latest", False))
-        try:
-            s = get_session(sid)
-            s = _ensure_full_session_before_mutation(sid, s)
-        except KeyError:
-            return bad(handler, "Session not found", 404)
-        if getattr(s, "read_only", False) or getattr(s, "is_imported", False):
-            return bad(handler, "Read-only imported sessions cannot be renamed", 403)
-        next_title, reason, raw_preview = generate_session_title_for_session(s, prefer_latest=prefer_latest)
-        if not next_title:
-            return bad(handler, f"Could not generate a better title ({reason or 'empty'})", 422)
-        with _get_session_agent_lock(sid):
-            s.title = str(next_title).strip()[:80] or "Untitled"
-            from api.session_ops import mark_session_title_generated
-            # mark_session_title_generated sets s.llm_title_generated = True and clears manual_title.
-            mark_session_title_generated(s)
-            s.save(touch_updated_at=False)
-        _sync_session_title_to_insights(s)
-        publish_session_list_changed("session_title_regenerate", profile=getattr(s, "profile", None))
-        return j(handler, {
-            "session": s.compact(),
-            "title": s.title,
-            "status": reason,
-            "raw_preview": (raw_preview or "")[:240],
-        })
+        _handle_session_title_refresh(handler, body)
+        return True
 
     if parsed.path == "/api/personality/set":
         try:

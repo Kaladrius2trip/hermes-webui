@@ -886,7 +886,7 @@ const LOCALES = {
     settings_auto_title_refresh_5: 'Every 5 exchanges',
     settings_auto_title_refresh_10: 'Every 10 exchanges',
     settings_auto_title_refresh_20: 'Every 20 exchanges',
-    settings_desc_auto_title_refresh: 'Automatically re-generates the session title based on the latest exchange, keeping it relevant as the conversation evolves. Requires an LLM title generation model to be configured.',
+    settings_desc_auto_title_refresh: 'Automatically re-generates the session title from balanced conversation context, keeping the overall chat theme relevant as the conversation evolves. Requires an LLM title generation model to be configured.',
     settings_desc_external_sessions: 'Show conversations from CLI, Telegram, Discord, Slack, and other channels in the session list. Click to import and continue.',
     settings_desc_all_workspaces: 'When off, the sidebar only shows sessions whose workspace matches the active one.',
     settings_desc_cron_sessions: 'Surface cron job output as conversations in the sidebar. Only active when non-WebUI sessions are enabled. Defaults off; high-frequency jobs can flood the sidebar.',

@@ -406,9 +406,9 @@ class TestMaybeScheduleTitleRefresh:
                 assert mock_thread_cls.called
 
     def test_does_nothing_when_no_exchange_content(self):
-        """Even at interval, if both snippets are empty, don't spawn."""
+        """Even at interval, if balanced snippets are empty, don't spawn."""
         with patch('api.streaming._get_title_refresh_interval', return_value=5), \
-             patch('api.streaming._latest_exchange_snippets', return_value=('', '')):
+             patch('api.streaming._balanced_title_context_snippets', return_value=('', '')):
             spawned = []
             with patch('threading.Thread', side_effect=lambda **kw: spawned.append(kw) or MagicMock()):
                 session = _make_session(messages=[_user_msg('q'), _asst_msg('a')] * 5)

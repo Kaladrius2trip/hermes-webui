@@ -2515,7 +2515,7 @@ async function _forceGenerateSessionTitle(session){
     return;
   }
   _setSessionTitleRefreshInFlight(sid,true);
-  if(typeof showToast==='function') showToast(t('session_title_generating'));
+  if(typeof showToast==='function') showToast(t('session_title_regenerating'),1600);
   try{
     const res=await api('/api/session/title/refresh',{method:'POST',body:JSON.stringify({session_id:sid}),timeoutMs:120000});
     if(res && res.session){
@@ -2530,13 +2530,17 @@ async function _forceGenerateSessionTitle(session){
       renderSessionListFromCache();
     }
     await renderSessionList();
-    if(typeof showToast==='function') showToast(t('session_title_generated'));
+    const nextTitle=(res&&res.title)||(res&&res.session&&res.session.title)||session.title||t('untitled');
+    if(typeof showToast==='function') showToast(t('session_title_regenerated', nextTitle),2400);
   }catch(err){
     if(err&&err.status===409){
-      if(typeof showToast==='function') showToast(t('session_title_already_generating'));
+      const status=(err.body&&err.body.status)||(err.payload&&err.payload.status)||'';
+      if(status==='manual_title'){
+        if(typeof showToast==='function') showToast(t('session_title_regenerate_failed')+(err.message||''),3000,'error');
+      }else if(typeof showToast==='function') showToast(t('session_title_already_generating'));
     }else{
       const detail=err&&err.message?err.message:String(err||'');
-      if(typeof showToast==='function') showToast(t('session_title_generate_failed')+detail,3000,'error');
+      if(typeof showToast==='function') showToast(t('session_title_regenerate_failed')+detail,3000,'error');
     }
   }finally{
     _setSessionTitleRefreshInFlight(sid,false);
@@ -2626,12 +2630,6 @@ function _openSessionActionMenu(session, anchorEl){
         }
       }
     ));
-    menu.appendChild(_buildSessionAction(
-      t('session_generate_title'),
-      t('session_generate_title_desc'),
-      ICONS.wand,
-      async()=>{ await _forceGenerateSessionTitle(session); }
-    ));
   }
   menu.appendChild(_buildSessionAction(
     session.pinned?t('session_unpin'):t('session_pin'),
@@ -2714,26 +2712,7 @@ function _openSessionActionMenu(session, anchorEl){
       t('session_title_regenerate'),
       t('session_title_regenerate_desc'),
       ICONS.spark,
-      async()=>{
-        closeSessionActionMenu();
-        try{
-          if(typeof showToast==='function') showToast(t('session_title_regenerating'), 1600);
-          const response=await api('/api/session/title/regenerate',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
-          const nextTitle=(response&&response.title)||(response&&response.session&&response.session.title)||'';
-          if(nextTitle){
-            session.title=nextTitle;
-            const cached=(_allSessions||[]).find(item=>item&&item.session_id===session.session_id);
-            if(cached) cached.title=nextTitle;
-            if(S.session&&S.session.session_id===session.session_id){S.session.title=nextTitle;syncTopbar();}
-            renderSessionListFromCache();
-          }
-          if(typeof showToast==='function') showToast(t('session_title_regenerated', nextTitle||t('untitled')), 2400);
-        }catch(err){
-          const msg=t('session_title_regenerate_failed')+(err&&err.message?err.message:String(err));
-          setStatus(msg);
-          if(typeof showToast==='function') showToast(msg,3000,'error');
-        }
-      }
+      async()=>{ await _forceGenerateSessionTitle(session); }
     ));
   }
   // Manual status picker (before danger actions)

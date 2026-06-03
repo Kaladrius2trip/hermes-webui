@@ -17,7 +17,9 @@ def test_session_action_menu_exposes_regenerate_title_control():
     assert "session_title_regenerate" in SESSIONS_JS
     assert "session_title_regenerate_desc" in SESSIONS_JS
     assert "ICONS.spark" in SESSIONS_JS
-    assert "api('/api/session/title/regenerate'" in SESSIONS_JS
+    assert "/api/session/title/refresh" in SESSIONS_JS
+    assert "_forceGenerateSessionTitle(session)" in SESSIONS_JS
+    assert "api('/api/session/title/regenerate'" not in SESSIONS_JS
     assert "renderSessionListFromCache();" in SESSIONS_JS
 
 
@@ -32,9 +34,10 @@ def test_imported_sessions_skip_regenerate_action_without_broadening_shared_gate
     assert "session.is_imported" not in helper_block, (
         "_isReadOnlySession must not include is_imported — it gates rename/pin/archive too"
     )
-    # The regenerate action is gated on !session.is_imported next to its api call.
-    regen_idx = SESSIONS_JS.index("api('/api/session/title/regenerate'")
-    guard_window = SESSIONS_JS[regen_idx - 600:regen_idx]
+    # The regenerate action is gated on !session.is_imported next to the shared title helper.
+    regen_idx = SESSIONS_JS.index("t('session_title_regenerate')")
+    action_end = SESSIONS_JS.index("_forceGenerateSessionTitle(session)", regen_idx)
+    guard_window = SESSIONS_JS[regen_idx - 200:action_end]
     assert "if(!session.is_imported){" in guard_window
 
 
@@ -55,12 +58,19 @@ def test_regenerate_endpoint_persists_generated_title_without_reordering_sidebar
     endpoint_idx = ROUTES_PY.index('"/api/session/title/regenerate"')
     next_endpoint_idx = ROUTES_PY.index('"/api/personality/set"', endpoint_idx)
     block = ROUTES_PY[endpoint_idx:next_endpoint_idx]
-    assert "generate_session_title_for_session" in block
-    assert "s.llm_title_generated = True" in block
-    assert "s.save(touch_updated_at=False)" in block
-    assert "_sync_session_title_to_insights(s)" in block
-    assert 'publish_session_list_changed("session_title_regenerate", profile=getattr(s, "profile", None))' in block
-    assert "Read-only imported sessions cannot be renamed" in block
+    assert "_handle_session_title_refresh(handler, body)" in block
+    assert "generate_session_title_for_session" not in block
+    assert "prefer_latest" not in block
+
+    handler_idx = ROUTES_PY.index("def _handle_session_title_refresh")
+    next_helper_idx = ROUTES_PY.index("def _reconcile_stale_stream_state_for_session_rows", handler_idx)
+    handler_block = ROUTES_PY[handler_idx:next_helper_idx]
+    assert "generate_session_title_for_session" in handler_block
+    assert "s.llm_title_generated = True" in handler_block
+    assert "s.save(touch_updated_at=False)" in handler_block
+    assert "_sync_session_title_to_insights(s)" in handler_block
+    assert 'publish_session_list_changed("session_title_refresh", profile=getattr(s, "profile", None))' in handler_block
+    assert "Read-only imported sessions cannot be renamed" in handler_block
 
 
 def test_regenerate_endpoint_syncs_title_to_state_db_when_enabled():

@@ -11,7 +11,7 @@
 
 - Local fork integration stack: model picker keyboard navigation, ultrawide composer width cap, clearer tool-card visuals, Docker cron/gateway docs, and contract-routing docs.
 - Local fork integration stack: context guidance is kept model-facing, terminal supervisor lifecycle is hardened, and session duplicate-merge/index churn paths are optimized.
-- Session title generation now uses the recent exchange window from `auto_title_refresh_every` for both forced and adaptive refreshes, instead of naming from only the latest exchange.
+- Session title generation now uses balanced conversation context (opening goal, recurring topic, and latest exchange) for manual/regenerate/adaptive refreshes, instead of naming from only the first or latest exchange.
 
 ### Fixed
 
