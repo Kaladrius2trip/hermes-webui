@@ -382,6 +382,43 @@ def _load_yaml_config_file(config_path: Path) -> dict:
         return {}
 
 
+def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
+    """Return the config dict for an explicit profile home directory.
+
+    The streaming agent runs on a detached worker thread that does NOT inherit
+    the per-request thread-local profile context (set from the ``hermes_profile``
+    cookie on the HTTP handler thread). On that worker, the ambient
+    ``get_config()`` resolves through ``get_active_profile_name()`` which falls
+    back to the process-global ``_active_profile`` (usually ``default``) — so a
+    session running under a non-default profile would silently read the
+    **default** profile's ``config.yaml`` for toolsets, prefill context, and
+    fallback chains (issue #3294).
+
+    This helper reads the config for a *known* profile home directly off disk,
+    bypassing the thread-local resolver entirely. When ``profile_home`` matches
+    the path the ambient resolver would pick (the common single-profile case),
+    we return the cached ``get_config()`` to preserve in-memory overrides used
+    by tests and runtime callers. Only when the session's profile home diverges
+    from the ambient path do we read the session profile's file directly — a
+    pure read with no global cache mutation, so it is race-free across
+    concurrent sessions on different profiles.
+    """
+    if not profile_home:
+        return get_config()
+    try:
+        target = Path(profile_home).expanduser()
+    except Exception:
+        return get_config()
+    # If the ambient resolver already points at this profile home, defer to
+    # get_config() so in-memory overrides (monkeypatched cfg) are honored.
+    try:
+        if _get_config_path().parent == target:
+            return get_config()
+    except Exception:
+        pass
+    return _load_yaml_config_file(target / "config.yaml")
+
+
 def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
     try:
         import yaml as _yaml
@@ -528,7 +565,7 @@ def verify_hermes_imports() -> tuple:
 
 
 # ── Limits ───────────────────────────────────────────────────────────────────
-MAX_FILE_BYTES = 200_000
+MAX_FILE_BYTES = 400_000
 MAX_UPLOAD_BYTES = _env_mb_bytes("HERMES_WEBUI_MAX_UPLOAD_MB", 20)
 
 # ── File type maps ───────────────────────────────────────────────────────────
@@ -679,6 +716,7 @@ _FALLBACK_MODELS = [
     # Mistral
     {"provider": "Mistral",   "id": "mistralai/mistral-large-latest",     "label": "Mistral Large"},
     # MiniMax
+    {"provider": "MiniMax",   "id": "minimax/MiniMax-M3",               "label": "MiniMax M3"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7",             "label": "MiniMax M2.7"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7-highspeed",   "label": "MiniMax M2.7 Highspeed"},
     # Z.AI / GLM
@@ -704,6 +742,7 @@ _PROVIDER_DISPLAY = {
     "openrouter": "OpenRouter",
     "anthropic": "Anthropic",
     "openai": "OpenAI",
+    "openai-api": "OpenAI API",
     "openai-codex": "OpenAI Codex",
     "xai-oauth": "xAI Grok OAuth",
     "copilot": "GitHub Copilot",
@@ -1061,6 +1100,12 @@ _PROVIDER_MODELS = {
         {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
         {"id": "gpt-5.4",      "label": "GPT-5.4"},
     ],
+    "openai-api": [
+        {"id": "gpt-5.5",      "label": "GPT-5.5"},
+        {"id": "gpt-5.5-mini", "label": "GPT-5.5 Mini"},
+        {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
+        {"id": "gpt-5.4",      "label": "GPT-5.4"},
+    ],
     "openai-codex": [
         {"id": "gpt-5.5", "label": "GPT-5.5"},
         {"id": "gpt-5.5-mini", "label": "GPT-5.5 Mini"},
@@ -1107,17 +1152,13 @@ _PROVIDER_MODELS = {
         {"id": "kimi-k2.5", "label": "Kimi K2.5"},
     ],
     "minimax": [
+        {"id": "MiniMax-M3", "label": "MiniMax M3"},
         {"id": "MiniMax-M2.7", "label": "MiniMax M2.7"},
         {"id": "MiniMax-M2.7-highspeed", "label": "MiniMax M2.7 Highspeed"},
-        {"id": "MiniMax-M2.5", "label": "MiniMax M2.5"},
-        {"id": "MiniMax-M2.5-highspeed", "label": "MiniMax M2.5 Highspeed"},
-        {"id": "MiniMax-M2.1", "label": "MiniMax M2.1"},
     ],
     "minimax-cn": [
+        {"id": "MiniMax-M3", "label": "MiniMax M3"},
         {"id": "MiniMax-M2.7", "label": "MiniMax M2.7"},
-        {"id": "MiniMax-M2.5", "label": "MiniMax M2.5"},
-        {"id": "MiniMax-M2.1", "label": "MiniMax M2.1"},
-        {"id": "MiniMax-M2", "label": "MiniMax M2"},
     ],
     # GitHub Copilot — model IDs served via the Copilot API
     "copilot": [
@@ -1250,14 +1291,29 @@ _PROVIDER_MODELS = {
 
 _AMBIENT_GH_CLI_MARKERS = frozenset({"gh_cli", "gh auth token"})
 
+# Environment variable sources that are auto-detected and should be filtered
+# when the token is a classic PAT (ghp_*) that Copilot API doesn't support.
+# Note: COPILOT_GITHUB_TOKEN is NOT included here - it's user-specific config.
+_AMBIENT_GH_ENV_SOURCES = frozenset({"env:github_token", "env:gh_token"})
+
 
 def _is_ambient_gh_cli_entry(source: str, label: str, key_source: str) -> bool:
     """True when a credential-pool entry is a seeded gh-cli token rather than
     one the user added explicitly. Filter these so Copilot doesn't appear in
     the dropdown just because `gh` is installed on the system.
+
+    Also filters GITHUB_TOKEN and GH_TOKEN env var entries, which are
+    auto-detected from the environment and should not cause Copilot to appear
+    in the picker when the token is a classic PAT (ghp_*) that Copilot API
+    doesn't support.
+
+    Note: COPILOT_GITHUB_TOKEN is NOT filtered - it's user-specific config
+    that should always be respected.
     """
+    source_lower = source.strip().lower()
     return (
-        source.strip().lower() in _AMBIENT_GH_CLI_MARKERS
+        source_lower in _AMBIENT_GH_CLI_MARKERS
+        or source_lower in _AMBIENT_GH_ENV_SOURCES
         or label.strip().lower() == "gh auth token"
         or key_source.strip().lower() == "gh auth token"
     )
@@ -2136,15 +2192,44 @@ def _candidate_supports_reasoning(candidate: str) -> bool:
 
     if "thinking" in token_set or "reasoning" in token_set:
         return True
+    if "gpt" in token_set or normalized.startswith("gpt"):
+        # Restrict to GPT-5+ (exclude GPT-4o/4.1/3.5 — reasoning_effort unsupported)
+        m = re.search(r"gpt-(\d+)", normalized)
+        if m and int(m.group(1)) >= 5:
+            return True
+        return False
     if normalized in {"o1", "o3", "o4"} or normalized.startswith(("o1-", "o3-", "o4-")):
         return True
-    if normalized.startswith(("kimi-k2", "kimi-thinking", "claude-3", "claude-4")):
+    if "claude" in token_set or normalized.startswith("claude"):
+        # Restrict to Claude 4+ or Claude 3.7+ (exclude Claude 3.0/3.5)
+        match = re.search(r"claude.*?(\d+)(?:\D+(\d+))?", normalized)
+        if match:
+            major = int(match.group(1))
+            minor = int(match.group(2)) if match.group(2) else 0
+            if major >= 4 or (major == 3 and minor >= 7):
+                return True
+        return False
+    if "qwen" in token_set or normalized.startswith("qwen"):
+        # Restrict to Qwen 3+ (exclude Qwen 2/2.5)
+        match = re.search(r"qwen.*?(\d+)(?:\D+(\d+))?", normalized)
+        if match:
+            major = int(match.group(1))
+            if major >= 3:
+                return True
+        return False
+    if "kimi" in token_set or normalized.startswith("kimi"):
         return True
-    if normalized.startswith("qwen3") or "qwen3" in token_set:
+    if "minimax" in token_set or normalized.startswith("minimax"):
         return True
-    if normalized.startswith(("deepseek-v3", "deepseek-v4", "deepseek-r1", "deepseek-r2")):
+    if "mimo" in token_set or normalized.startswith("mimo"):
         return True
-    if len(tokens) >= 2 and tokens[0] == "deepseek" and tokens[1] in {"v3", "v4", "r1", "r2"}:
+    if "glm" in token_set or normalized.startswith("glm"):
+        return True
+    if "step" in token_set or normalized.startswith("step"):
+        return True
+    if normalized.startswith(("deepseek-v", "deepseek-r")):
+        return True
+    if len(tokens) >= 2 and tokens[0] == "deepseek" and tokens[1].startswith(("v", "r")):
         return True
     return False
 
@@ -3068,8 +3153,10 @@ def _get_label_for_model(model_id: str, existing_groups: list) -> str:
     if lookup_id.startswith("@") and ":" in lookup_id:
         lookup_id = lookup_id.split(":", 1)[1]
 
-    # Check existing groups for a matching label
-    _norm = lambda s: (s.split("/", 1)[-1] if "/" in s else s).replace("-", ".").lower()
+    # Check existing groups for a matching label.
+    # Skip slash stripping for URI-scheme IDs (e.g. gpt://folder/model) (#3429).
+    _has_scheme = lambda s: "://" in s
+    _norm = lambda s: (s.split("/", 1)[-1] if ("/" in s and not _has_scheme(s)) else s).replace("-", ".").lower()
     norm_lookup = _norm(lookup_id)
     for g in existing_groups:
         for m in g.get("models", []):
@@ -3078,7 +3165,8 @@ def _get_label_for_model(model_id: str, existing_groups: list) -> str:
 
     # Fall back: strip only the first slash-segment (provider prefix),
     # preserving vendor hierarchy for multi-slash IDs (#3360).
-    bare = lookup_id.split("/", 1)[1] if "/" in lookup_id else lookup_id
+    # Skip for URI-scheme IDs whose slashes are path separators (#3429).
+    bare = lookup_id.split("/", 1)[1] if ("/" in lookup_id and not _has_scheme(lookup_id)) else lookup_id
     return " ".join(
         w.upper() if (len(w) <= 3 and w.replace(".", "").isalnum() and not w.isdigit()) else w.capitalize()
         for w in bare.replace("_", "-").split("-")
@@ -3231,14 +3319,18 @@ def get_available_models() -> dict:
             if s.startswith("@") and ":" in s:
                 parts = s.split(":")
                 s = parts[-1] or s
-            # Strip only the first slash-segment (provider prefix), preserving
-            # any remaining vendor hierarchy.  Using parts[-1] here previously
-            # discarded ALL segments except the last, collapsing distinct
-            # multi-slash IDs like 'vendor_a/deepseek-v4-pro' and
-            # 'vendor_b/deepseek/deepseek-v4-pro' to the same key (#3360).
-            if "/" in s:
-                stripped = s.split("/", 1)[1]
-                s = stripped or s
+            # Skip slash-based stripping for URI-scheme IDs (e.g.
+            # gpt://folder/model/latest) whose slashes are path separators,
+            # not provider delimiters (#3429).
+            if "://" not in s:
+                # Strip only the first slash-segment (provider prefix), preserving
+                # any remaining vendor hierarchy.  Using parts[-1] here previously
+                # discarded ALL segments except the last, collapsing distinct
+                # multi-slash IDs like 'vendor_a/deepseek-v4-pro' and
+                # 'vendor_b/deepseek/deepseek-v4-pro' to the same key (#3360).
+                if "/" in s:
+                    stripped = s.split("/", 1)[1]
+                    s = stripped or s
             return s.replace("-", ".")
 
         def _build_configured_model_badges() -> dict[str, dict[str, str]]:
@@ -3507,7 +3599,12 @@ def get_available_models() -> dict:
             if all_env.get("ANTHROPIC_API_KEY"):
                 detected_providers.add("anthropic")
             if all_env.get("OPENAI_API_KEY"):
-                detected_providers.add("openai")
+                # hermes-agent registers its OPENAI_API_KEY/OPENAI_BASE_URL provider
+                # under the slug `openai-api` (there is no bare `openai` in the agent
+                # registry — only `openai-api` and `openai-codex`). Detecting `openai`
+                # here would emit `@openai:` picker entries the agent can't resolve on
+                # the send path, so detect `openai-api` to match the registry (#3443).
+                detected_providers.add("openai-api")
                 # openai-codex uses ChatGPT OAuth (not OPENAI_API_KEY) for its default endpoint.
                 # Detecting it here lets users who have both credentials configured find it in the
                 # picker without a manual config.yaml edit. Users without Codex OAuth will see
@@ -4853,6 +4950,7 @@ _SETTINGS_DEFAULTS = {
     "font_size": "default",  # small | default | large | xlarge
     "session_jump_buttons": False,  # show Start/End transcript jump pills
     "session_endless_scroll": False,  # auto-load older transcript pages while scrolling upward
+    "activity_feed_expanded_default": False,  # expand Activity disclosures by default for new turns
     "pinned_sessions_limit": 3,  # maximum active pinned sessions shown in the sidebar
     "inflight_state_max_sessions": 8,  # max active-stream recovery snapshots kept in browser localStorage
     "inflight_state_max_messages": 24,  # max recent messages kept per recovery snapshot
@@ -5018,6 +5116,7 @@ _SETTINGS_BOOL_KEYS = {
     "api_redact_enabled",
     "session_jump_buttons",
     "session_endless_scroll",
+    "activity_feed_expanded_default",
 }
 # Language codes are validated as short alphanumeric BCP-47-like tags (e.g. 'en', 'zh', 'fr')
 _SETTINGS_LANG_RE = __import__("re").compile(r"^[a-zA-Z]{2,10}(-[a-zA-Z0-9]{2,8})?$")

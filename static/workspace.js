@@ -469,8 +469,8 @@ const HTML_EXTS   = new Set(['.html','.htm']);
 const PDF_EXTS    = new Set(['.pdf']);
 const AUDIO_EXTS  = new Set(['.mp3','.wav','.m4a','.aac','.ogg','.oga','.opus','.flac']);
 const VIDEO_EXTS  = new Set(['.mp4','.mov','.m4v','.webm','.ogv','.avi','.mkv']);
-const MD_PREVIEW_RICH_RENDER_MAX_BYTES = 64 * 1024;
-const MD_PREVIEW_RICH_RENDER_MAX_LINES = 1500;
+const MD_PREVIEW_RICH_RENDER_MAX_BYTES = 256 * 1024;
+const MD_PREVIEW_RICH_RENDER_MAX_LINES = 5000;
 // Binary formats that should download rather than preview
 const DOWNLOAD_EXTS = new Set([
   '.docx','.doc','.xlsx','.xls','.pptx','.ppt','.odt','.ods','.odp',
@@ -504,7 +504,28 @@ function largeMarkdownPlainTextStatus(content){
   const bytes=markdownPreviewByteLength(content);
   const lines=markdownPreviewLineCount(content);
   const sizeLabel=bytes>=1024?`${Math.round(bytes/1024)} KB`:`${bytes} B`;
-  return `Large markdown file (${sizeLabel}, ${lines} lines) shown as plain text. Click Edit to view raw.`;
+  return `Large markdown file (${sizeLabel}, ${lines} lines) shown as plain text. Click "Render as markdown anyway" to force rich rendering, or Edit to view raw.`;
+}
+
+function setLargeMarkdownForceRenderVisible(visible){
+  const btn=$('btnRenderMarkdownAnyway');
+  if(btn) btn.style.display=visible?'inline-flex':'none';
+}
+
+function renderMarkdownPreviewContent(data){
+  showPreview('md');
+  $('previewMd').innerHTML=renderMd(data.content);
+  requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();});
+}
+
+function forceRenderMarkdownPreview(){
+  // #3378 review (Codex): don't force-render from a dirty/open editor — the
+  // cached raw content would not reflect the unsaved edit. Require a saved,
+  // non-dirty state and cached content that belongs to the current file.
+  if(_previewDirty || $('previewEditArea').style.display!=='none') return;
+  if(!_previewRawContent || _previewRawContentPath!==_previewCurrentPath) return;
+  openFile(_previewCurrentPath,{forceRichMarkdown:true});
+  setStatus('Markdown rendered for this file.');
 }
 
 let _previewCurrentPath = '';  // relative path of currently previewed file
@@ -529,6 +550,7 @@ function showPreview(mode){
   // Show "Open in browser" button for iframe-backed document previews
   const openBtn=$('btnOpenInBrowser');
   if(openBtn) openBtn.style.display = (mode==='html'||mode==='pdf')?'inline-flex':'none';
+  setLargeMarkdownForceRenderVisible(false);
 }
 
 function updateEditBtn(){
@@ -554,9 +576,13 @@ async function toggleEditMode(){
         session_id:S.session.session_id, path:_previewCurrentPath, content
       })});
       _previewDirty=false;
-      // Update read-only views
+      // Update read-only views AND the cached raw content so a later
+      // "Render as markdown anyway" force-render reflects the just-saved text
+      // (not the stale pre-edit fetch). #3378 review (Codex).
+      _previewRawContent = content;
+      _previewRawContentPath = _previewCurrentPath;
       if(_previewCurrentMode==='code') $('previewCode').textContent=content;
-      else { $('previewMd').innerHTML=renderMd(content); requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();}); }
+      else renderMarkdownPreviewContent({content});
       $('previewEditArea').style.display='none';
       if(_previewCurrentMode==='code') $('previewCode').style.display='';
       else $('previewMd').style.display='';
@@ -580,6 +606,7 @@ async function toggleEditMode(){
 }
 
 let _previewRawContent = '';  // raw text for md files (to populate editor)
+let _previewRawContentPath = '';  // path that _previewRawContent belongs to (#3378 force-render cache guard)
 
 function cancelEditMode(){
   // Discard changes and return to read-only view
@@ -629,6 +656,7 @@ async function openFile(path, opts={}){
   if(!S.session)return;
   const ext=fileExt(path);
   const bustCache=!!(opts&&opts.bustCache);
+  const forceRichMarkdown=!!(opts&&opts.forceRichMarkdown);
   const cacheBust=bustCache?`&_=${Date.now()}`:'';
 
   // Binary/download-only formats: trigger browser download, don't preview
@@ -673,17 +701,24 @@ async function openFile(path, opts={}){
   } else if(MD_EXTS.has(ext)){
     // Markdown: fetch text, render with renderMd, display as formatted HTML
     try{
-      const data=await api(`/api/file?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
+      // #3378 review (Codex): only reuse cached raw content when it actually
+      // belongs to the requested path. `path===_previewCurrentPath` is tautological
+      // here (_previewCurrentPath was just assigned above), so guard on the
+      // dedicated _previewRawContentPath instead — otherwise a force-render after a
+      // file switch could re-render the previous file's cached content.
+      const data=forceRichMarkdown&&path===_previewRawContentPath&&_previewRawContent
+        ? {content:_previewRawContent}
+        : await api(`/api/file?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
       _previewRawContent = data.content;
-      if(shouldRenderMarkdownPreviewAsPlainText(data.content)){
+      _previewRawContentPath = path;
+      if(!forceRichMarkdown && shouldRenderMarkdownPreviewAsPlainText(data.content)){
         showPreview('code');
         $('previewCode').textContent=data.content;
+        setLargeMarkdownForceRenderVisible(true);
         setStatus(largeMarkdownPlainTextStatus(data.content));
         return;
       }
-      showPreview('md');
-      $('previewMd').innerHTML=renderMd(data.content);
-      requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();});
+      renderMarkdownPreviewContent(data);
     }catch(e){setStatus(t('file_open_failed'));}
   } else if(HTML_EXTS.has(ext)){
     // HTML: render in sandboxed iframe via raw endpoint.
@@ -848,9 +883,16 @@ if (typeof document !== 'undefined') {
   const _wsUploadInit = () => {
     const tree = $('fileTree');
     if (!tree) return;
+    tree.addEventListener('dragenter', (e) => {
+      if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    });
     tree.addEventListener('dragover', (e) => {
       if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
         e.preventDefault();
+        e.stopPropagation();
         e.dataTransfer.dropEffect = 'copy';
         tree.classList.add('drag-over-upload');
       }
@@ -862,6 +904,7 @@ if (typeof document !== 'undefined') {
       tree.classList.remove('drag-over-upload');
       if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes('Files')) return;
       e.preventDefault();
+      e.stopPropagation();
       for (const file of e.dataTransfer.files) {
         await uploadToWorkspace(file, S.currentDir || '.');
       }

@@ -2739,6 +2739,49 @@ def _active_state_db_path() -> Path:
     return hermes_home / 'state.db'
 
 
+def agent_session_row_exists(session_id: str, *, profile=None) -> bool:
+    """Return True if ``session_id`` still has a backing row in the agent state.db.
+
+    Used to detect orphaned imported-CLI sidecars (#3238): the WebUI sidebar
+    must NOT rely on the session's presence in ``get_cli_sessions()`` to decide
+    whether its backing CLI row still exists, because that helper caps at
+    ``CLI_VISIBLE_SESSION_LIMIT`` (20) rows — a still-existing session can fall
+    out of the recent window and look "deleted." This is an exact, uncapped
+    existence probe against the ``sessions`` table.
+
+    Degrades safely to ``True`` (assume present) on any error or when the DB is
+    unreadable, so a transient failure never causes a stale-pruning data loss.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    try:
+        import sqlite3
+    except ImportError:
+        return True
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not db_path.exists():
+        # No agent DB at all on this instance — can't claim the row is gone.
+        return True
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            cols = {str(row[1]) for row in cur.fetchall()}
+            if 'id' not in cols:
+                return True
+            cur.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (sid,))
+            return cur.fetchone() is not None
+    except Exception:
+        logger.debug("agent_session_row_exists probe failed for %s", sid, exc_info=True)
+        return True
+
+
 def _sidebar_title_is_generic_webui(title: str | None) -> bool:
     text = ' '.join(str(title or '').split())
     if text == 'Hermes WebUI':
@@ -3888,6 +3931,29 @@ def _session_message_merge_key(msg: dict):
     )
 
 
+def _session_message_dedup_key(msg: dict):
+    """Like _session_message_merge_key but preserves full-precision timestamp.
+
+    Two messages are true duplicates only if role, content, AND exact
+    timestamp all match.  Sub-second timestamp differences indicate
+    legitimately distinct messages (e.g. two assistant turns within the
+    same wall-clock second).
+    """
+    if not isinstance(msg, dict):
+        return ("non_dict", repr(msg))
+    message_identity = msg.get("id") or msg.get("message_id")
+    if message_identity:
+        return ("message_id", str(message_identity))
+    return (
+        "legacy",
+        str(msg.get("role") or ""),
+        str(msg.get("content") or ""),
+        str(msg.get("timestamp") or ""),
+        str(msg.get("tool_call_id") or ""),
+        str(msg.get("tool_name") or msg.get("name") or ""),
+    )
+
+
 def _normalized_session_message_content(msg: dict) -> str:
     if not isinstance(msg, dict):
         return repr(msg)
@@ -4064,17 +4130,34 @@ def merge_session_messages_append_only(
         return sidecar_messages
     if not sidecar_messages:
         if watermark_timestamp is not None:
-            return [
+            filtered = [
                 msg for msg in state_messages
                 if (
                     (timestamp := _message_timestamp_as_float(msg)) is not None
                     and timestamp <= watermark_timestamp
                 )
             ]
-        return state_messages
+        else:
+            filtered = state_messages
+        # Deduplicate true duplicates (same role, content, exact timestamp)
+        # without collapsing legitimately-repeated identical turns (#3346).
+        # Note: rows whose timestamps were mutated by compaction/recovery to
+        # microsecond-different values will not be folded — only byte-identical
+        # timestamps are treated as the same message.  This is intentional;
+        # collapsing same-second distinct turns would be worse than retaining
+        # a compaction-restamped duplicate.
+        seen = set()
+        deduped = []
+        for msg in filtered:
+            key = _session_message_dedup_key(msg)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(msg)
+        return deduped
 
     merged_messages = []
     seen_message_keys = set()
+    seen_dedup_keys = set()
     seen_content_keys = set()
     seen_visible_keys = set()
     sidecar_visible_sequence = []
@@ -4087,6 +4170,7 @@ def merge_session_messages_append_only(
             max_sidecar_timestamp = timestamp if max_sidecar_timestamp is None else max(max_sidecar_timestamp, timestamp)
         key = _session_message_merge_key(msg)
         seen_message_keys.add(key)
+        seen_dedup_keys.add(_session_message_dedup_key(msg))
         seen_content_keys.add(_session_message_content_key(msg))
         visible_key = _session_message_visible_key(msg)
         seen_visible_keys.add(visible_key)
@@ -4135,6 +4219,9 @@ def merge_session_messages_append_only(
                 skipped_state_visible_counts[matched_visible_key] = (
                     skipped_state_visible_counts.get(matched_visible_key, 0) + 1
                 )
+            # Record dedup key so later duplicates of this replayed message
+            # are caught by the dedup guard (#3346).
+            seen_dedup_keys.add(_session_message_dedup_key(msg))
             continue
         # Skip rows ABOVE the watermark only while the sidecar has NOT advanced
         # past the watermark. Because Session.save() no longer auto-clears the
@@ -4173,12 +4260,24 @@ def merge_session_messages_append_only(
             and _session_message_content_key(msg) not in seen_content_keys
         ):
             continue
+        # Check for true duplicates using full-precision timestamp (#3346).
+        # Must run before the merge-key guards so that legitimately distinct
+        # sub-second messages with the same second-level merge key are not
+        # collapsed.  The merge key truncates to seconds; the dedup key does
+        # not.
+        dedup_key = _session_message_dedup_key(msg)
+        if dedup_key in seen_dedup_keys:
+            continue
         if max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
-            if key in seen_message_keys:
+            # For message_id keys the merge key is authoritative — skip if
+            # already seen.  For legacy keys the dedup check above already
+            # handled true duplicates; same-second distinct messages must
+            # fall through.
+            if key in seen_message_keys and key[0] == "message_id":
                 continue
             if not (isinstance(key, tuple) and key[:1] == ("message_id",)):
                 continue
-        if key in seen_message_keys:
+        if key in seen_message_keys and key[0] == "message_id":
             continue
         matched_visible_key = _matching_visible_duplicate(
             visible_key, sidecar_visible_keys, _cache=_visible_cache
@@ -4206,8 +4305,8 @@ def merge_session_messages_append_only(
             and timestamp <= max_sidecar_timestamp
         ):
             continue
-        if key[0] == "message_id":
-            seen_message_keys.add(key)
+        seen_message_keys.add(key)
+        seen_dedup_keys.add(dedup_key)
         seen_content_keys.add(_session_message_content_key(msg))
         seen_visible_keys.add(visible_key)
         merged_messages.append(msg)

@@ -17,6 +17,116 @@
 
 - Local fork integration stack: provider-key 403 removal errors now show a clearer toast, streaming preserves underscores, interim progress remains visible, and older-history tail loading keeps cumulative windows stable.
 
+## [v0.51.229] — 2026-06-03 — Release GW (stage-p13 — /model never silently snaps a versioned name to a -tier variant)
+
+### Fixed
+- `/model <name>` no longer silently snaps a complete versioned model name to a longer `-tier` variant (and a different price tier). When the typed name ends in a version number (e.g. `mimo-v2.5`) and the catalog has only a longer suffixed variant (e.g. `xiaomi/mimo-v2.5-pro`), both the dropdown matcher (`_findModelInDropdown`) and the command fallback (`_bestModelMatch`) now reject the snap unless the extra text *continues the version* (`.` + digit), rather than upgrading the user to a `-pro`/`-flash` tier they did not type. When nothing matches cleanly, `/model` now shows a *"No model matching … — did you mean …?"* suggestion toast instead of silently switching. Legitimate fuzzy shorthand is preserved (`/model gpt-5` → `gpt-5.4-mini`, `/model claude` → `claude-opus-4.6`, `/model mimo-v2` → `mimo-v2.5-pro`), as is exact-match priority (#3368, with @garyd9; thanks @yutaotie for confirmation).
+
+## [v0.51.228] — 2026-06-03 — Release GV (stage-p12 — workspace file-tree drop + large-markdown preview)
+
+### Fixed
+- Dropping an OS file onto the **workspace file tree** now uploads it into the workspace only, instead of *also* attaching it to the chat composer. The tree's drag handlers now stop event propagation for OS `Files` drops so the document-level composer drop handler no longer fires for the same drop (#3411, @pamnard).
+- Moderately large Markdown documents in the **workspace preview** are no longer forced into plain-text too early. The rich-render ceiling is raised (64 KB / 1500 lines → 256 KB / 5000 lines, and the backend file-read limit 200 KB → 400 KB), and files above the limit gain a **"Render as markdown anyway"** button that force-renders the already-loaded content without a second fetch (#3378, @starGazerK).
+
+## [v0.51.227] — 2026-06-03 — Release GU (stage-p11 — keep the active New Chat visible in the sidebar)
+
+### Fixed
+- A freshly-created **New Chat** now stays visible and selected in the sidebar before its first message is sent. The sidebar intentionally filters inactive 0-message sessions, but that filter also hid the *currently active* blank chat until the user sent a turn — so starting a New Chat could make the selected row vanish from the list. The active ephemeral session is now injected into the sidebar render rows (only when the server-side list omits it), while inactive empty sessions stay filtered as before. Starting a New Chat from a CLI-filtered sidebar also switches the source filter back to WebUI so the active chat isn't immediately hidden (#3408, @AJV20).
+
+## [v0.51.226] — 2026-06-03 — Release GT (stage-p9 — mobile composer context-usage ring + activity-feed default-expand setting)
+
+### Added
+- **Settings → Appearance: "Expand activity feed by default"** — a new checkbox (default off) that expands new Activity disclosures by default as turns arrive. Manual per-turn collapse/expand still wins (an explicit user toggle is preserved), and live "Waiting on model" rows now explain what the agent is doing before and after tool calls (#3080, @AJV20).
+
+### Changed
+- The mobile composer's config button now shows a **context-usage ring** (an SVG progress ring with a centered percentage) in place of the static sliders icon, color-coded green (≤50%) / orange (≤85%) / red (>85%) and reset to 0% on a new session, so context-window pressure is visible at a glance on mobile (#3062, @NottheGuy007).
+
+## [v0.51.225] — 2026-06-03 — Release GS (stage-p7 — remote gateway health probe resolves gateway_state)
+
+### Fixed
+- The remote-gateway health probe now correctly reports `gateway_state`, so the Tasks/Cron banner lights up for Docker / remote-gateway deployments. The probe previously hit `/health` and `/status` (neither returns `gateway_state`) and never queried `/health/detailed` (which does), so `gateway_state == "running"` was never observed remotely. The probe now tries `/health/detailed` first, parses the JSON body of a 2xx response to extract `gateway_state`, and unifies the gateway base-URL env precedence to `GATEWAY_HEALTH_URL` > `HERMES_GATEWAY_HEALTH_URL` > `HERMES_API_URL` (#3355, @rodboev).
+
+## [v0.51.224] — 2026-06-03 — Release GR (stage-p6 — profile tool/skill config authoritative on the streaming worker)
+
+### Fixed
+- Profile tool/skill restrictions are now respected for WebUI chats even when the per-session "Tool Restrictions" field is left blank. The streaming agent runs on a detached worker thread that does not inherit the per-request thread-local profile context, so the ambient `get_config()` resolved the process-global `default` profile and loaded its `platform_toolsets.cli` (all tools) instead of the session profile's configured list — inflating a tools-disabled profile's prompt from ~400 to ~15K input tokens. The worker now reads the session's own profile config explicitly via a new `get_config_for_profile_home()` helper (a race-free direct disk read with no shared-cache mutation), so toolsets, prefill context, and fallback chains all match the profile the session actually runs under (#3294, @nesquena-hermes).
+
+## [v0.51.223] — 2026-06-02 — Release GQ (stage-p5 — openai-api first-class picker provider + MiniMax-M3)
+
+### Fixed
+- GPT models now appear in the model picker when hermes-agent exposes its built-in OpenAI provider under the `openai-api` slug (the one activated by `OPENAI_API_KEY` / `OPENAI_BASE_URL`, distinct from `openai-codex`). `openai-api` is now a first-class picker provider in `_PROVIDER_DISPLAY` / `_PROVIDER_MODELS` rather than an alias of `openai` — an alias would have fixed the display but broken the send path, since the agent registry has `openai-api` and not `openai`. Env detection for `OPENAI_API_KEY` was also corrected to surface `openai-api` instead of a bare `openai` the agent registry can't resolve (#3443, @rodboev).
+
+### Changed
+- MiniMax default model catalog upgraded to M3 in the model picker (#3374, @octo-patch).
+
+## [v0.51.222] — 2026-06-02 — Release GP (stage-p4 — backend bugfix batch: title language drift + orphaned CLI sidecar prune + pin-quota lineage)
+
+### Fixed
+- Auto-generated session titles no longer persist in the wrong language. The title-language guard previously only rejected English titles for *German* conversation starts, so an English chat whose LLM-generated title came back in Chinese, Russian, or another script sailed through and was saved. `_title_language_mismatch` now also does a language-agnostic cross-script check: when the conversation start has a clear dominant writing script and the generated title introduces a substantial amount of a different script (CJK / Cyrillic / Arabic / etc.), the title is rejected and generation falls back to the deterministic topic title. The threshold tolerates a borrowed technical term (a CJK title with one English word still trips; an English title with a single foreign place-name does not), and the legacy German→English heuristic is preserved (#3293).
+- WebUI sidebar now reconciles orphaned imported-CLI sessions. When a CLI/agent session is opened in the WebUI it gets a WebUI-owned sidecar so it can render and reopen; previously, if the user then deleted that session from the CLI / local Hermes storage, nothing pruned the sidecar and the stale row lingered in the sidebar indefinitely (there is no WebUI delete affordance for CLI rows). Orphaned sidecars whose backing session no longer exists are now pruned on reconciliation (#3238).
+- Pin quota is now counted by visible session lineage rather than raw session rows, so continuation siblings in the same sidebar-visible lineage no longer each consume a separate pin slot. Previously a pinned session that had been compressed/continued into multiple rows could exhaust the pin limit with what the user sees as a single pinned conversation. The limit check now collapses each lineage to its visible root before counting against `pinned_sessions_limit` (#3288, @andrewkangkr).
+
+## [v0.51.221] — 2026-06-02 — Release GO (stage-p3e — block all workspace symlink escapes [security])
+
+### Security
+- The workspace file API now blocks **all** symlink escapes from the selected workspace, not just symlinks pointing at system directories. Previously a symlink placed inside a workspace could resolve to an arbitrary external host path (e.g. `~/.ssh`, `~/.hermes/auth.json`) and be read through `/api/list` / `read_file_content` — and since that API is reachable by LLM agent tool calls, an imported or crafted workspace could expose credentials. `safe_resolve_ws` now requires the resolved path stay under the workspace root, `list_dir` hides escaping symlinks (they could never be opened anyway), and `read_file_content` rejects them. Symlinks that resolve back under the workspace still work normally. The directory-list, file-read, file-upload, and archive-extraction paths are additionally hardened against a symlink-swap **TOCTOU** race: each path is opened component-by-component from the workspace root with `O_NOFOLLOW` (an anchored `openat` walk on Linux/macOS, with a plain-open fallback on platforms without `dir_fd` support such as Windows, where creating symlinks needs admin anyway), so a symlink raced into any component after the containment check cannot redirect the read/list/write outside the workspace. Note: an intentional in-workspace symlink pointing to an external directory is no longer followed (#3398, @Hinotoi-agent).
+
+## [v0.51.220] — 2026-06-02 — Release GN (stage-p3c — fix aux title generation with @provider: model ids)
+
+### Fixed
+- Manual session-title regeneration and background auxiliary title generation no longer fail with `422` / `llm_error_aux` when `auxiliary.title_generation.model` in `config.yaml` is set using the WebUI model-picker's `@provider:model` format (e.g. `@gemini:gemini-3.1-flash-lite`). The `@provider:` prefix is now normalized away via the canonical helper before the id reaches the provider API (#3430, @pamnard).
+
+## [v0.51.219] — 2026-06-02 — Release GM (stage-p3b — extend URI-scheme model-ID fix to backend normalization + matching)
+
+### Fixed
+- Extended the #3429 URI-scheme fix beyond the visible model chip (fixed in v0.51.218) to the model-identity normalization and matching paths: `api/config.py` `_norm_model_id` / `_get_label_for_model` and `static/ui.js` `_normalizeConfiguredModelKey` no longer strip the first `/`-segment of a `scheme://` id (e.g. `gpt://${FOLDER}/model/latest`), where the slashes are path separators rather than a provider prefix. This prevents the #3360-class identity collision/mislabel for URI-shaped model IDs in dropdown matching, badge assignment, and configured-entry dedup. Backend/front-end parity is covered by tests (#3436, @b3nw).
+
+## [v0.51.218] — 2026-06-02 — Release GL (stage-p3a — fix getModelLabel mangling URI-scheme model IDs)
+
+### Fixed
+- The composer model chip no longer shows env-var path junk for model IDs that use a URI scheme (e.g. Yandex `gpt://${FOLDER}/deepseek-v4-flash/latest`). A regression from #3366 (v0.51.210): `getModelLabel()` stripped the first `/`-segment, which for a `scheme://` id landed inside the `://` and left `/${FOLDER}/…`. The label now detects a URI scheme, drops scheme + authority, and takes the last meaningful path segment (skipping `${…}` placeholders and bare version tails like `latest`); non-URI multi-slash IDs keep their #3360 behavior (#3429).
+
+## [v0.51.217] — 2026-06-02 — Release GK (stage-p2f — decode and complete zh-Hant locale strings)
+
+### Changed
+- Decoded the `zh-Hant` (Traditional Chinese) locale block from `\u`-escaped sequences to literal Chinese text and backfilled missing keys so `zh-Hant` now has full coverage of the English key set. Makes future locale review readable and prevents newer UI keys from falling back to English for Traditional Chinese users. Locale-only — no runtime behavior change (#3414, @PeterDaveHello).
+
+### Fixed
+- Added the missing `provider_mismatch_warning` string to the French (`fr`) locale. It was absent entirely; the gap was masked by a stale duplicate of the same key in the `zh-Hant` block that #3414 removed, so all locales now carry the key.
+
+## [v0.51.216] — 2026-06-02 — Release GJ (stage-p2e — fix consecutive-user-turn rejection on strict chat templates)
+
+### Fixed
+- WebUI session/delivery context (connected platforms, home channels, scheduled-task delivery hints) is now injected into the ephemeral **system prompt** instead of being appended as a prefill `user` message. The old prefill produced two consecutive `user` turns (session context + the actual message), which models with strict chat templates (Mistral, Gemma via llama.cpp) reject with a Jinja 500. The same context is preserved — just delivered in a role-alternation-safe place (#3324, @aether-agent, closes #3276).
+
+## [v0.51.215] — 2026-06-02 — Release GI (stage-p2d — deduplicate legacy messages in append-only merge)
+
+### Fixed
+- `merge_session_messages_append_only` now deduplicates true duplicate legacy messages (same role, content, AND exact timestamp) that could accumulate in state, while preserving legitimately-repeated identical turns whose timestamps differ even slightly. This avoids both the stale-duplicate buildup and the data-loss class where collapsing same-second distinct turns would drop real messages (#3393, @thanhtoantnt, closes #3346).
+
+## [v0.51.214] — 2026-06-02 — Release GH (stage-p2c — preserve loaded transcript width on same-session external refresh)
+
+### Fixed
+- A same-session external refresh (e.g. a background poll triggering a force-reload of the conversation you're reading) no longer collapses a long transcript back to the default 30-message tail window and jumps the viewport to a different slice. The already-loaded transcript width and scroll position are now captured before the in-memory transcript is cleared and preserved across the authoritative reload (#3326, @viraatdas, closes #3239).
+
+## [v0.51.213] — 2026-06-02 — Release GG (stage-p2b — keep gateway context visible in chat transcripts)
+
+### Fixed
+- Gateway-backed chat now backfills model-context turns into the visible transcript before saving the latest reply, while keeping hidden `[context compaction]` markers out of the visible transcript. Previously a context-compacted gateway session could collapse the sidebar/header message count to a two-message conversation (and drop older visible turns) while the assistant was responding to hidden prior context. Older visible turns are preserved and compaction markers stay hidden from `saved.messages` (#3300, @AJV20).
+
+## [v0.51.212] — 2026-06-02 — Release GF (stage-batch2 — i18n regenerate-title strings + self-restart argv + todos cold-load)
+
+### Fixed
+- Localized the five `session_title_regenerate*` session-menu strings (the "Regenerate title" action, its description, and the regenerating/regenerated/failed states) that shipped as English text in every non-English locale. Translated across it, ja, ru, es, de, zh, zh-Hant, pt, ko, fr, and tr, matching each locale's existing terminology; `zh`/`zh-Hant` keep the `\u`-escaped style of those blocks (#3396, @vanshaj-pahwa, closes #3364).
+- Self-update re-exec now distinguishes source checkouts from frozen/packaged builds: a frozen binary (`sys.frozen`) re-execs with `sys.argv` as-is, while source checkouts keep the `[sys.executable] + sys.argv` CPython idiom. Previously the frozen path re-inserted the binary as `argv[1]`, turning re-exec into a no-op that left the WebUI stuck "offline" after every self-update (#3395, @PatrickNoFilter).
+- The Todos panel now hydrates correctly on a cold session load (page refresh) even when the latest todo tool result is outside the truncated display window: `/api/session` derives a compact `todo_state` sidecar from the full settled transcript, and an explicit empty todo list is honored as the current state instead of falling through to an older non-empty write. A malformed historical tool message can never break session loading (#3373, @v2psv).
+
+## [v0.51.211] — 2026-06-02 — Release GE (stage-batch1 — reasoning heuristics + /model shortest-match + Copilot env-token filter)
+
+### Fixed
+- Generalized reasoning-effort capability checks in `_candidate_supports_reasoning` to target whole model families (GPT-5+, Claude 4/3.7, Qwen-3, Kimi, Minimax, Mimo, GLM, Step, and DeepSeek) instead of anchoring on hardcoded version numbers or vendor formats. This prevents the thinking-level configuration selector from being hidden on custom providers, new model releases, or when names carry suffixes like `-free` or `:free` (common on integrations such as Kilo Code or OpenCode Zen). The GPT heuristic is now version-anchored (5+) to avoid falsely enabling reasoning_effort for gpt-4o/4.1/3.5 on aggregator providers (#3379, @b3nw, closes #3377).
+- The `/model` slash command no longer selects a longer model variant when a shorter name is a prefix of it (e.g. `/model mimo-v2.5` selecting `mimo-v2.5-pro`). The fuzzy fallback now prefers an exact id/label match and otherwise the shortest matching option, applied to both the main and bare-name (`provider/...`) fallbacks (#3394, @vanshaj-pahwa, closes #3368).
+- `GITHUB_TOKEN` and `GH_TOKEN` environment variables are now filtered from the Copilot credential pool alongside the seeded `gh`-CLI token, so a classic PAT (`ghp_*`) auto-detected from the environment no longer makes Copilot appear in the model picker when the Copilot API can't use it. User-specific `COPILOT_GITHUB_TOKEN` is still respected (#3382, @happy5318).
 ## [v0.51.210] — 2026-06-02 — Release GD (stage-batch1 — model-picker multi-slash fix + extensionless preview highlighting)
 
 ### Fixed

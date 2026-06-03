@@ -11,7 +11,7 @@ from pathlib import Path
 from api.config import MAX_UPLOAD_BYTES, STATE_DIR
 from api.helpers import j, bad
 from api.models import get_session
-from api.workspace import safe_resolve_ws, resolve_trusted_workspace
+from api.workspace import safe_resolve_ws, resolve_trusted_workspace, open_anchored_create_fd, make_anchored_dir
 
 
 def _max_extracted_bytes() -> int:
@@ -211,7 +211,8 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
             dest_dir = safe_resolve_ws(workspace, stem).with_name(stem + '_' + suffix)
         else:
             raise ValueError('Could not allocate a unique extraction directory')
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    # #3398: create the extraction root race-safely under the true workspace root.
+    make_anchored_dir(workspace, dest_dir)
 
     # Member-count cap: a tiny archive with millions of (possibly empty) members
     # slips under the byte cap but can exhaust inodes / file descriptors. Bound it.
@@ -243,8 +244,12 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
                             f'{cap // (1024*1024)} MB limit). '
                             f'Possible zip bomb.'
                         )
-                    member_path.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member) as src, open(member_path, 'wb') as dst:
+                    # #3398: open_anchored_create_fd creates intermediate dirs
+                    # race-safely under the true workspace root (anchored mkdirat),
+                    # so no pathname member_path.parent.mkdir() before it (which
+                    # could be redirected outside by a raced symlink component).
+                    _mfd = open_anchored_create_fd(workspace, member_path)
+                    with zf.open(member) as src, os.fdopen(_mfd, 'wb', closefd=True) as dst:
                         _chunk_size = 65536
                         while True:
                             chunk = src.read(_chunk_size)
@@ -281,10 +286,13 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
                             f'{cap // (1024*1024)} MB limit). '
                             f'Possible zip bomb.'
                         )
-                    member_path.parent.mkdir(parents=True, exist_ok=True)
+                    # #3398: anchored member create makes intermediate dirs
+                    # race-safely; no pathname member_path.parent.mkdir() first.
                     src_obj = tf.extractfile(member)
                     if src_obj:
-                        with src_obj as src, open(member_path, 'wb') as dst:
+                        # #3398: fd-anchored member create under the TRUE workspace root.
+                        _mfd = open_anchored_create_fd(workspace, member_path)
+                        with src_obj as src, os.fdopen(_mfd, 'wb', closefd=True) as dst:
                             _chunk_size = 65536
                             while True:
                                 chunk = src.read(_chunk_size)
@@ -428,7 +436,12 @@ def handle_workspace_upload(handler):
         # workspace==target equality case, so the normal subpath='' path passes.)
         if not target_dir.resolve().is_relative_to(workspace.resolve()):
             return j(handler, {'error': 'Upload target escapes workspace'}, status=403)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        # #3398: create the upload target dir race-safely under the workspace root
+        # (anchored mkdirat) so a raced symlink subpath can't mkdir outside.
+        try:
+            make_anchored_dir(workspace, target_dir)
+        except (ValueError, OSError):
+            return j(handler, {'error': 'Upload target escapes workspace'}, status=403)
 
         results = []
         for _field_name, (filename, file_bytes) in files.items():
@@ -458,7 +471,19 @@ def handle_workspace_upload(handler):
                 else:
                     return j(handler, {'error': 'Too many uploads with the same filename'}, status=400)
 
-            dest.write_bytes(file_bytes)
+            # #3398 TOCTOU hardening: create the destination via an anchored
+            # openat-walk from the true workspace root with O_CREAT|O_EXCL|
+            # O_NOFOLLOW, so a symlink raced into any path component after the
+            # containment checks above cannot redirect the write outside the
+            # workspace. The dedup loop guarantees `dest` does not exist.
+            try:
+                _wfd = open_anchored_create_fd(workspace, dest.resolve())
+            except FileExistsError:
+                return j(handler, {'error': f'Upload destination already exists: {safe_name}'}, status=409)
+            except (ValueError, OSError):
+                return j(handler, {'error': f'Path traversal blocked: {safe_name}'}, status=403)
+            with os.fdopen(_wfd, 'wb', closefd=True) as _wfh:
+                _wfh.write(file_bytes)
             mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
 
             # For archives, optionally extract into the target directory.
