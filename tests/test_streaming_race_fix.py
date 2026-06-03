@@ -225,3 +225,150 @@ class TestReconnectAccumulatorPreservation:
         assert 'S.session&&S.session.session_id' in fn
         assert '!==activeSid' in fn
         assert fn.index('!==activeSid') < fn.index('api(`/api/chat/stream/status?stream_id=')
+
+
+class TestLiveAssistantRestoreReconciliation:
+    """Live DOM restore must not preserve duplicate active assistant segments."""
+
+    def test_restore_merge_prunes_duplicate_live_assistant_segments(self):
+        """Regression for the observed shape: a restored memory snapshot can
+        contain two adjacent live assistant segments with the same prefix, while
+        the freshly rendered existing turn has the longer current text.  Merging
+        the existing segment into the restored turn must leave exactly one live
+        owner for that text; otherwise tokens update the upper copy while the
+        lower stale copy keeps the blue cursor.
+        """
+        import json
+        import shutil
+        import subprocess
+
+        node = shutil.which('node')
+        if node is None:
+            import pytest
+            pytest.skip('node not on PATH')
+
+        src = read('static/ui.js')
+
+        def extract_func(name, required=True):
+            m = re.search(rf'function {name}\(', src)
+            if not m:
+                if required:
+                    raise AssertionError(f'{name} not found')
+                return ''
+            start = m.start()
+            brace = src.index('{', start)
+            depth = 0
+            for i in range(brace, len(src)):
+                if src[i] == '{':
+                    depth += 1
+                elif src[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return src[start:i + 1]
+            raise AssertionError(f'{name} body not found')
+
+        fns = '\n'.join([
+            extract_func('_assistantTurnBlocks'),
+            extract_func('_liveAssistantSegmentText', required=False),
+            extract_func('_liveAssistantSegmentTextLength'),
+            extract_func('_liveAssistantSegmentsDuplicate', required=False),
+            extract_func('_mergeRestoredLiveAssistantSegment'),
+            extract_func('_dedupeLiveAssistantSegments', required=False),
+        ])
+        driver = r'''
+class El {
+  constructor(tag='div', attrs={}, classes=[]) {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.parentElement = null;
+    this.attrs = {...attrs};
+    this.className = classes.join(' ');
+    this._text = '';
+  }
+  appendChild(child){ child.parentElement = this; this.children.push(child); return child; }
+  cloneNode(deep=false){
+    const copy = new El(this.tagName.toLowerCase(), {...this.attrs}, this.className.split(/\s+/).filter(Boolean));
+    copy._text = this._text;
+    if(deep) this.children.forEach(ch => copy.appendChild(ch.cloneNode(true)));
+    return copy;
+  }
+  replaceWith(node){
+    const parent = this.parentElement;
+    const idx = parent.children.indexOf(this);
+    if(idx < 0) throw new Error('replace target missing');
+    node.parentElement = parent;
+    parent.children[idx] = node;
+    this.parentElement = null;
+  }
+  insertAdjacentElement(position, node){
+    if(position !== 'afterend') throw new Error('unsupported insert position');
+    const parent = this.parentElement;
+    const idx = parent.children.indexOf(this);
+    node.parentElement = parent;
+    parent.children.splice(idx + 1, 0, node);
+  }
+  remove(){
+    if(!this.parentElement) return;
+    const idx = this.parentElement.children.indexOf(this);
+    if(idx >= 0) this.parentElement.children.splice(idx, 1);
+    this.parentElement = null;
+  }
+  get textContent(){ return this._text + this.children.map(ch => ch.textContent).join(''); }
+  set textContent(value){ this._text = String(value || ''); this.children = []; }
+  getAttribute(name){ return this.attrs[name]; }
+  setAttribute(name, value){ this.attrs[name] = String(value); }
+  matches(selector){
+    return selector.split(',').some(sel => {
+      sel = sel.trim();
+      if(sel === '.assistant-turn-blocks') return this.className.split(/\s+/).includes('assistant-turn-blocks');
+      if(sel === '.msg-body') return this.className.split(/\s+/).includes('msg-body');
+      if(sel === '.tool-card-row') return this.className.split(/\s+/).includes('tool-card-row');
+      if(sel === '.tool-call-group') return this.className.split(/\s+/).includes('tool-call-group');
+      if(sel === '.agent-activity-thinking') return this.className.split(/\s+/).includes('agent-activity-thinking');
+      if(sel === '.thinking-card-row') return this.className.split(/\s+/).includes('thinking-card-row');
+      if(sel === '[data-live-assistant="1"]') return this.attrs['data-live-assistant'] === '1';
+      return false;
+    });
+  }
+  querySelector(selector){ return this.querySelectorAll(selector)[0] || null; }
+  querySelectorAll(selector){
+    const out = [];
+    const visit = node => {
+      for(const child of node.children){
+        if(child.matches(selector)) out.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+function segment(text){
+  const seg = new El('div', {'data-live-assistant':'1'}, ['assistant-segment']);
+  const body = new El('div', {}, ['msg-body']);
+  body.textContent = text;
+  seg.appendChild(body);
+  return seg;
+}
+function turn(children){
+  const row = new El('div', {}, ['msg-row', 'assistant-turn']);
+  const blocks = new El('div', {}, ['assistant-turn-blocks']);
+  row.appendChild(blocks);
+  children.forEach(ch => blocks.appendChild(ch));
+  return row;
+}
+'''
+        driver += '\n' + fns + r'''
+const partial = 'Ref command hit known pitfall (rev-parse one ref only). Повторю правильно.';
+const current = partial + ' Re-running with an explicit branch and workspace.';
+const restored = turn([segment(partial), segment(partial)]);
+const existing = turn([segment(current)]);
+_mergeRestoredLiveAssistantSegment(restored, existing);
+const texts = restored.querySelectorAll('[data-live-assistant="1"]').map(seg => seg.querySelector('.msg-body').textContent.trim());
+process.stdout.write(JSON.stringify(texts));
+'''
+        result = subprocess.run([node, '-e', driver], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == [
+            'Ref command hit known pitfall (rev-parse one ref only). Повторю правильно. Re-running with an explicit branch and workspace.'
+        ]

@@ -1076,7 +1076,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // After a tool call _freshSegment=true, so we always create a new segment
       // below the tool card rather than re-attaching to the old one above it.
       if(!_freshSegment){
-        const existing=blocks.querySelector('[data-live-assistant="1"]');
+        if(typeof _dedupeLiveAssistantSegments==='function') _dedupeLiveAssistantSegments(turn);
+        const liveSegments=blocks.querySelectorAll('[data-live-assistant="1"]');
+        const existing=liveSegments[liveSegments.length-1];
         if(existing){
           assistantRow=existing;
           assistantBody=existing.querySelector('.msg-body');

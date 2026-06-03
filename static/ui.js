@@ -5214,32 +5214,75 @@ function snapshotLiveTurnHtmlForSession(sid){
   INFLIGHT[sid].liveTurnHtml=turn.outerHTML;
 }
 
-function _liveAssistantSegmentTextLength(seg){
-  if(!seg) return 0;
+function _liveAssistantSegmentText(seg){
+  if(!seg) return '';
   const body=seg.querySelector('.msg-body')||seg;
-  return String(body.textContent||'').trim().length;
+  return String(body.textContent||'').replace(/\s+/g,' ').trim();
+}
+
+function _liveAssistantSegmentTextLength(seg){
+  return _liveAssistantSegmentText(seg).length;
+}
+
+function _liveAssistantSegmentsDuplicate(a,b){
+  const aText=_liveAssistantSegmentText(a);
+  const bText=_liveAssistantSegmentText(b);
+  if(!aText||!bText) return true;
+  return aText===bText||aText.startsWith(bText)||bText.startsWith(aText);
+}
+
+function _dedupeLiveAssistantSegments(turn){
+  const blocks=_assistantTurnBlocks(turn);
+  if(!blocks) return;
+  const kept=[];
+  for(const child of Array.from(blocks.children)){
+    if(!child.matches||!child.matches('[data-live-assistant="1"]')){
+      kept.length=0;
+      continue;
+    }
+    let discard=false;
+    for(let i=kept.length-1;i>=0;i--){
+      const prev=kept[i];
+      if(!_liveAssistantSegmentsDuplicate(prev,child)) continue;
+      const childLen=_liveAssistantSegmentTextLength(child);
+      const prevLen=_liveAssistantSegmentTextLength(prev);
+      if(childLen>=prevLen){
+        prev.remove();
+        kept.splice(i,1);
+        continue;
+      }
+      child.remove();
+      discard=true;
+      break;
+    }
+    if(!discard) kept.push(child);
+  }
 }
 
 function _mergeRestoredLiveAssistantSegment(restored, existing){
-  if(!restored||!existing) return;
-  const existingLive=existing.querySelector('[data-live-assistant="1"]');
-  if(!existingLive) return;
-  const restoredLive=restored.querySelector('[data-live-assistant="1"]');
-  const existingLen=_liveAssistantSegmentTextLength(existingLive);
-  const restoredLen=_liveAssistantSegmentTextLength(restoredLive);
-  if(existingLen<=restoredLen) return;
-  const replacement=existingLive.cloneNode(true);
-  if(restoredLive){
-    restoredLive.replaceWith(replacement);
-    return;
+  if(!restored) return;
+  const existingLive=existing?existing.querySelector('[data-live-assistant="1"]'):null;
+  if(existingLive){
+    const restoredLive=restored.querySelector('[data-live-assistant="1"]');
+    const existingLen=_liveAssistantSegmentTextLength(existingLive);
+    const restoredLen=_liveAssistantSegmentTextLength(restoredLive);
+    if(existingLen>restoredLen){
+      const replacement=existingLive.cloneNode(true);
+      if(restoredLive){
+        restoredLive.replaceWith(replacement);
+      }else{
+        const blocks=_assistantTurnBlocks(restored);
+        if(blocks){
+          const anchor=Array.from(blocks.children).filter(el=>
+            el.matches('.tool-call-group,.tool-card-row,.agent-activity-thinking,.thinking-card-row,[data-live-assistant="1"]')
+          ).pop();
+          if(anchor) anchor.insertAdjacentElement('afterend', replacement);
+          else blocks.appendChild(replacement);
+        }
+      }
+    }
   }
-  const blocks=_assistantTurnBlocks(restored);
-  if(!blocks) return;
-  const anchor=Array.from(blocks.children).filter(el=>
-    el.matches('.tool-call-group,.tool-card-row,.agent-activity-thinking,.thinking-card-row,[data-live-assistant="1"]')
-  ).pop();
-  if(anchor) anchor.insertAdjacentElement('afterend', replacement);
-  else blocks.appendChild(replacement);
+  _dedupeLiveAssistantSegments(restored);
 }
 
 function restoreLiveTurnHtmlForSession(sid){
