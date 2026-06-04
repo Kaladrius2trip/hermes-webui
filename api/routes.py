@@ -3052,6 +3052,7 @@ from api.models import (
     get_state_db_session_summary,
     merge_session_messages_append_only,
     _session_message_merge_key,
+    _active_stream_ids,
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,
@@ -3072,6 +3073,7 @@ from api.workspace import (
     read_file_content,
     safe_resolve_ws,
     resolve_trusted_workspace,
+    open_anchored_fd,
     validate_workspace_to_add,
     _is_blocked_system_path,
     _strip_surrounding_quotes,
@@ -3685,6 +3687,94 @@ def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
     return pages
 
 
+def _llm_wiki_last_writer(wiki_path: Path, page_files: list[Path]) -> str:
+    """Best-effort last-writer detection for the LLM Wiki status card.
+
+    Closes the gap left by the original panel (commit 2684d6fa, Issue #1257):
+    the field was reserved as ``"last_writer": None`` with no reader wired up,
+    so the UI always rendered "Not available". This helper makes the field
+    useful without breaking the private-safe contract (reads only one line
+    of frontmatter and one line of log.md headings, never page bodies).
+
+    Priority:
+      1. Most-recently-modified page frontmatter ``updated_by`` / ``writer`` /
+         ``author`` (case-insensitive).
+      2. Most recent ``log.md`` heading of the form
+         ``## [YYYY-MM-DD] <action> | subject`` — returns
+         ``"ai-agent (<action>)"`` so the user can see ingest vs update.
+      3. Static fallback ``"ai-agent"`` so the UI never shows "Not available"
+         for a configured wiki.
+    """
+    # #3455 review (Codex): resolve the wiki root once and require every file we
+    # read to stay under it, so a symlinked .md page can't leak frontmatter from
+    # outside the wiki. Also read bounded line-by-line (frontmatter only / log
+    # headings only), never full page bodies, per the private-safe status contract.
+    try:
+        wiki_root = wiki_path.resolve()
+    except Exception:
+        wiki_root = wiki_path
+
+    def _within_wiki(p: Path) -> bool:
+        try:
+            return p.resolve().is_relative_to(wiki_root)
+        except Exception:
+            return False
+
+    # Priority 1: most recent page frontmatter (resolved-path must stay in-wiki)
+    latest_page: Path | None = None
+    latest_mtime = -1.0
+    for candidate in page_files:
+        if not _within_wiki(candidate):
+            continue  # skip symlinks resolving outside the wiki
+        try:
+            mtime = candidate.stat().st_mtime
+        except Exception:
+            continue
+        if mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_page = candidate
+    if latest_page is not None:
+        try:
+            with open(latest_page, encoding="utf-8", errors="replace") as fh:
+                first = fh.readline()
+                if first.strip() == "---":
+                    # Read only the frontmatter block, bounded to a small line cap.
+                    for _ in range(200):
+                        line = fh.readline()
+                        if line == "" or line.strip() == "---":
+                            break  # EOF or end of frontmatter — never touch the body
+                        stripped = line.strip()
+                        lower = stripped.lower()
+                        for key in ("updated_by", "writer", "author"):
+                            if lower.startswith(f"{key}:"):
+                                value = stripped.split(":", 1)[1].strip()
+                                if value:
+                                    return value
+        except Exception:
+            pass
+
+    # Priority 2: log.md last entry action verb (heading lines only, bounded)
+    log_path = wiki_path / "log.md"
+    if _within_wiki(log_path) and log_path.is_file():
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                for _ in range(5000):  # cap the heading scan
+                    line = fh.readline()
+                    if line == "":
+                        break
+                    stripped = line.strip()
+                    if not stripped.startswith("## [") or "|" not in stripped:
+                        continue
+                    tail = stripped.split("]", 1)[1].strip() if "]" in stripped else ""
+                    action = tail.split()[0] if tail else "update"
+                    return f"ai-agent ({action})"
+        except Exception:
+            pass
+
+    # Priority 3: never return None / "Not available" for a configured wiki
+    return "ai-agent"
+
+
 def _build_llm_wiki_status() -> dict:
     """Return private-safe LLM Wiki status metadata without reading page bodies."""
     try:
@@ -3697,7 +3787,7 @@ def _build_llm_wiki_status() -> dict:
             "page_count": 0,
             "raw_source_count": 0,
             "last_updated": None,
-            "last_writer": None,
+            "last_writer": "ai-agent",
             "path_configured": path_configured,
             "path_source": path_source,
             "toggle_available": False,
@@ -3729,6 +3819,7 @@ def _build_llm_wiki_status() -> dict:
             "page_count": len(page_files),
             "raw_source_count": _llm_wiki_count_files(wiki_path / "raw"),
             "last_updated": _llm_wiki_safe_iso(latest),
+            "last_writer": _llm_wiki_last_writer(wiki_path, page_files),
         })
         return base
     except Exception as exc:
@@ -3740,7 +3831,7 @@ def _build_llm_wiki_status() -> dict:
             "page_count": 0,
             "raw_source_count": 0,
             "last_updated": None,
-            "last_writer": None,
+            "last_writer": "ai-agent",
             "path_configured": False,
             "path_source": "unknown",
             "toggle_available": False,
@@ -5267,7 +5358,15 @@ def handle_get(handler, parsed) -> bool:
                     )
                 except (TypeError, ValueError):
                     _merged_last_message_at = 0
-            raw = s.compact() | {
+            active_stream_ids = _active_stream_ids()
+            try:
+                compact_session = s.compact(
+                    include_runtime=True,
+                    active_stream_ids=active_stream_ids,
+                )
+            except TypeError:
+                compact_session = s.compact()
+            raw = compact_session | {
                 "messages": _truncated_msgs,
                 "message_count": _merged_message_count,
                 "tool_calls": _session_tool_calls,
@@ -5285,9 +5384,10 @@ def handle_get(handler, parsed) -> bool:
                 except Exception:
                     journal = None
                 if journal:
+                    journal_active = bool(original_stream_id in active_stream_ids)
                     raw["runtime_journal"] = _run_journal_status_payload(
                         journal,
-                        active=bool(getattr(s, "active_stream_id", None)),
+                        active=journal_active,
                     )
             # Cold-load: derive the latest settled todo snapshot from the full
             # merged transcript, not the truncated display window. This keeps
@@ -5344,7 +5444,55 @@ def handle_get(handler, parsed) -> bool:
                 )
             return resp
         except KeyError:
-            # Not a WebUI session -- try CLI store
+            # Not a WebUI session -- try CLI store.
+            # Before synthesising a read-only CLI stub, verify the id was not a
+            # deleted WebUI session. _index.json is the canonical WebUI session
+            # registry; an entry there with a webui, fork, or empty source means the
+            # session once had a sidecar that is now gone. Returning 404 lets the
+            # client self-heal: strip the stale /session/<id> URL and clear
+            # localStorage. Otherwise GET would keep returning 200 from the CLI
+            # stub while POST /api/session/draft and /api/chat/start 404, leaving
+            # the UI bricked (#2782). Genuine CLI-origin sessions (absent from the
+            # index, or tagged with a non-webui source) keep the existing 200 path.
+            _was_webui_session = False
+            if SESSION_INDEX_FILE.exists():
+                try:
+                    _index_entries = json.loads(SESSION_INDEX_FILE.read_text(encoding="utf-8"))
+                    for _ie in _index_entries if isinstance(_index_entries, list) else []:
+                        if _ie.get("session_id") == sid:
+                            # Classify PER source field, not on a collapsed
+                            # `a or b or c` — a legacy CLI/imported row can carry
+                            # is_cli_session:true with BLANK source fields, and
+                            # collapsing-then-defaulting-to-WebUI would wrongly
+                            # 404 it (it should keep its read-only CLI stub).
+                            _srcs = [
+                                str(_ie.get("source_tag") or "").strip().lower(),
+                                str(_ie.get("raw_source") or "").strip().lower(),
+                                str(_ie.get("session_source") or "").strip().lower(),
+                            ]
+                            _explicit = [s for s in _srcs if s]
+                            if any(s in ("webui", "fork") for s in _explicit):
+                                # Explicit WebUI-origin (incl. forks, which
+                                # /api/session/branch stamps session_source="fork")
+                                # — a deleted sidecar bricks identically. 404.
+                                _was_webui_session = True
+                            elif _explicit:
+                                # Explicit non-WebUI source (cli, telegram,
+                                # claude_code, ...) — a genuine foreign session.
+                                # Keep the existing 200 CLI/read-only stub path.
+                                _was_webui_session = False
+                            else:
+                                # All source fields blank: WebUI-origin UNLESS the
+                                # row is a legacy CLI/imported session marked only
+                                # by is_cli_session / read_only.
+                                _is_cli = _ie.get("is_cli_session") is True
+                                _ro = bool(_ie.get("read_only") or _ie.get("is_read_only"))
+                                _was_webui_session = not (_is_cli or _ro)
+                            break
+                except Exception:
+                    pass
+            if _was_webui_session:
+                return bad(handler, "Session not found", 404)
             cli_meta = _lookup_cli_session_metadata(sid)
             msgs = get_cli_session_messages(sid)
             if msgs:
@@ -6557,6 +6705,7 @@ def handle_post(handler, parsed) -> bool:
         with _get_session_agent_lock(body["session_id"]):
             s.title = str(body["title"]).strip()[:80] or "Untitled"
             s.save()
+        _sync_session_title_to_insights(s)
         publish_session_list_changed("session_rename")
         return j(handler, {"session": s.compact()})
 
@@ -6938,7 +7087,19 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
-        keep = int(body["keep_count"])
+        # Validate keep_count before it reaches the destructive `messages[:keep]`
+        # slice. A non-numeric value would raise ValueError and surface as a
+        # confusing 500; a NEGATIVE value slices as `messages[:-N]`, which
+        # silently DELETES the most recent N messages (e.g. keep_count=-5 on a
+        # 3-message session wipes the whole transcript) and then persists it via
+        # save(). Mirror the explicit guard the /api/session/branch handler
+        # already applies to its own keep_count. (Opus pre-release follow-up.)
+        try:
+            keep = int(body["keep_count"])
+        except (ValueError, TypeError):
+            return bad(handler, "keep_count must be an integer")
+        if keep < 0:
+            return bad(handler, "keep_count must be non-negative")
         with _get_session_agent_lock(body["session_id"]):
             old_msg_count = len(s.messages or [])
             old_ctx_count = len(getattr(s, 'context_messages', None) or [])
@@ -7258,6 +7419,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/file/rename":
         return _handle_file_rename(handler, body)
+
+    if parsed.path == "/api/file/move":
+        return _handle_file_move(handler, body)
 
     if parsed.path == "/api/file/create-dir":
         return _handle_create_dir(handler, body)
@@ -8360,7 +8524,15 @@ def _handle_sessions_search(handler, parsed):
     qs = parse_qs(parsed.query)
     q = qs.get("q", [""])[0].lower().strip()
     content_search = qs.get("content", ["1"])[0] == "1"
-    depth = int(qs.get("depth", ["5"])[0])
+    # Reject a malformed depth instead of letting int() raise ValueError and
+    # surface as a confusing 500. Clamp to >= 0 so a negative value can't reach
+    # the messages[:depth] slice below — messages[:-n] would silently exclude
+    # the most recent messages from the content search instead of capping it.
+    # (depth == 0 keeps its existing meaning: search the full transcript.)
+    try:
+        depth = max(0, int(qs.get("depth", ["5"])[0]))
+    except (ValueError, TypeError):
+        depth = 5
     if not q:
         safe_sessions = []
         for s in all_sessions():
@@ -10480,9 +10652,18 @@ def _handle_cron_output(handler, parsed):
 
     qs = parse_qs(parsed.query)
     job_id = qs.get("job_id", [""])[0]
-    limit = int(qs.get("limit", ["5"])[0])
     if not job_id:
         return j(handler, {"error": "job_id required"}, status=400)
+    # Reject malformed limit instead of letting int() raise ValueError and
+    # surface as a confusing 500. Clamp to a safe range; a negative value must
+    # never reach the slice below — files is sorted newest-first, so a negative
+    # limit on `files[:limit]` slices as `files[:-n]` and drops the n OLDEST
+    # entries (or all of them when |n| >= len), returning a truncated/empty list
+    # instead of the newest outputs. Mirrors _handle_cron_run_detail.
+    try:
+        limit = max(1, min(500, int(qs.get("limit", ["5"])[0])))
+    except (ValueError, TypeError):
+        limit = 5
     out_dir = CRON_OUT / job_id
     outputs = []
     if out_dir.exists():
@@ -10514,7 +10695,13 @@ def _handle_cron_recent(handler, parsed):
     import datetime
 
     qs = parse_qs(parsed.query)
-    since = float(qs.get("since", ["0"])[0])
+    # Reject a malformed `since` instead of letting float() raise ValueError and
+    # surface as a confusing 500. A bad/absent value means "from the epoch", so
+    # the client still gets a well-formed (if unfiltered) response.
+    try:
+        since = float(qs.get("since", ["0"])[0])
+    except (ValueError, TypeError):
+        since = 0.0
     try:
         from cron.jobs import list_jobs
 
@@ -12256,6 +12443,101 @@ def _handle_file_rename(handler, body):
         new_rel = str(dest.relative_to(Path(s.workspace)))
         return j(handler, {"ok": True, "old_path": body["path"], "new_path": new_rel})
     except (ValueError, PermissionError, OSError) as e:
+        return bad(handler, _sanitize_error(e))
+
+
+def _handle_file_move(handler, body):
+    try:
+        require(body, "session_id", "path", "dest_dir")
+    except ValueError as e:
+        return bad(handler, str(e))
+    try:
+        s = get_session_for_file_ops(body["session_id"])
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    try:
+        ws_root = Path(s.workspace)
+        # safe_resolve() returns paths under the RESOLVED root, so compute
+        # returned relative paths against the resolved root too — otherwise a
+        # symlinked workspace root (e.g. macOS /tmp -> /private/tmp) makes
+        # dest.relative_to(ws_root) raise after a successful on-disk move,
+        # returning a confusing 400 for a move that actually happened.
+        ws_root_resolved = ws_root.resolve()
+        source = safe_resolve(ws_root, body["path"])
+        if not source.exists():
+            return bad(handler, "File not found", 404)
+        # Reject a symlinked SOURCE entry. safe_resolve() follows the final
+        # symlink, so source.name/source.parent would point at the link's
+        # TARGET, not the dragged entry — moving link.txt would silently move
+        # dir/real.txt and leave link.txt dangling. Detect the symlink on the
+        # lexically-requested final component (lstat, no-follow) and refuse.
+        if (ws_root / body["path"]).is_symlink():
+            return bad(handler, "Cannot move a symlinked entry")
+        dest_dir_raw = (body.get("dest_dir") or ".").strip()
+        if not dest_dir_raw:
+            dest_dir_raw = "."
+        if ".." in dest_dir_raw.split("/"):
+            return bad(handler, "Invalid destination")
+        dest_parent = safe_resolve(ws_root, dest_dir_raw)
+        if not dest_parent.is_dir():
+            return bad(handler, "Destination folder not found", 404)
+        if source.is_dir():
+            try:
+                dest_parent.resolve().relative_to(source.resolve())
+                return bad(handler, "Cannot move a folder into itself or its subfolder")
+            except ValueError:
+                pass
+        dest = dest_parent / source.name
+        if dest.resolve() == source.resolve():
+            new_rel = str(source.relative_to(ws_root_resolved))
+            return j(
+                handler,
+                {"ok": True, "old_path": body["path"], "new_path": new_rel},
+            )
+        # Perform the move race-safely. The path-based checks above can be raced
+        # (TOCTOU): between validating dest_parent and renaming, dest_dir could be
+        # swapped to a symlink pointing outside the workspace, and a path-based
+        # rename would follow it. Open BOTH parent directories as workspace-anchored
+        # fds (openat + O_NOFOLLOW — every component verified non-symlink), do the
+        # collision check by fd, then rename via src_dir_fd/dst_dir_fd so the kernel
+        # operates on the verified directories, not re-resolved pathnames.
+        leaf = source.name
+        if os.open in getattr(os, "supports_dir_fd", set()):
+            src_parent_fd = open_anchored_fd(ws_root, source.parent, want_dir=True)
+            try:
+                dst_parent_fd = open_anchored_fd(ws_root, dest_parent, want_dir=True)
+                try:
+                    try:
+                        os.stat(leaf, dir_fd=dst_parent_fd, follow_symlinks=False)
+                        return bad(
+                            handler,
+                            f'A file named "{leaf}" already exists in that folder',
+                        )
+                    except FileNotFoundError:
+                        pass
+                    os.rename(
+                        leaf, leaf,
+                        src_dir_fd=src_parent_fd, dst_dir_fd=dst_parent_fd,
+                    )
+                finally:
+                    os.close(dst_parent_fd)
+            finally:
+                os.close(src_parent_fd)
+        else:
+            # Windows / no openat: no new race protection available, but creating
+            # symlinks needs admin there. Fall back to the path-based rename.
+            if dest.exists():
+                return bad(
+                    handler,
+                    f'A file named "{source.name}" already exists in that folder',
+                )
+            source.rename(dest)
+        new_rel = str(dest.relative_to(ws_root_resolved))
+        return j(
+            handler,
+            {"ok": True, "old_path": body["path"], "new_path": new_rel},
+        )
+    except (ValueError, FileNotFoundError, PermissionError, OSError) as e:
         return bad(handler, _sanitize_error(e))
 
 

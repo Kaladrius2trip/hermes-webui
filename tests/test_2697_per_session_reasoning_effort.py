@@ -145,10 +145,13 @@ class TestStreamingResolvesSessionOverFirst:
         )
 
     def test_parse_reasoning_effort_handles_session_value(self):
-        # The session value is parsed via the same parse_reasoning_effort
-        # helper as the profile value, so 'none' / valid efforts route the
-        # same way and unknown values silently become None.
-        assert "_reasoning_config = _parse_reff(_session_effort)" in self.SRC
+        # The selected raw value (session override if present, otherwise profile)
+        # is coerced to the active model/provider capabilities, then parsed via
+        # the same parse_reasoning_effort helper so 'none' / valid efforts route
+        # the same way and unsupported levels degrade safely.
+        assert "_effort_raw = _session_effort" in self.SRC
+        assert "coerce_reasoning_effort_for_model(" in self.SRC
+        assert "_reasoning_config = parse_reasoning_effort(_effort)" in self.SRC
 
 
 # ── Layer 3a: routes.py exposes /api/session/reasoning ──────────────────────
