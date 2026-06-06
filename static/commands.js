@@ -1141,27 +1141,71 @@ async function cmdSteer(args){
  * @param {boolean} explicitSteer - True if the user explicitly invoked /steer
  *   (vs the busy-mode auto-fallback). Affects toast wording only.
  */
-function _showSteerIndicator(text){
+function _normalizePendingSteerItems(pendingSteers, legacyText){
+  const raw=Array.isArray(pendingSteers)?pendingSteers:((legacyText!==undefined&&legacyText!==null&&String(legacyText).trim())?[{text:legacyText,text_preview:legacyText,order:1}]:[]);
+  return raw.map((entry,idx)=>{
+    const item=(entry&&typeof entry==='object')?entry:{text:entry,text_preview:entry};
+    const orderNum=Number(item.order);
+    const acceptedNum=Number(item.accepted_at);
+    const full=String(item.text||item.message||item.content||item.text_preview||'').trim();
+    const preview=String(item.text_preview||full||'').trim();
+    return {
+      id:item.id?String(item.id):`steer-${idx+1}`,
+      order:Number.isFinite(orderNum)?orderNum:idx+1,
+      acceptedAt:Number.isFinite(acceptedNum)?acceptedNum:idx,
+      text:_clipSteerPreview(preview),
+      title:full||preview,
+      _idx:idx,
+    };
+  }).filter(item=>item.text).sort((a,b)=>(a.order-b.order)||(a.acceptedAt-b.acceptedAt)||(a._idx-b._idx));
+}
+
+function _showSteerIndicator(text, pendingSteers){
+  if(typeof document==='undefined') return;
   const inner=document.getElementById('msgInner');
   if(!inner) return;
-  // Remove any existing steer indicator
-  const old=inner.querySelector('.steer-indicator');
-  if(old) old.remove();
+  const items=_normalizePendingSteerItems(pendingSteers,text);
+  clearPendingSteerIndicators();
+  if(!items.length) return;
   const el=document.createElement('div');
   el.className='steer-indicator';
+  el.dataset.pendingSteerCount=String(items.length);
+  el.title=items.map(item=>item.title||item.text).filter(Boolean).join('\n');
   const badge=document.createElement('span');
   badge.className='steer-badge';
-  badge.textContent='Steer';
-  const body=document.createElement('span');
+  badge.textContent=items.length>1?`${items.length} Steers`:'Steer';
+  const body=document.createElement('div');
   body.className='steer-body';
-  body.textContent=text.length>120?text.slice(0,117)+'…':text;
+  if(items.length===1){
+    body.textContent=items[0].text;
+    body.title=items[0].title||items[0].text;
+  }else{
+    for(const item of items){
+      const row=document.createElement('div');
+      row.className='steer-item';
+      row.textContent=item.text;
+      row.title=item.title||item.text;
+      if(item.id) row.dataset.steerId=item.id;
+      if(item.order!==undefined) row.dataset.steerOrder=String(item.order);
+      body.appendChild(row);
+    }
+  }
   el.appendChild(badge);
   el.appendChild(body);
   inner.appendChild(el);
   if(typeof scrollToBottom==='function') scrollToBottom();
 }
 
-async function _trySteer(msg, explicitSteer){
+function clearPendingSteerIndicators(){
+  if(typeof document==='undefined') return;
+  const inner=document.getElementById('msgInner');
+  if(!inner||typeof inner.querySelectorAll!=='function') return;
+  for(const el of Array.from(inner.querySelectorAll('.steer-indicator'))){
+    if(el&&typeof el.remove==='function') el.remove();
+  }
+}
+
+async function _trySteer(msg, explicitSteer, fallbackPayload){
   let result=null;
   try{
     result=await api('/api/chat/steer',{
@@ -1177,15 +1221,17 @@ async function _trySteer(msg, explicitSteer){
     // survive the done event's S.messages=d.session.messages replacement).
     // The indicator self-removes when the turn completes (done/cancel/error
     // all call renderMessages which rebuilds msgInner).
-    _showSteerIndicator(msg);
+    _showSteerIndicator(msg,result.pending_steers);
     showToast(t('cmd_steer_delivered'),2500);
     return;
   }
   // Fall back to interrupt: queue the message + cancel the stream so the
   // drain in setBusy(false) re-sends it as a fresh turn.
-  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+  const fallbackFromComposer=!fallbackPayload;
+  const fallbackQueuePayload={text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'};
+  queueSessionMessage(S.session.session_id,fallbackPayload||fallbackQueuePayload);
   updateQueueBadge(S.session.session_id);
-  S.pendingFiles=[];renderTray();
+  if(fallbackFromComposer){S.pendingFiles=[];renderTray();}
   if(typeof cancelStream==='function'){await cancelStream();}
   // Toast wording differs based on why we're falling back so the user
   // understands what just happened.
@@ -1200,7 +1246,6 @@ async function _trySteer(msg, explicitSteer){
     showToast(t('busy_steer_fallback'),2500);
   }
 }
-
 async function cmdTitle(args){
   if(!S.session){showToast(t('no_active_session'));return;}
   const name=(args||'').trim();

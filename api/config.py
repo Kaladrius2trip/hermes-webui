@@ -4924,6 +4924,8 @@ STREAM_REASONING_TEXT: dict = {}  # stream_id -> reasoning trace accumulated dur
 STREAM_LIVE_TOOL_CALLS: dict = {}  # stream_id -> live tool calls accumulated during streaming (#1361 §B)
 STREAM_GOAL_RELATED: dict = {}  # stream_id -> bool: only evaluate goal for goal-related turns (#1932)
 STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:` field on live SSE frames (stage-364)
+STREAM_PENDING_STEERS: dict = {}  # stream_id -> ordered accepted /steer metadata pending apply/leftover reconciliation
+STREAM_PENDING_STEERS_LOCK = threading.Lock()
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
 
 # Active agent-run registry. This intentionally tracks worker lifecycle rather

@@ -27,7 +27,7 @@ from api.config import (
     STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT, STREAM_LIVE_TOOL_CALLS,
     STREAM_GOAL_RELATED, PENDING_GOAL_CONTINUATION,
-    STREAM_LAST_EVENT_ID,
+    STREAM_LAST_EVENT_ID, STREAM_PENDING_STEERS, STREAM_PENDING_STEERS_LOCK,
     LOCK, SESSIONS, SESSIONS_MAX, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
@@ -64,6 +64,167 @@ from api.session_ops import mark_session_title_generated, session_has_manual_tit
 _ENV_LOCK = threading.Lock()
 
 _KEYLESS_CUSTOM_API_KEY = "dummy-key"
+
+_STEER_TEXT_PREVIEW_CHARS = 200
+_NO_PENDING_STEER_OVERRIDE = object()
+
+
+def _pending_steer_preview(text: str) -> str:
+    text = str(text or "")
+    if len(text) <= _STEER_TEXT_PREVIEW_CHARS:
+        return text
+    return text[:_STEER_TEXT_PREVIEW_CHARS] + "…"
+
+
+def _public_pending_steer(item: dict) -> dict:
+    return {
+        "id": item.get("id"),
+        "order": item.get("order"),
+        "text_preview": item.get("text_preview") or _pending_steer_preview(item.get("text", "")),
+        "accepted_at": item.get("accepted_at"),
+    }
+
+
+def _record_pending_steer(stream_id: str, session_id: str, text: str) -> list[dict]:
+    """Record accepted /steer text in WebUI-owned order metadata."""
+    if not stream_id:
+        return []
+    cleaned = str(text or "").strip()
+    now = time.time()
+    with STREAM_PENDING_STEERS_LOCK:
+        pending = list(STREAM_PENDING_STEERS.get(stream_id) or [])
+        last_order = int(pending[-1].get("order") or len(pending)) if pending else 0
+        item = {
+            "id": f"steer-{last_order + 1}-{time.time_ns()}",
+            "order": last_order + 1,
+            "session_id": session_id,
+            "stream_id": stream_id,
+            "text": cleaned,
+            "text_preview": _pending_steer_preview(cleaned),
+            "accepted_at": now,
+        }
+        pending.append(item)
+        STREAM_PENDING_STEERS[stream_id] = pending
+        return [_public_pending_steer(entry) for entry in pending]
+
+
+def _clear_pending_steers(stream_id: str) -> None:
+    if not stream_id:
+        return
+    with STREAM_PENDING_STEERS_LOCK:
+        STREAM_PENDING_STEERS.pop(stream_id, None)
+
+
+def _pop_pending_steers(stream_id: str) -> list[dict]:
+    if not stream_id:
+        return []
+    with STREAM_PENDING_STEERS_LOCK:
+        return list(STREAM_PENDING_STEERS.pop(stream_id, []) or [])
+
+
+def _pending_steer_suffix_for_text(pending: list[dict], text: str) -> list[dict]:
+    """Return pending-item suffix matching AIAgent's newline-concat slot."""
+    text = str(text or "")
+    if not pending or not text:
+        return []
+    for idx in range(len(pending)):
+        joined = "\n".join(str(item.get("text") or "") for item in pending[idx:])
+        if joined == text:
+            return pending[idx:]
+    return []
+
+
+def _peek_agent_pending_steer_text(agent) -> str | None:
+    if not hasattr(agent, "_pending_steer"):
+        return None
+    lock = getattr(agent, "_pending_steer_lock", None)
+    if lock is not None:
+        try:
+            with lock:
+                return str(getattr(agent, "_pending_steer", None) or "")
+        except Exception:
+            return None
+    return str(getattr(agent, "_pending_steer", None) or "")
+
+
+def _normalize_legacy_pending_steer_leftover(leftover) -> list[dict]:
+    if not leftover:
+        return []
+    values = leftover if isinstance(leftover, (list, tuple)) else [leftover]
+    items = []
+    for idx, value in enumerate(values, 1):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        items.append({
+            "id": f"steer-leftover-{idx}-{time.time_ns()}",
+            "order": idx,
+            "text": text,
+            "text_preview": _pending_steer_preview(text),
+        })
+    return items
+
+
+def _reconcile_pending_steers_after_tool_boundary(stream_id: str, agent) -> None:
+    """Drop WebUI steer metadata once AIAgent consumed it at a tool boundary."""
+    if not stream_id:
+        return
+    remaining_text = _peek_agent_pending_steer_text(agent)
+    if remaining_text is None:
+        return
+    with STREAM_PENDING_STEERS_LOCK:
+        pending = list(STREAM_PENDING_STEERS.get(stream_id) or [])
+        if not pending:
+            return
+        if not remaining_text:
+            STREAM_PENDING_STEERS.pop(stream_id, None)
+            return
+        remaining = _pending_steer_suffix_for_text(pending, remaining_text)
+        if remaining:
+            STREAM_PENDING_STEERS[stream_id] = remaining
+        else:
+            fallback = _normalize_legacy_pending_steer_leftover(remaining_text)
+            if fallback:
+                STREAM_PENDING_STEERS[stream_id] = fallback
+            else:
+                STREAM_PENDING_STEERS.pop(stream_id, None)
+
+
+def _pending_steer_leftover_items(stream_id: str, leftover) -> list[dict]:
+    if not leftover:
+        _clear_pending_steers(stream_id)
+        return []
+    pending = _pop_pending_steers(stream_id)
+    if pending:
+        remaining = _pending_steer_suffix_for_text(pending, leftover)
+        if remaining:
+            return remaining
+    return _normalize_legacy_pending_steer_leftover(leftover)
+
+
+def _emit_pending_steer_leftovers(agent, stream_id: str, session_id: str, put_event, pending_steer_override=_NO_PENDING_STEER_OVERRIDE) -> None:
+    """Emit one ordered leftover event per pending /steer item still in the agent."""
+    try:
+        if pending_steer_override is _NO_PENDING_STEER_OVERRIDE:
+            drain = getattr(agent, "_drain_pending_steer", None)
+            leftover = drain() if drain else None
+        else:
+            leftover = pending_steer_override
+        for item in _pending_steer_leftover_items(stream_id, leftover):
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            put_event('pending_steer_leftover', {
+                'session_id': session_id,
+                'text': text,
+                'id': item.get('id'),
+                'order': item.get('order'),
+                'text_preview': item.get('text_preview') or _pending_steer_preview(text),
+                'source': 'steer',
+            })
+    except Exception:
+        logger.debug("Failed to emit pending steer leftovers for session %s", session_id, exc_info=True)
+
 
 _PERSISTENT_MEMORY_FILES = (
     ("memory", ("memories", "MEMORY.md")),
@@ -5757,6 +5918,7 @@ def _run_agent_streaming(
                             session_id=session_id,
                             stream_id=stream_id,
                         )
+                        _reconcile_pending_steers_after_tool_boundary(stream_id, agent)
                     _tool_stats = meter().get_stats()
                     _tool_stats['session_id'] = session_id
                     _tool_stats['usage'] = _live_usage_snapshot()
@@ -6356,6 +6518,9 @@ def _run_agent_streaming(
                 task_id=session_id,
                 persist_user_message=msg_text,
             )
+            _pending_steer_from_result = _NO_PENDING_STEER_OVERRIDE
+            if isinstance(result, dict) and 'pending_steer' in result:
+                _pending_steer_from_result = result.get('pending_steer')
             if cancel_event.is_set():
                 if _checkpoint_stop is not None:
                     _checkpoint_stop.set()
@@ -7524,16 +7689,13 @@ def _run_agent_streaming(
             # it now and emit a pending_steer_leftover SSE event so the
             # frontend can queue it for the next turn — same fallback
             # path as the CLI in cli.py:8788-8794.
-            try:
-                _drain_pending_steer = getattr(agent, '_drain_pending_steer', None)
-                _leftover = _drain_pending_steer() if _drain_pending_steer else None
-                if _leftover:
-                    put('pending_steer_leftover', {
-                        'session_id': session_id,
-                        'text': str(_leftover),
-                    })
-            except Exception:
-                logger.debug("Failed to drain pending steer for session %s", session_id)
+            _emit_pending_steer_leftovers(
+                agent,
+                stream_id,
+                session_id,
+                put,
+                _pending_steer_from_result if '_pending_steer_from_result' in locals() else _NO_PENDING_STEER_OVERRIDE,
+            )
             # /goal parity: after a successful assistant turn, run the Hermes
             # GoalManager judge before terminal done/stream_end events. The
             # frontend surfaces the status line and queues continuation_prompt as
@@ -7949,6 +8111,7 @@ def _run_agent_streaming(
             STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
             STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
             STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
+            _clear_pending_steers(stream_id)  # Clear accepted /steer metadata on any terminal path.
             unregister_active_run(stream_id)
             # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker
             # is set by goal_continue (line ~3328) inside the SAME function
@@ -8056,8 +8219,15 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         return j(handler, {"accepted": False, "fallback": "steer_error",
                            "stream_id": active_stream_id})
 
-    return j(handler, {"accepted": accepted, "fallback": None,
-                       "stream_id": active_stream_id})
+    if not accepted:
+        return j(handler, {"accepted": False, "fallback": "steer_rejected",
+                           "stream_id": active_stream_id})
+
+    pending_steers = _record_pending_steer(active_stream_id, sid, text)
+    return j(handler, {"accepted": True, "fallback": None,
+                       "stream_id": active_stream_id,
+                       "pending_steer_count": len(pending_steers),
+                       "pending_steers": pending_steers})
 
 
 def cancel_stream(stream_id: str) -> bool:
@@ -8212,6 +8382,7 @@ def cancel_stream(stream_id: str) -> bool:
         streams.pop(stream_id, None)
         cancel_flags.pop(stream_id, None)
         agent_instances.pop(stream_id, None)
+        _clear_pending_steers(stream_id)
     # STREAM_PARTIAL_TEXT is intentionally NOT popped here — the agent thread may
     # still be appending tokens, and the streaming finally block handles cleanup
     # when the thread exits. We already snapshotted the buffers under streams_lock

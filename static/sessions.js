@@ -33,6 +33,18 @@ function _setSessionTitleRefreshInFlight(sid, active){
   if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
 }
 
+function _applySessionTitleRefreshStatusEvent(data, fallbackSid){
+  const sid=String((data&&data.session_id)||fallbackSid||'').trim();
+  if(!sid) return;
+  const status=String((data&&data.status)||'').trim().toLowerCase();
+  if(!status) return;
+  if(status==='generating'||status==='refreshing'||status==='refresh_started'){
+    _setSessionTitleRefreshInFlight(sid,true);
+    return;
+  }
+  _setSessionTitleRefreshInFlight(sid,false);
+}
+
 // #3306: Snapshot of S.messages captured by loadSession() right before it
 // clears them on a force-reload of the active session. Consumed by
 // _ensureMessagesLoaded() when calling _carryForwardEphemeralTurnFields so
@@ -1033,6 +1045,13 @@ async function loadSession(sid){
       }catch(_){sessionStorage.removeItem('hermes-queue-'+sid);}
     }
 
+    // Queue storage is backend-canonical. Reconcile the optimistic browser
+    // cache from /api/session/queue before rendering queue badges/cards.
+    if(typeof reconcileSessionQueue==='function'){
+      await reconcileSessionQueue(sid);
+      if (_loadingSessionId !== sid) return;
+    }
+
     // Reconstruct tool calls from message metadata, or fall back to session-level summary.
     // (hasMessageToolMetadata already computed inside _ensureMessagesLoaded; S.toolCalls set there.)
     updateQueueBadge(sid);
@@ -1066,11 +1085,10 @@ async function loadSession(sid){
       // snaps to bottom — see _restoreMessageScrollStateForSession in ui.js.
       if(typeof _restoreMessageScrollStateForSession==='function') _restoreMessageScrollStateForSession(sid);
       if(typeof resumeManualCompressionForSession==='function') resumeManualCompressionForSession(sid);
-      const _dirP=loadDir('.');
+      const _dirP=loadDir('.');if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
       // Workspace refresh is guarded by session id inside loadDir(); do not
       // block session-load completion, draft restore, or model resolution on
       // file-tree IO for users focused on the chat.
-      if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
     }
   }
 

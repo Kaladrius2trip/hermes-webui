@@ -2686,6 +2686,13 @@ function loadTodos() {
   let todos;
   if (S.todoStateMeta) {
     todos = Array.isArray(S.todos) ? S.todos : [];
+  } else if (typeof _latestTodoToolState === 'function') {
+    const state = _latestTodoToolState(
+      (S.session && Array.isArray(S.session.messages) && S.session.messages.length)
+        ? S.session.messages
+        : S.messages
+    );
+    todos = state && state.found ? state.todos : _legacyTodosFromMessages();
   } else {
     todos = _legacyTodosFromMessages();
   }

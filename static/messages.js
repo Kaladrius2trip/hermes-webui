@@ -1958,6 +1958,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('tool_complete',e=>{
       const d=JSON.parse(e.data);
+      if(typeof clearPendingSteerIndicators==='function') clearPendingSteerIndicators();
       if(d.name==='clarify') return;
       const inflight=INFLIGHT[activeSid];
       if(!inflight) return;
@@ -2067,12 +2068,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
       if((d.session_id||activeSid)!==activeSid) return;
       applySessionTitleUpdate(activeSid, d.title);
+      if(typeof _setSessionTitleRefreshInFlight==='function') _setSessionTitleRefreshInFlight(activeSid,false);
     });
 
     source.addEventListener('title_status',e=>{
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
       if((d.session_id||activeSid)!==activeSid) return;
+      if(typeof _applySessionTitleRefreshStatusEvent==='function') _applySessionTitleRefreshStatusEvent(d,activeSid);
       try{
         console.info('[title]', {
           status:String(d.status||''),
@@ -2159,6 +2162,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // S.messages with stale server data (issue #3195).
       _streamFinalized=true;
       _terminalStateReached=true;
+      if(typeof clearPendingSteerIndicators==='function') clearPendingSteerIndicators();
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       const _doneData=JSON.parse(e.data);
       const _finishDone=()=>{
@@ -2195,6 +2199,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           _markSessionCompletedInList(completedSession, activeSid);
         }
         _clearApprovalForOwner();
+        if(typeof clearPendingSteerIndicators==='function') clearPendingSteerIndicators();
         _clearClarifyForOwner('terminal');
         const shouldFollowOnDone=isActiveSession&&((typeof _shouldFollowMessagesOnDomReplace==='function')
           ? _shouldFollowMessagesOnDomReplace()
@@ -2379,6 +2384,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       _terminalStateReached=true;
+      if(typeof clearPendingSteerIndicators==='function') clearPendingSteerIndicators();
       try{
         const d=JSON.parse(e.data||'{}');
         if((d.session_id||activeSid)!==activeSid) return;
@@ -2410,6 +2416,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const sid=d.session_id||activeSid;
         const txt=String(d.text||'').trim();
         if(!txt||sid!==activeSid) return;
+        if(typeof clearPendingSteerIndicators==='function') clearPendingSteerIndicators();
         if(typeof queueSessionMessage==='function'){
           const _modelState=_chatPayloadModelState();
           queueSessionMessage(sid,{
@@ -2782,6 +2789,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _closeSource(source);
       _clearApprovalForOwner();
       _clearClarifyForOwner('terminal');
+      if(typeof clearPendingSteerIndicators==='function') clearPendingSteerIndicators();
       const isSessionViewed=_isSessionActivelyViewed(activeSid);
       const completedSid=session.session_id||activeSid;
       if(!isSessionViewed && typeof _markSessionCompletionUnread==='function'){
@@ -2849,6 +2857,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _clearOwnerInflightState();
     _closeSource(source);
     _clearApprovalForOwner();
+    if(typeof clearPendingSteerIndicators==='function') clearPendingSteerIndicators();
     _clearClarifyForOwner('terminal');
     if(S.session&&S.session.session_id===activeSid){
       S.activeStreamId=null;

@@ -13,6 +13,8 @@ function assistantDisplayName(){
 }
 const INFLIGHT={};  // keyed by session_id while request in-flight
 const SESSION_QUEUES={};  // keyed by session_id for queued follow-up turns
+const _queueMutationSeq={};  // sid -> monotonic generation for async backend reconciliation
+const _queuePendingIds={};  // sid -> optimistic ids not yet confirmed durable by backend
 const MAX_UPLOAD_BYTES=(window.__HERMES_CONFIG__&&window.__HERMES_CONFIG__.maxUploadBytes)||20*1024*1024;
 const MAX_UPLOAD_MB=Math.round(MAX_UPLOAD_BYTES/1024/1024);
 // Tracks which session's queue to drain in setBusy(false).
@@ -160,28 +162,146 @@ else initOfflineMonitor();
 function _redirectIfUnauth(res){if(res&&res.status===401){window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);return true;}return false;}
 function _getSessionQueue(sid, create=false){
   if(!sid) return [];
+  if(!SESSION_QUEUES[sid]){
+    try{
+      const raw=sessionStorage.getItem('hermes-queue-'+sid);
+      if(raw){
+        const stored=JSON.parse(raw);
+        if(Array.isArray(stored)&&stored.length) SESSION_QUEUES[sid]=stored.filter(Boolean);
+      }
+    }catch(_){try{sessionStorage.removeItem('hermes-queue-'+sid);}catch(__){}}
+  }
   if(!SESSION_QUEUES[sid]&&create) SESSION_QUEUES[sid]=[];
   return SESSION_QUEUES[sid]||[];
+}
+function _queueNextSeq(sid){
+  if(!sid) return 0;
+  _queueMutationSeq[sid]=(_queueMutationSeq[sid]||0)+1;
+  return _queueMutationSeq[sid];
+}
+function _queueItemId(item){return item&&String(item.id||item._queue_id||'').trim();}
+function _queueMarkPending(sid,item){
+  const id=_queueItemId(item);
+  if(!sid||!id) return;
+  if(!_queuePendingIds[sid]) _queuePendingIds[sid]={};
+  _queuePendingIds[sid][id]=Date.now();
+}
+function _queueClearPending(sid,itemOrId){
+  const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
+  if(!sid||!id||!_queuePendingIds[sid]) return;
+  delete _queuePendingIds[sid][id];
+  if(!Object.keys(_queuePendingIds[sid]).length) delete _queuePendingIds[sid];
+}
+function _queueResyncMissingLocalItem(sid,item){
+  const id=_queueItemId(item);
+  if(!sid||!id||typeof api!=='function') return;
+  _queueMarkPending(sid,item);
+  void api('/api/session/queue',{method:'POST',body:JSON.stringify({session_id:sid,item:item}),timeoutMs:10000,timeoutToast:false})
+    .then(r=>{
+      _queueClearPending(sid,id);
+      if(r&&r.ignored&&r.consumed){
+        const kept=_getSessionQueue(sid,false).filter(existing=>_queueItemId(existing)!==id);
+        _setSessionQueue(sid,kept);
+        updateQueueBadge(sid);
+        return;
+      }
+      if(r&&Array.isArray(r.queue)){
+        _setSessionQueue(sid,_mergeBackendQueueWithPendingLocal(sid,r.queue));
+        updateQueueBadge(sid);
+      }
+    })
+    .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to re-sync queued message',4000,'error');});
+}
+function _mergeBackendQueueWithPendingLocal(sid,backendQueue){
+  const merged=Array.isArray(backendQueue)?backendQueue.filter(Boolean).slice():[];
+  const seen={};
+  merged.forEach(item=>{const id=_queueItemId(item); if(id) seen[id]=true;});
+  const pending=_queuePendingIds[sid]||{};
+  const local=_getSessionQueue(sid,false);
+  local.forEach(item=>{
+    const id=_queueItemId(item);
+    if(id&&!seen[id]){
+      merged.push(item);
+      seen[id]=true;
+      if(!pending[id]) _queueResyncMissingLocalItem(sid,item);
+    }
+  });
+  return merged;
+}
+function _setSessionQueue(sid, queue){
+  if(!sid) return [];
+  const q=Array.isArray(queue)?queue.filter(Boolean):[];
+  if(q.length){
+    SESSION_QUEUES[sid]=q;
+    try{sessionStorage.setItem('hermes-queue-'+sid, JSON.stringify(q));}catch(_){}
+  }else{
+    delete SESSION_QUEUES[sid];
+    try{sessionStorage.removeItem('hermes-queue-'+sid);}catch(_){}
+  }
+  delete _queueRenderKeys[sid];
+  return q;
+}
+async function reconcileSessionQueue(sid, opts={}){
+  if(!sid) return [];
+  if(typeof api!=='function') return _getSessionQueue(sid,false);
+  try{
+    const _seq=_queueMutationSeq[sid]||0;
+    const r=await api('/api/session/queue?session_id='+encodeURIComponent(sid),{method:'GET',timeoutMs:10000,timeoutToast:false});
+    if((_queueMutationSeq[sid]||0)!==_seq) return _getSessionQueue(sid,false);
+    const q=_setSessionQueue(sid,_mergeBackendQueueWithPendingLocal(sid,(r&&Array.isArray(r.queue))?r.queue:[]));
+    updateQueueBadge(sid);
+    return q;
+  }catch(e){
+    if(opts&&opts.toast&&typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to load queued messages',4000,'error');
+    return _getSessionQueue(sid,false);
+  }
+}
+function _persistSessionQueue(sid, queue){
+  if(!sid) return 0;
+  const _seq=_queueNextSeq(sid);
+  const q=_setSessionQueue(sid,queue);
+  if(typeof api==='function'){
+    void api('/api/session/queue/replace',{method:'POST',body:JSON.stringify({session_id:sid,queue:q}),timeoutMs:10000,timeoutToast:false})
+      .then(r=>{if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,r.queue);updateQueueBadge(sid);}})
+      .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued messages',4000,'error');});
+  }
+  return q.length;
 }
 function queueSessionMessage(sid, payload){
   if(!sid||!payload) return 0;
   const q=_getSessionQueue(sid,true);
-  // Stamp created_at so the restore path can detect stale entries (agent already responded)
-  const entry={...payload, _queued_at: Date.now()};
+  // Stamp created_at so reconciliation can order optimistic entries.
+  const _id=payload.id||payload._queue_id||('q_'+Date.now()+'_'+Math.random().toString(36).slice(2,8));
+  const entry={...payload,id:_id,_queue_id:_id,_queued_at:payload._queued_at||Date.now()};
+  const _seq=_queueNextSeq(sid);
+  _queueMarkPending(sid,entry);
   q.push(entry);
-  // Persist to sessionStorage so the queue survives page refresh
-  try{ sessionStorage.setItem('hermes-queue-'+sid, JSON.stringify(q)); }catch(_){}
+  try{sessionStorage.setItem('hermes-queue-'+sid, JSON.stringify(q));}catch(_){}
+  if(typeof api==='function'){
+    void api('/api/session/queue',{method:'POST',body:JSON.stringify({session_id:sid,item:entry}),timeoutMs:10000,timeoutToast:false})
+      .then(r=>{
+        _queueClearPending(sid,entry);
+        if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,r.queue);updateQueueBadge(sid);}
+      })
+      .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued message',4000,'error');});
+  }
   return q.length;
 }
 function shiftQueuedSessionMessage(sid){
   const q=_getSessionQueue(sid,false);
   if(!q.length) return null;
   const next=q.shift();
-  if(!q.length){
-    delete SESSION_QUEUES[sid];
-    try{ sessionStorage.removeItem('hermes-queue-'+sid); }catch(_){}
-  } else {
-    try{ sessionStorage.setItem('hermes-queue-'+sid, JSON.stringify(q)); }catch(_){}
+  _queueClearPending(sid,next);
+  const _seq=_queueNextSeq(sid);
+  _setSessionQueue(sid,q);
+  if(typeof api==='function'){
+    void api('/api/session/queue/shift',{method:'POST',body:JSON.stringify({session_id:sid,item_id:next&&(next.id||next._queue_id)||''}),timeoutMs:10000,timeoutToast:false})
+      .then(r=>{
+        if((_queueMutationSeq[sid]||0)!==_seq) return;
+        if(r&&r.not_found){updateQueueBadge(sid);return;}
+        if(r&&Array.isArray(r.queue)){_setSessionQueue(sid,r.queue);updateQueueBadge(sid);}
+      })
+      .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to update queued messages',4000,'error');});
   }
   return next;
 }
@@ -4112,6 +4232,110 @@ async function handleComposerPrimaryAction(){
   await send();
 }
 
+function _todoToolPayloadTodos(content){
+  let payload=null;
+  try{
+    payload=typeof content==='string'?JSON.parse(content):content;
+  }catch(_){
+    return null;
+  }
+  if(!payload||typeof payload!=='object'||Array.isArray(payload)) return null;
+  const wrapped=payload.payload&&typeof payload.payload==='object'&&!Array.isArray(payload.payload)
+    ? payload.payload
+    : null;
+  if(wrapped&&Object.prototype.hasOwnProperty.call(wrapped,'todos')){
+    return Array.isArray(wrapped.todos)?wrapped.todos:null;
+  }
+  // Legacy completed-tool shape kept for old transcripts and the existing Todo tab.
+  if(payload&&Array.isArray(payload.todos)) return payload.todos;
+  return null;
+}
+
+function _latestTodoToolState(messages){
+  for(let i=(messages||[]).length-1;i>=0;i--){
+    const m=messages[i];
+    if(!m||m.role!=='tool') continue;
+    const todos=_todoToolPayloadTodos(m.content);
+    if(Array.isArray(todos)) return {found:true,todos,rawIdx:i};
+  }
+  return {found:false,todos:[],rawIdx:-1};
+}
+
+function _todoStatusClass(status){
+  const s=String(status||'pending').trim().toLowerCase().replace(/[^a-z0-9_-]/g,'_');
+  return s||'pending';
+}
+
+function _todoStatusCounts(items){
+  const counts={total:0,pending:0,in_progress:0,completed:0,cancelled:0,other:0,active:0};
+  for(const item of (Array.isArray(items)?items:[])){
+    counts.total++;
+    const status=String(item&&item.status||'').trim().toLowerCase();
+    if(Object.prototype.hasOwnProperty.call(counts,status)) counts[status]++;
+    else counts.other++;
+    if(status==='pending'||status==='in_progress') counts.active++;
+  }
+  return counts;
+}
+
+function _chatTodoSummaryText(counts){
+  if(!counts.total) return t('todos_no_active')||'No active todos';
+  if(counts.active>0){
+    const donePart=counts.completed?` · ${counts.completed} done`:'';
+    return `${counts.active} active${donePart}`;
+  }
+  if(counts.completed===counts.total) return `All done · ${counts.completed} completed`;
+  return `${counts.total} items · no active`;
+}
+
+function _todoSourceMessages(){
+  return (S.session&&Array.isArray(S.session.messages)&&S.session.messages.length)
+    ? S.session.messages
+    : S.messages;
+}
+
+function renderChatTodoSurface(messages){
+  const host=$('chatTodoSurface');
+  if(!host) return;
+  const state=_latestTodoToolState(Array.isArray(messages)?messages:_todoSourceMessages());
+  if(!state.found){
+    host.hidden=true;
+    host.innerHTML='';
+    return;
+  }
+  const todos=Array.isArray(state.todos)?state.todos:[];
+  const counts=_todoStatusCounts(todos);
+  const preferred=counts.active>0
+    ? todos.filter(item=>{
+        const status=String(item&&item.status||'').trim().toLowerCase();
+        return status==='pending'||status==='in_progress';
+      })
+    : todos;
+  const shown=preferred.slice(0,4);
+  const itemHtml=shown.map(item=>{
+    const status=_todoStatusClass(item&&item.status);
+    const text=String((item&&item.content)||(item&&item.id)||'Todo').trim()||'Todo';
+    return `<span class="chat-todo-item chat-todo-item-status-${esc(status)}" title="${esc(text)}"><span class="chat-todo-item-dot"></span><span class="chat-todo-item-text">${esc(text)}</span></span>`;
+  }).join('');
+  const moreCount=Math.max(0, preferred.length-shown.length);
+  const moreHtml=moreCount?`<span class="chat-todo-more">+${moreCount} more</span>`:'';
+  const emptyHtml=!todos.length?`<span class="chat-todo-empty">${esc(t('todos_no_active')||'No active todos')}</span>`:'';
+  const doneClass=counts.total&&counts.active===0?' chat-todo-card-done':'';
+  host.innerHTML=`
+    <div class="chat-todo-card${doneClass}">
+      <span class="chat-todo-icon" aria-hidden="true">${li('list-todo',14)}</span>
+      <div class="chat-todo-body">
+        <div class="chat-todo-head">
+          <span class="chat-todo-title">${esc(t('current_task_list')||'Current task list')}</span>
+          <span class="chat-todo-summary">${esc(_chatTodoSummaryText(counts))}</span>
+        </div>
+        <div class="chat-todo-items">${itemHtml}${moreHtml}${emptyHtml}</div>
+      </div>
+      <button type="button" class="chat-todo-open" onclick="switchPanel('todos')">Open</button>
+    </div>`;
+  host.hidden=false;
+}
+
 function setBusy(v){
   S.busy=v;
   updateSendBtn();
@@ -4174,6 +4398,72 @@ function _queuePanelHasEditingFocus(inner){
   return tag==='TEXTAREA'||tag==='INPUT';
 }
 
+async function _steerQueuedSessionMessage(sid, entryTs, fallbackIndex){
+  if(!sid) return;
+  if(!S.session||S.session.session_id!==sid){
+    if(typeof showToast==='function') showToast('Switch back to this session before steering a queued message',3000,'warning');
+    return;
+  }
+  const liveQ=_getSessionQueue(sid,false);
+  const idx=entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===entryTs):fallbackIndex;
+  if(idx<0||idx>=liveQ.length) return;
+  const entry=liveQ[idx]||{};
+  const entryText=String(entry.text||entry.message||entry.content||'').trim();
+  if(!entryText){
+    if(typeof showToast==='function') showToast('Queued steer needs message text',2600,'warning');
+    return;
+  }
+  const files=Array.isArray(entry.files)?entry.files.filter(Boolean):[];
+  if(files.length){
+    if(typeof showToast==='function') showToast('Queued items with attachments cannot be steered yet. Remove attachments or let the queue send it normally.',3600,'warning');
+    return;
+  }
+  const fallbackPayload={
+    text:entryText,
+    files:[],
+    model:entry.model||'',
+    model_provider:entry.model_provider||null,
+    profile:entry.profile||S.activeProfile||'default',
+  };
+  liveQ.splice(idx,1);
+  _persistSessionQueue(sid,liveQ);
+  const activeEl=document.activeElement;
+  const queueInner=document.getElementById('queueChips');
+  if(activeEl&&activeEl.blur&&queueInner&&queueInner.contains(activeEl)) activeEl.blur();
+  delete _queueRenderKeys[sid];
+  updateQueueBadge(sid);
+
+  if(!S.busy||!S.activeStreamId){
+    const inp=$('msg');
+    if(inp) inp.value=entryText;
+    if(fallbackPayload.model&&S.session&&fallbackPayload.model!==S.session.model) S.session.model=fallbackPayload.model;
+    if(fallbackPayload.model_provider&&S.session) S.session.model_provider=fallbackPayload.model_provider;
+    if(fallbackPayload.model&&S.session){
+      if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(fallbackPayload.model,$('modelSelect'),S.session.model_provider||null);
+      if(typeof syncModelChip==='function') syncModelChip();
+    }
+    if(typeof autoResize==='function') autoResize();
+    if(typeof send==='function') {
+      try{ await send(); }
+      catch(e){
+        queueSessionMessage(sid,fallbackPayload);
+        updateQueueBadge(sid);
+        throw e;
+      }
+    }
+    return;
+  }
+
+  if(typeof _trySteer==='function'){
+    await _trySteer(entryText,true,fallbackPayload);
+  } else {
+    queueSessionMessage(sid,fallbackPayload);
+    updateQueueBadge(sid);
+    if(typeof cancelStream==='function') await cancelStream();
+    else if(typeof showToast==='function') showToast('Steer unavailable; queued for next turn',2500,'warning');
+  }
+}
+
 function _renderQueueChips(sid){
   const card=document.getElementById('queueCard');
   const inner=document.getElementById('queueChips');
@@ -4218,9 +4508,7 @@ function _renderQueueChips(sid){
 
   function _saveAndRefresh(){
     const liveQ=_getSessionQueue(sid,false);
-    if(!liveQ.length){delete SESSION_QUEUES[sid];try{sessionStorage.removeItem('hermes-queue-'+sid);}catch(_){}}
-    else{SESSION_QUEUES[sid]=[...liveQ];try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}}
-    delete _queueRenderKeys[sid];
+    _persistSessionQueue(sid,liveQ);
     updateQueueBadge(sid);
   }
 
@@ -4245,9 +4533,7 @@ function _renderQueueChips(sid){
         const first=snapshot.find(e=>e)||{};
         const firstFiles=(snapshot.find(e=>e&&Array.isArray(e.files)&&e.files.length)||{files:[]}).files;
         liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
-        SESSION_QUEUES[sid]=liveQ;
-        try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}
-        delete _queueRenderKeys[sid];
+        _persistSessionQueue(sid,liveQ);
         updateQueueBadge(sid);
       };
       if(hasFiles){
@@ -4326,8 +4612,7 @@ function _renderQueueChips(sid){
         const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
         if(idx!==-1){
           liveQ[idx]={...liveQ[idx],text:newText};
-          try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}
-          delete _queueRenderKeys[sid];
+          _persistSessionQueue(sid,liveQ);
           updateQueueBadge(sid);
         }
       }
@@ -4354,6 +4639,14 @@ function _renderQueueChips(sid){
       badges.appendChild(mb);
     }
     // Profile badge removed — drain cannot server-switch profiles so badge was misleading
+    // Steer button — move this queued text into the live /steer path.
+    const steerBtn=document.createElement('button');
+    steerBtn.className='queue-card-btn queue-card-steer-btn';
+    steerBtn.setAttribute('aria-label','Send queued message as steer');
+    steerBtn.setAttribute('draggable','false');
+    steerBtn.title='Send queued message as steer';
+    steerBtn.innerHTML=(typeof li==='function'?li('send',12):'↪')+'Steer';
+    steerBtn.onclick=()=>{_steerQueuedSessionMessage(sid,_entryTs,i);};
     // Delete button
     const delBtn=document.createElement('button');
     delBtn.className='queue-card-icon-btn';
@@ -4365,19 +4658,17 @@ function _renderQueueChips(sid){
       const liveQ=_getSessionQueue(sid,false);
       const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
       if(idx!==-1) liveQ.splice(idx,1);
-      if(!liveQ.length){delete SESSION_QUEUES[sid];try{sessionStorage.removeItem('hermes-queue-'+sid);}catch(_){}}
-      else{SESSION_QUEUES[sid]=[...liveQ];try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}}
-      delete _queueRenderKeys[sid];
+      _persistSessionQueue(sid,liveQ);
       updateQueueBadge(sid);
     };
     row.appendChild(drag);
     row.appendChild(msgSpan);
     if(badges.childNodes.length) row.appendChild(badges);
+    row.appendChild(steerBtn);
     row.appendChild(delBtn);
     inner.appendChild(row);
   });
 }
-
 function _updateQueuePill(sid,count){
   const pill=document.getElementById('queuePill');
   if(!pill) return;
@@ -7225,6 +7516,7 @@ function renderMessages(options){
   const preserveScroll=!!(options&&options.preserveScroll);
   const scrollSnapshot=preserveScroll?_captureMessageScrollSnapshot():null;
   const inner=$('msgInner');
+  if(typeof renderChatTodoSurface==='function') renderChatTodoSurface(S.messages);
   const sid=S.session?S.session.session_id:null;
   const msgCount=S.messages.length;
   if(sid!==_messageRenderWindowSid) _resetMessageRenderWindow(sid);

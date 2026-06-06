@@ -275,6 +275,30 @@ def _visible_pinned_lineage_ids(session_rows) -> set[str]:
 from api.profiles import _profiles_match  # noqa: F401, E402  (re-export)
 
 
+
+
+def _queue_session_visible_to_active_profile(sid: str) -> bool:
+    """Return True if the queued-session id belongs to the active WebUI profile.
+
+    Queue files are keyed by session_id on disk, so route handlers must verify
+    session visibility before exposing/mutating queued input. This mirrors the
+    /api/sessions default profile filter and prevents cross-profile queue leaks.
+    """
+    try:
+        session = get_session(sid, metadata_only=True)
+    except KeyError:
+        return False
+    except Exception:
+        logger.debug("failed to resolve session %s for queue profile scope", sid, exc_info=True)
+        return False
+    try:
+        from api.profiles import get_active_profile_name
+
+        active_profile = get_active_profile_name()
+    except Exception:
+        active_profile = "default"
+    return _profiles_match(getattr(session, "profile", None), active_profile)
+
 def _all_profiles_query_flag(parsed_url) -> bool:
     """Return True if the request URL has `?all_profiles=1` (or true/yes).
 
@@ -1586,7 +1610,11 @@ def _handle_session_title_refresh(handler, body):
             s.llm_title_generated = True
             s.save(touch_updated_at=False)
         _sync_session_title_to_insights(s)
-        publish_session_list_changed("session_title_refresh", profile=getattr(s, "profile", None))
+        publish_reason = str(body.get("_publish_reason") or "session_title_refresh")
+        if publish_reason == "session_title_regenerate":
+            publish_session_list_changed("session_title_regenerate", profile=getattr(s, "profile", None))
+        else:
+            publish_session_list_changed("session_title_refresh", profile=getattr(s, "profile", None))
         payload = {
             "ok": True,
             "status": status,
@@ -5264,6 +5292,25 @@ def handle_get(handler, parsed) -> bool:
         _handle_session_compress_status(handler, query.get("session_id", [""])[0])
         return True
 
+
+    if parsed.path == "/api/session/queue":
+        query = parse_qs(parsed.query)
+        sid = (query.get("session_id", [""])[0] or "").strip()
+        if not sid:
+            return bad(handler, "session_id is required", status=400)
+        if not _queue_session_visible_to_active_profile(sid):
+            return bad(handler, "Session not found", status=404)
+        try:
+            from api.session_queue import list_queue
+
+            queue_items = list_queue(sid)
+            return j(handler, {"ok": True, "session_id": sid, "queue": queue_items, "count": len(queue_items)})
+        except ValueError as exc:
+            return bad(handler, str(exc), status=400)
+        except Exception as exc:
+            logger.exception("failed to read queued input for session %s", sid)
+            return bad(handler, _sanitize_error(exc), status=500)
+
     if parsed.path == "/api/session":
         import time as _time
         _t0 = _time.monotonic()
@@ -6570,6 +6617,55 @@ def handle_post(handler, parsed) -> bool:
             bad(handler, str(exc), status=500)
         return True
 
+
+    if parsed.path == "/api/session/queue":
+        sid = str(body.get("session_id") or "").strip()
+        if not sid:
+            return bad(handler, "session_id is required", status=400)
+        if not _queue_session_visible_to_active_profile(sid):
+            return bad(handler, "Session not found", status=404)
+        try:
+            from api.session_queue import append_queue_item
+
+            return j(handler, append_queue_item(sid, body.get("item") or body))
+        except ValueError as exc:
+            return bad(handler, str(exc), status=400)
+        except Exception as exc:
+            logger.exception("failed to append queued input for session %s", sid)
+            return bad(handler, _sanitize_error(exc), status=500)
+
+    if parsed.path == "/api/session/queue/replace":
+        sid = str(body.get("session_id") or "").strip()
+        if not sid:
+            return bad(handler, "session_id is required", status=400)
+        if not _queue_session_visible_to_active_profile(sid):
+            return bad(handler, "Session not found", status=404)
+        try:
+            from api.session_queue import replace_queue
+
+            return j(handler, replace_queue(sid, body.get("queue") or []))
+        except ValueError as exc:
+            return bad(handler, str(exc), status=400)
+        except Exception as exc:
+            logger.exception("failed to replace queued input for session %s", sid)
+            return bad(handler, _sanitize_error(exc), status=500)
+
+    if parsed.path == "/api/session/queue/shift":
+        sid = str(body.get("session_id") or "").strip()
+        if not sid:
+            return bad(handler, "session_id is required", status=400)
+        if not _queue_session_visible_to_active_profile(sid):
+            return bad(handler, "Session not found", status=404)
+        try:
+            from api.session_queue import shift_queue_item
+
+            return j(handler, shift_queue_item(sid, body.get("item_id") or body.get("id")))
+        except ValueError as exc:
+            return bad(handler, str(exc), status=400)
+        except Exception as exc:
+            logger.exception("failed to shift queued input for session %s", sid)
+            return bad(handler, _sanitize_error(exc), status=500)
+
     if parsed.path == "/api/session/new":
         try:
             workspace = str(resolve_trusted_workspace(body.get("workspace"))) if body.get("workspace") else None
@@ -6838,6 +6934,7 @@ def handle_post(handler, parsed) -> bool:
         return True
 
     if parsed.path == "/api/session/title/regenerate":
+        body["_publish_reason"] = "session_title_regenerate"
         _handle_session_title_refresh(handler, body)
         return True
 

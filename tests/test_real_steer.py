@@ -37,14 +37,21 @@ def _restore_auth_sessions():
 
 @pytest.fixture
 def _clear_caches():
-    """Snapshot SESSION_AGENT_CACHE and STREAMS so tests don't bleed."""
-    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK, STREAMS, STREAMS_LOCK
+    """Snapshot SESSION_AGENT_CACHE and stream state so tests don't bleed."""
+    from api.config import (
+        SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK,
+        STREAMS, STREAMS_LOCK,
+        STREAM_PENDING_STEERS, STREAM_PENDING_STEERS_LOCK,
+    )
     with SESSION_AGENT_CACHE_LOCK:
         cache_snap = dict(SESSION_AGENT_CACHE)
         SESSION_AGENT_CACHE.clear()
     with STREAMS_LOCK:
         streams_snap = dict(STREAMS)
         STREAMS.clear()
+    with STREAM_PENDING_STEERS_LOCK:
+        pending_steers_snap = dict(STREAM_PENDING_STEERS)
+        STREAM_PENDING_STEERS.clear()
     yield
     with SESSION_AGENT_CACHE_LOCK:
         SESSION_AGENT_CACHE.clear()
@@ -52,6 +59,9 @@ def _clear_caches():
     with STREAMS_LOCK:
         STREAMS.clear()
         STREAMS.update(streams_snap)
+    with STREAM_PENDING_STEERS_LOCK:
+        STREAM_PENDING_STEERS.clear()
+        STREAM_PENDING_STEERS.update(pending_steers_snap)
 
 
 def _make_handler():
@@ -105,7 +115,43 @@ class TestHandleChatSteerHappyPath:
 
         agent.steer.assert_called_once_with("Use Python instead")
         body = _captured_response(handler)
-        assert body == {"accepted": True, "fallback": None, "stream_id": stream_id}
+        assert body["accepted"] is True
+        assert body["fallback"] is None
+        assert body["stream_id"] == stream_id
+        assert body["pending_steer_count"] == 1
+        assert body["pending_steers"][0]["order"] == 1
+        assert body["pending_steers"][0]["text_preview"] == "Use Python instead"
+
+    def test_two_accepted_steers_return_ordered_pending_state(self, _clear_caches):
+        """Two /steer calls before a drain stay distinguishable in backend state."""
+        from api.streaming import _handle_chat_steer
+        from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK, STREAMS, STREAMS_LOCK
+        sid, stream_id = "sid_multi", "stream_multi"
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        with SESSION_AGENT_CACHE_LOCK:
+            SESSION_AGENT_CACHE[sid] = (agent, "sig")
+        with STREAMS_LOCK:
+            import queue as _q
+            STREAMS[stream_id] = _q.Queue()
+
+        sess = MagicMock()
+        sess.active_stream_id = stream_id
+        with patch("api.streaming.get_session", return_value=sess):
+            first = _make_handler()
+            _handle_chat_steer(first, {"session_id": sid, "text": "first hint"})
+            second = _make_handler()
+            _handle_chat_steer(second, {"session_id": sid, "text": "second hint"})
+
+        body1 = _captured_response(first)
+        body2 = _captured_response(second)
+        assert body1["pending_steer_count"] == 1
+        assert [item["text_preview"] for item in body1["pending_steers"]] == ["first hint"]
+        assert body2["accepted"] is True
+        assert body2["pending_steer_count"] == 2
+        assert [item["order"] for item in body2["pending_steers"]] == [1, 2]
+        assert [item["text_preview"] for item in body2["pending_steers"]] == ["first hint", "second hint"]
+        assert body2["pending_steers"][0]["id"] != body2["pending_steers"][1]["id"]
 
 
 class TestHandleChatSteerFallbacks:
@@ -285,10 +331,29 @@ class TestFrontendWiring:
         """Frontend must listen for pending_steer_leftover SSE events and queue them."""
         idx = self.msgs.find("addEventListener('pending_steer_leftover'")
         assert idx >= 0, "messages.js must add a listener for pending_steer_leftover"
-        block = self.msgs[idx:idx + 600]
+        block = self.msgs[idx:idx + 1200]
         assert "queueSessionMessage" in block, (
             "pending_steer_leftover handler must queue the leftover text for the next turn"
         )
+        assert "clearPendingSteerIndicators" in block, (
+            "pending_steer_leftover handler must clear pending steer display once queued"
+        )
+
+    def test_pending_steer_indicator_clears_on_apply_and_terminal_paths(self):
+        assert "function clearPendingSteerIndicators" in self.cmds
+        for marker in (
+            "addEventListener('tool_complete'",
+            "addEventListener('done'",
+            "addEventListener('stream_end'",
+            "function _restoreSettledSession",
+            "function _handleStreamError",
+        ):
+            idx = self.msgs.find(marker)
+            assert idx >= 0, f"missing frontend stream path: {marker}"
+            block = self.msgs[idx:idx + 3600]
+            assert "clearPendingSteerIndicators" in block, (
+                f"{marker} must clear pending steer display when backend state settles"
+            )
 
 
 # ── i18n keys ─────────────────────────────────────────────────────────────
@@ -316,32 +381,83 @@ class TestI18nKeys:
 # ── Leftover SSE delivery: streaming.py emits pending_steer_leftover ─────
 
 class TestLeftoverDelivery:
-    """After run_conversation returns, _drain_pending_steer is called and a
-    pending_steer_leftover SSE event is emitted if there's still text stashed."""
+    """After run_conversation returns, leftover /steer metadata is emitted in order."""
 
     def test_leftover_drain_call_in_streaming(self):
-        """Verify the streaming.py source contains the drain call before put('done', ...)."""
         src = (Path(__file__).parent.parent / "api" / "streaming.py").read_text(encoding="utf-8")
-        assert "_drain_pending_steer" in src, (
-            "_run_agent_streaming must call agent._drain_pending_steer() to deliver leftovers"
-        )
-        assert "pending_steer_leftover" in src, (
-            "_run_agent_streaming must emit a pending_steer_leftover SSE event"
-        )
+        assert "_emit_pending_steer_leftovers" in src
+        assert "_drain_pending_steer" in src
+        assert "pending_steer_leftover" in src
+
+    def test_stream_terminal_paths_clear_pending_steer_metadata(self):
+        src = (Path(__file__).parent.parent / "api" / "streaming.py").read_text(encoding="utf-8")
+        finally_idx = src.find("STREAM_LAST_EVENT_ID.pop(stream_id")
+        assert finally_idx >= 0
+        finally_block = src[finally_idx:finally_idx + 500]
+        assert "_clear_pending_steers(stream_id)" in finally_block
+        cancel_idx = src.find("def cancel_stream(stream_id")
+        assert cancel_idx >= 0
+        clear_idx = src.find("_clear_pending_steers(stream_id)", cancel_idx)
+        assert clear_idx > cancel_idx
 
     def test_leftover_drain_runs_before_done_event(self):
-        """The drain must happen BEFORE put('done', ...) so frontend gets both events
-        on the same turn."""
         src = (Path(__file__).parent.parent / "api" / "streaming.py").read_text(encoding="utf-8")
-        # Find the drain invocation and the next put('done', ...) AFTER it
-        drain_idx = src.find("_drain_pending_steer()")
+        drain_idx = src.find("_emit_pending_steer_leftovers(")
         assert drain_idx >= 0
         done_idx = src.find("put('done'", drain_idx)
         assert done_idx >= 0
-        # No put('done', ...) should appear BEFORE the drain in the same code block
-        # (we already check the drain is in the file; ordering matters within the
-        # non-ephemeral success path)
-        assert drain_idx < done_idx, (
-            "_drain_pending_steer must run before put('done', ...) so the SSE listener "
-            "sees the leftover before stream_end fires"
-        )
+        assert drain_idx < done_idx
+
+    def test_leftover_events_preserve_recorded_steer_order(self, _clear_caches):
+        from api import config
+        from api.streaming import _record_pending_steer, _emit_pending_steer_leftovers
+
+        sid, stream_id = "sid_leftover_order", "stream_leftover_order"
+        _record_pending_steer(stream_id, sid, "first hint")
+        _record_pending_steer(stream_id, sid, "second hint")
+
+        class Agent:
+            def _drain_pending_steer(self):
+                return "first hint\nsecond hint"
+
+        events = []
+        _emit_pending_steer_leftovers(Agent(), stream_id, sid, lambda event, data: events.append((event, data)))
+
+        assert [event for event, _ in events] == ["pending_steer_leftover", "pending_steer_leftover"]
+        assert [data["text"] for _, data in events] == ["first hint", "second hint"]
+        assert [data["order"] for _, data in events] == [1, 2]
+        assert all(data["source"] == "steer" for _, data in events)
+        with config.STREAM_PENDING_STEERS_LOCK:
+            assert stream_id not in config.STREAM_PENDING_STEERS
+
+    def test_leftover_emit_uses_agent_drain_when_metadata_diverges(self, _clear_caches):
+        from api.streaming import _record_pending_steer, _emit_pending_steer_leftovers
+
+        sid, stream_id = "sid_leftover_diverged", "stream_leftover_diverged"
+        _record_pending_steer(stream_id, sid, "already applied")
+        _record_pending_steer(stream_id, sid, "still pending")
+
+        class Agent:
+            def _drain_pending_steer(self):
+                return "still pending"
+
+        events = []
+        _emit_pending_steer_leftovers(Agent(), stream_id, sid, lambda event, data: events.append((event, data)))
+        assert [data["text"] for _, data in events] == ["still pending"]
+
+    def test_leftover_emit_clears_consumed_metadata_without_event(self, _clear_caches):
+        from api import config
+        from api.streaming import _record_pending_steer, _emit_pending_steer_leftovers
+
+        sid, stream_id = "sid_leftover_consumed", "stream_leftover_consumed"
+        _record_pending_steer(stream_id, sid, "already consumed")
+
+        class Agent:
+            def _drain_pending_steer(self):
+                return None
+
+        events = []
+        _emit_pending_steer_leftovers(Agent(), stream_id, sid, lambda event, data: events.append((event, data)))
+        assert events == []
+        with config.STREAM_PENDING_STEERS_LOCK:
+            assert stream_id not in config.STREAM_PENDING_STEERS
