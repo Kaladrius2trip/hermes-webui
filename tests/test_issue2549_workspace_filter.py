@@ -19,16 +19,16 @@ def test_show_all_workspaces_setting_defaults_true():
 
 def test_sessions_js_applies_workspace_filter_after_project():
     src = read("static/sessions.js")
-    assert "workspaceFiltered" in src
-    # The workspace filter must run after projectFiltered (uses it as input)
-    proj_idx = src.index("const projectFiltered=")
-    ws_idx = src.index("const workspaceFiltered=")
-    assert proj_idx < ws_idx
-    # And sessionsRaw must be derived from workspaceFiltered, not projectFiltered
-    raw_idx = src.index("const sessionsRaw=")
-    assert raw_idx > ws_idx
-    snippet = src[raw_idx:raw_idx + 200]
-    assert "workspaceFiltered" in snippet
+    partition_idx = src.index("function _partitionSidebarSessionRows")
+    body = src[partition_idx:src.index("function renderSessionListFromCache", partition_idx)]
+    # The workspace filter now lives in the upstream partition helper, after
+    # project checks and before archived/sessionRaw accounting.
+    project_idx = body.index("if(_activeProject===NO_PROJECT_FILTER)")
+    workspace_idx = body.index("s.workspace!==_activeWsPath")
+    raw_idx = body.index("sessionsRaw.push(s)")
+    assert project_idx < workspace_idx < raw_idx
+    assert "window._showAllWorkspaces!==false" in body
+    assert "!s.pinned&&s.workspace" in body
 
 
 def test_default_true_means_no_filtering_when_setting_absent():
