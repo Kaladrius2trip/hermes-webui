@@ -104,6 +104,8 @@ PROJECT_DYNAMIC_GLOBALS = {
     "placeLiveToolCardsHost": "typeof-guarded optional (ui/sessions/messages call sites)",
     "watchInflightSession": "typeof-guarded optional fallback (sessions.js)",
     "_applyMediaPlaybackPreferences": "typeof-guarded optional (ui.js / workspace.js)",
+    "_currentReasoningEffortsSupported": "typeof-guarded optional extracted-test harness state (ui.js)",
+    "_applyReasoningOptions": "typeof-guarded optional extracted-test harness helper (ui.js)",
 }
 
 

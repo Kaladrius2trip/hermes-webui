@@ -4280,6 +4280,14 @@ function _sidebarRowHasVisibleMessages(s, activeSidForSidebar){
     (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0);
 }
 
+function _sidebarWorkspaceFilterState(){
+  return {
+    showAllWorkspaces:(typeof window!=='undefined')?window._showAllWorkspaces!==false:true,
+    activeWorkspacePath:(typeof S!=='undefined'&&S.session&&S.session.workspace)
+      ||(typeof _currentWorkspaceDetail!=='undefined'&&_currentWorkspaceDetail?_currentWorkspaceDetail.path:null),
+  };
+}
+
 function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   let webuiSessionCount=0;
   let cliSessionCount=0;
@@ -4295,6 +4303,7 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   const profileFiltered=[];
   const sessionsRaw=[];
   let archivedCount=0;
+  const {showAllWorkspaces, activeWorkspacePath}=_sidebarWorkspaceFilterState();
   for(const s of allMatched){
     if(!_sidebarRowHasVisibleMessages(s, activeSidForSidebar)) continue;
     const isCli=_isCliSession(s);
@@ -4308,10 +4317,7 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
     }
     // Optional: hide sessions whose workspace !== the currently active workspace (#2549).
     // Pinned rows and rows without workspace metadata remain visible.
-    const _showAllWs=(typeof window!=='undefined')?window._showAllWorkspaces!==false:true;
-    const _activeWsPath=(typeof S!=='undefined'&&S.session&&S.session.workspace)
-      ||(typeof _currentWorkspaceDetail!=='undefined'&&_currentWorkspaceDetail?_currentWorkspaceDetail.path:null);
-    if(!_showAllWs&&_activeWsPath&&!s.pinned&&s.workspace&&s.workspace!==_activeWsPath) continue;
+    if(!showAllWorkspaces&&activeWorkspacePath&&!s.pinned&&s.workspace&&s.workspace!==activeWorkspacePath) continue;
     if(s.archived) archivedCount++;
     if(!_showArchived&&s.archived) continue;
     sessionsRaw.push(s);
@@ -4322,6 +4328,8 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
     profileFiltered,
     sessionsRaw,
     archivedCount,
+    showAllWorkspaces,
+    activeWorkspacePath,
   };
 }
 
@@ -4353,6 +4361,8 @@ function renderSessionListFromCache(){
     profileFiltered,
     sessionsRaw,
     archivedCount,
+    showAllWorkspaces,
+    activeWorkspacePath,
   }=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
   const sessions=_attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw);
   _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);
@@ -4496,7 +4506,7 @@ function renderSessionListFromCache(){
   // Empty state for active per-workspace filter (#2549). Only fires when the workspace
   // filter is doing the rejecting (i.e. no active project filter is in play), so the
   // two empty-state messages don't fight over the same DOM slot.
-  if(!_activeProject&&!_showAllWs&&_activeWsPath&&sessions.length===0){
+  if(!_activeProject&&!showAllWorkspaces&&activeWorkspacePath&&sessions.length===0){
     const empty=document.createElement('div');
     empty.style.cssText='padding:20px 14px;color:var(--muted);font-size:12px;text-align:center;opacity:.7;';
     empty.textContent='No sessions in this workspace yet.';

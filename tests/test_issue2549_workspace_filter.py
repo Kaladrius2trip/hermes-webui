@@ -24,11 +24,23 @@ def test_sessions_js_applies_workspace_filter_after_project():
     # The workspace filter now lives in the upstream partition helper, after
     # project checks and before archived/sessionRaw accounting.
     project_idx = body.index("if(_activeProject===NO_PROJECT_FILTER)")
-    workspace_idx = body.index("s.workspace!==_activeWsPath")
+    workspace_idx = body.index("s.workspace!==activeWorkspacePath")
     raw_idx = body.index("sessionsRaw.push(s)")
     assert project_idx < workspace_idx < raw_idx
-    assert "window._showAllWorkspaces!==false" in body
+    assert "function _sidebarWorkspaceFilterState()" in src
+    assert "window._showAllWorkspaces!==false" in src
     assert "!s.pinned&&s.workspace" in body
+
+
+def test_render_workspace_empty_state_uses_partition_returned_state():
+    """The empty-state branch must not reference locals scoped inside the partition helper."""
+    src = read("static/sessions.js")
+    render_idx = src.index("function renderSessionListFromCache")
+    render_body = src[render_idx:src.index("function _showProjectPicker", render_idx)]
+    assert "!_showAllWs" not in render_body
+    assert "_activeWsPath&&sessions.length" not in render_body
+    assert "showAllWorkspaces" in render_body
+    assert "activeWorkspacePath" in render_body
 
 
 def test_default_true_means_no_filtering_when_setting_absent():
