@@ -1255,7 +1255,13 @@ let _editingCronId = null;
 // ── Kanban panel (read-only) ──
 function _kanbanColumnLabel(name){ return t('kanban_status_' + name) || name; }
 function _kanbanTaskTitle(task){ return task.title || task.summary || task.id || t('kanban_task'); }
-function _kanbanTaskBody(task){ return task.body || task.description || task.prompt || ''; }
+function _kanbanStripCapabilityMarker(body){
+  const text = body || '';
+  const marker = '<!-- hermes-kanban-capability:';
+  const idx = String(text).lastIndexOf(marker);
+  return idx >= 0 ? String(text).slice(0, idx).trimEnd() : text;
+}
+function _kanbanTaskBody(task){ return _kanbanStripCapabilityMarker(task.body || task.description || task.prompt || ''); }
 function _kanbanTaskMeta(task){
   const bits = [];
   if (task.assignee) bits.push(task.assignee);
@@ -1656,6 +1662,33 @@ function _kanbanRenderBoard(){
   board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(_kanbanRenderColumn).join('');
 }
 
+function _kanbanCapabilityCardHtml(capability){
+  if (!capability) return '';
+  const profile = capability.profile || '';
+  const category = capability.category || '';
+  const gate = capability.gate_state || '';
+  const evidence = Array.isArray(capability.evidence) ? capability.evidence : [];
+  return `<div class="kanban-card-capability" aria-label="Capability workflow">
+    <span>${esc(profile)}</span>${category ? `<span>${esc(category)}</span>` : ''}${gate ? `<span class="kanban-capability-gate">${esc(gate)}</span>` : ''}
+    ${evidence.length ? `<span class="kanban-capability-evidence">${esc(evidence[0])}</span>` : ''}
+  </div>`;
+}
+
+function _kanbanCapabilityDetailHtml(capability){
+  if (!capability) return '';
+  const gates = Array.isArray(capability.approval_gates) ? capability.approval_gates : [];
+  const evidence = Array.isArray(capability.evidence) ? capability.evidence : [];
+  return `<section class="kanban-capability-panel">
+    <div class="kanban-capability-title">Capability workflow</div>
+    <div class="kanban-capability-row"><span>Profile</span><strong>${esc(capability.profile || '')}</strong></div>
+    <div class="kanban-capability-row"><span>Category</span><strong>${esc(capability.category || '')}</strong></div>
+    <div class="kanban-capability-row"><span>Mode</span><strong>${esc(capability.mode || '')}</strong></div>
+    <div class="kanban-capability-row"><span>Gate state</span><strong class="kanban-capability-gate">${esc(capability.gate_state || '')}</strong></div>
+    ${gates.length ? `<div class="kanban-capability-row"><span>Approval gates</span><strong>${esc(gates.join(' · '))}</strong></div>` : ''}
+    ${evidence.length ? `<div class="kanban-capability-evidence">${evidence.map(item => `<span>${esc(item)}</span>`).join('')}</div>` : ''}
+  </section>`;
+}
+
 function _kanbanCard(task, status){
   const priority = Number(task.priority || 0);
   const links = task.link_counts || {};
@@ -1664,11 +1697,15 @@ function _kanbanCard(task, status){
   const age = _kanbanTaskAge(task);
   const stale = _kanbanCardStalenessClass(task);
   const body = _kanbanTaskBody(task);
+  const capability = task.capability || null;
+  const capabilityClass = capability ? ' kanban-card-capability' : '';
+  const capabilityHtml = _kanbanCapabilityCardHtml(task.capability);
   const assignee = task.assignee ? `<span class="kanban-card-assignee">@${esc(task.assignee)}</span>` : `<span class="kanban-card-unassigned">${esc(t('kanban_unassigned'))}</span>`;
-  return `<article class="kanban-card ${esc(stale)}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, '${esc(task.id)}')" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, '${esc(task.id)}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask('${esc(task.id)}')}">
+  return `<article class="kanban-card ${esc(stale)}${capabilityClass}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, '${esc(task.id)}')" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, '${esc(task.id)}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask('${esc(task.id)}')}">
     <div class="kanban-card-topline"><span class="kanban-card-id">${esc(task.id || '')}</span>${priority ? `<span class="kanban-badge priority">P${priority}</span>` : ''}${task.tenant ? `<span class="kanban-badge tenant">${esc(task.tenant)}</span>` : ''}</div>
     <div class="kanban-card-title">${esc(_kanbanTaskTitle(task))}</div>
     ${body ? `<div class="kanban-card-body">${_kanbanRenderMarkdown(body)}</div>` : ''}
+    ${capabilityHtml}
     <div class="kanban-card-meta">${assignee}${comments ? `<span class="kanban-card-metric">💬 ${comments}</span>` : ''}${linkTotal ? `<span class="kanban-card-metric">↔ ${linkTotal}</span>` : ''}${age ? `<span class="kanban-card-age">${esc(age)}</span>` : ''}</div>
     ${_kanbanCardQuickActions(task)}
   </article>`;
@@ -2186,6 +2223,8 @@ let _kanbanTaskModalFocusCleanup = null;
 // the worker and moving the task back to triage.
 let _kanbanTaskModalInitialDisplayedStatus = null;
 let _kanbanBoardModalFocusCleanup = null;
+let _kanbanCapabilityModalFocusCleanup = null;
+let _kanbanCapabilityLastPlan = null;
 
 async function _kanbanLoadProfileNames(){
   // Hit /api/profiles once per session and cache for a short TTL.
@@ -2260,6 +2299,173 @@ async function _kanbanPopulateAssigneeSelect(currentValue){
   // Final "no assignee" fallthrough — explicit so users know what they're choosing.
   html += `<option value=""${(!currentValue) ? ' selected' : ''}>${esc(t('kanban_assignee_unassigned') || '— Unassigned (won\u2019t auto-run) —')}</option>`;
   sel.innerHTML = html;
+}
+
+async function _kanbanPopulateCapabilityProfileSelect(currentValue){
+  const sel = document.getElementById('kanbanCapabilityProfile');
+  if (!sel) return;
+  const names = await _kanbanLoadProfileNames();
+  const values = names.length ? names : ['default'];
+  sel.innerHTML = values.map(name => `<option value="${esc(name)}"${name === currentValue ? ' selected' : ''}>${esc(name)}</option>`).join('');
+  if (currentValue && values.includes(currentValue)) sel.value = currentValue;
+}
+
+function _kanbanCapabilitySetError(message){
+  const el = document.getElementById('kanbanCapabilityError');
+  if (el) el.textContent = message || '';
+}
+
+function _kanbanCapabilitySetBusy(busy){
+  const preview = document.getElementById('kanbanCapabilityPreview');
+  const create = document.getElementById('kanbanCapabilityCreate');
+  if (preview) preview.disabled = !!busy;
+  if (create) create.disabled = !!busy || !_kanbanCapabilityLastPlan;
+}
+
+function openKanbanCapabilityWorkflow(){
+  if (typeof switchPanel === 'function' && _currentPanel !== 'kanban') switchPanel('kanban');
+  const modal = document.getElementById('kanbanCapabilityModal');
+  if (!modal) return;
+  _kanbanCapabilityLastPlan = null;
+  _kanbanCapabilitySetError('');
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
+  set('kanbanCapabilityGoal', '');
+  set('kanbanCapabilityScope', '');
+  set('kanbanCapabilityConstraints', '');
+  set('kanbanCapabilityMode', 'canary');
+  set('kanbanCapabilityGates', 'review-required');
+  const plan = document.getElementById('kanbanCapabilityPlan');
+  if (plan) plan.innerHTML = '<div class="kanban-detail-empty">Dry-run preview will show planned team graph here.</div>';
+  _kanbanCapabilitySetBusy(false);
+  _kanbanPopulateCapabilityProfileSelect('default');
+  modal.hidden = false;
+  if (_kanbanCapabilityModalFocusCleanup) {
+    _kanbanCapabilityModalFocusCleanup();
+    _kanbanCapabilityModalFocusCleanup = null;
+  }
+  _kanbanCapabilityModalFocusCleanup = _trapModalFocus(modal);
+  setTimeout(() => {
+    const goal = document.getElementById('kanbanCapabilityGoal');
+    if (goal) goal.focus();
+  }, 50);
+  document.addEventListener('keydown', _kanbanCapabilityModalKey);
+}
+
+function closeKanbanCapabilityWorkflow(){
+  const modal = document.getElementById('kanbanCapabilityModal');
+  if (modal) modal.hidden = true;
+  if (_kanbanCapabilityModalFocusCleanup) {
+    _kanbanCapabilityModalFocusCleanup();
+    _kanbanCapabilityModalFocusCleanup = null;
+  }
+  document.removeEventListener('keydown', _kanbanCapabilityModalKey);
+}
+
+function _kanbanCapabilityModalKey(ev){
+  const modal = document.getElementById('kanbanCapabilityModal');
+  if (!modal || modal.hidden) return;
+  if (ev.key === 'Escape') {
+    ev.preventDefault();
+    closeKanbanCapabilityWorkflow();
+  }
+}
+
+function _collectKanbanCapabilityContract(){
+  const value = id => {
+    const el = document.getElementById(id);
+    return el ? String(el.value || '').trim() : '';
+  };
+  const goal = value('kanbanCapabilityGoal');
+  if (!goal) throw new Error('Goal is required.');
+  const gates = value('kanbanCapabilityGates').split(/[,\n]/).map(s => s.trim()).filter(Boolean);
+  return {
+    goal,
+    scope: value('kanbanCapabilityScope'),
+    constraints: value('kanbanCapabilityConstraints'),
+    capability_profile: value('kanbanCapabilityProfile') || 'default',
+    mode: value('kanbanCapabilityMode') || 'canary',
+    approval_gates: gates.length ? gates : ['review-required'],
+  };
+}
+
+function _renderKanbanCapabilityPlan(data){
+  const el = document.getElementById('kanbanCapabilityPlan');
+  if (!el) return;
+  if (!data) {
+    el.innerHTML = '<div class="kanban-detail-empty">No plan.</div>';
+    return;
+  }
+  const contract = data.contract || {};
+  const cards = Array.isArray(data.cards) ? data.cards : [];
+  const gates = Array.isArray(data.gates) ? data.gates : [];
+  const graph = data.graph || {};
+  const edges = Array.isArray(graph.edges) ? graph.edges : [];
+  const cardHtml = cards.map(card => {
+    const cap = card.capability || {};
+    return `<div class="kanban-capability-node">
+      <div><strong>${esc(card.title || card.id || 'card')}</strong></div>
+      <div>${esc(cap.profile || card.profile || '')} · ${esc(cap.category || card.category || '')} · ${esc(cap.gate_state || card.gate_state || 'pending')}</div>
+    </div>`;
+  }).join('');
+  const edgeHtml = edges.length
+    ? `<div class="kanban-capability-edges">${edges.map(edge => `<span>${esc(edge.from)} → ${esc(edge.to)}</span>`).join('')}</div>`
+    : '<div class="kanban-detail-empty">No dependencies.</div>';
+  const gateHtml = gates.length
+    ? gates.map(gate => `<span class="kanban-capability-gate">${esc(gate.name || gate)}: ${esc(gate.state || 'pending')}</span>`).join('')
+    : '<span class="kanban-capability-gate">review-required: pending</span>';
+  el.innerHTML = `<div class="kanban-capability-plan-head">
+      <strong>${esc(contract.capability_profile || '')}</strong>
+      <span>${esc(contract.mode || 'canary')}</span>
+    </div>
+    ${contract.mode === 'live' ? '<div class="kanban-capability-mode-warning">Live mode creates pending gates only; it does not restart WebUI or mutate live config.</div>' : ''}
+    <div class="kanban-capability-graph" aria-label="Planned team graph">${cardHtml}${edgeHtml}</div>
+    <div class="kanban-capability-gates">${gateHtml}</div>`;
+}
+
+async function previewKanbanCapabilityWorkflow(){
+  let payload;
+  try { payload = _collectKanbanCapabilityContract(); }
+  catch(e) { _kanbanCapabilitySetError(e.message || String(e)); return; }
+  _kanbanCapabilitySetBusy(true);
+  _kanbanCapabilitySetError('');
+  try {
+    const data = await api('/api/kanban/capability/plan' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    _kanbanCapabilityLastPlan = data;
+    _renderKanbanCapabilityPlan(data);
+    _kanbanCapabilitySetBusy(false);
+  } catch(e) {
+    _kanbanCapabilityLastPlan = null;
+    _renderKanbanCapabilityPlan(null);
+    _kanbanCapabilitySetError((e && e.message) || String(e));
+    _kanbanCapabilitySetBusy(false);
+  }
+}
+
+async function createKanbanCapabilityCards(){
+  let payload;
+  try { payload = _collectKanbanCapabilityContract(); }
+  catch(e) { _kanbanCapabilitySetError(e.message || String(e)); return; }
+  _kanbanCapabilitySetBusy(true);
+  _kanbanCapabilitySetError('');
+  try {
+    const data = await api('/api/kanban/capability/cards' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    _kanbanCapabilityLastPlan = data;
+    _renderKanbanCapabilityPlan(data);
+    closeKanbanCapabilityWorkflow();
+    await loadKanban(true);
+    const tasks = Array.isArray(data && data.created_tasks) ? data.created_tasks : [];
+    if (tasks.length && tasks[0].id) await loadKanbanTask(tasks[0].id);
+  } catch(e) {
+    _kanbanCapabilitySetError((e && e.message) || String(e));
+  } finally {
+    _kanbanCapabilitySetBusy(false);
+  }
 }
 
 function openKanbanCreate(){
@@ -2629,6 +2835,7 @@ function _kanbanRenderTaskDetail(data){
       <button class="btn secondary kanban-edit-btn" onclick="openKanbanEdit('${esc(task.id)}')" data-i18n="kanban_edit_task" title="${esc(t('kanban_edit_task') || 'Edit task')}">${esc(t('kanban_edit_task') || 'Edit task')}</button>
     </div>
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
+    ${_kanbanCapabilityDetailHtml(task.capability)}
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     <div class="kanban-status-actions">${statusButtons}</div>
     <div class="kanban-detail-grid">

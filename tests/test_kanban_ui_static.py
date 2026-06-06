@@ -1191,3 +1191,50 @@ def test_kanban_locale_parity():
     assert not failures, (
         "Kanban i18n key parity violations:\n" + "\n".join(failures)
     )
+
+
+def test_capability_workflow_panel_markup_and_handlers_exist():
+    """Capability workflow MVP needs a native, quiet WebUI form reachable from
+    the Kanban panel. The form captures task-contract inputs, supports dry-run
+    preview, and creates cards only from an explicit action.
+    """
+    assert 'id="btnKanbanCapabilityWorkflow"' in INDEX
+    assert 'onclick="openKanbanCapabilityWorkflow()"' in INDEX
+    for field_id in (
+        "kanbanCapabilityModal",
+        "kanbanCapabilityGoal",
+        "kanbanCapabilityScope",
+        "kanbanCapabilityConstraints",
+        "kanbanCapabilityProfile",
+        "kanbanCapabilityMode",
+        "kanbanCapabilityGates",
+        "kanbanCapabilityPlan",
+        "kanbanCapabilityCreate",
+    ):
+        assert f'id="{field_id}"' in INDEX, f"missing #{field_id}"
+
+    for fn in (
+        "function openKanbanCapabilityWorkflow",
+        "function closeKanbanCapabilityWorkflow",
+        "async function previewKanbanCapabilityWorkflow",
+        "async function createKanbanCapabilityCards",
+        "function _renderKanbanCapabilityPlan",
+        "function _collectKanbanCapabilityContract",
+    ):
+        assert fn in PANELS, f"Missing handler: {fn}"
+    assert "api('/api/kanban/capability/plan'" in PANELS
+    assert "api('/api/kanban/capability/cards'" in PANELS
+    assert "method: 'POST'" in PANELS
+
+
+def test_capability_workflow_status_evidence_and_gate_state_render_on_cards_and_detail():
+    """Created capability cards must surface profile/category/status/evidence
+    and gate state quietly on board cards and in task detail.
+    """
+    assert "task.capability" in PANELS
+    assert "kanban-card-capability" in PANELS
+    assert "kanban-capability-gate" in PANELS
+    assert "kanban-capability-evidence" in PANELS
+    assert ".kanban-card-capability" in STYLE
+    assert ".kanban-capability-panel" in STYLE
+    assert ".kanban-capability-gate" in STYLE
