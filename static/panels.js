@@ -2306,8 +2306,23 @@ async function _kanbanPopulateCapabilityProfileSelect(currentValue){
   if (!sel) return;
   const names = await _kanbanLoadProfileNames();
   const values = names.length ? names : ['default'];
-  sel.innerHTML = values.map(name => `<option value="${esc(name)}"${name === currentValue ? ' selected' : ''}>${esc(name)}</option>`).join('');
+  const options = values.map(name => {
+    const opt = document.createElement('option');
+    opt.value = String(name);
+    opt.textContent = String(name);
+    if (name === currentValue) opt.selected = true;
+    return opt;
+  });
+  sel.replaceChildren(...options);
   if (currentValue && values.includes(currentValue)) sel.value = currentValue;
+}
+
+function _kanbanCapabilitySetEmptyPlan(el, message){
+  if (!el) return;
+  const empty = document.createElement('div');
+  empty.className = 'kanban-detail-empty';
+  empty.textContent = message;
+  el.replaceChildren(empty);
 }
 
 function _kanbanCapabilitySetError(message){
@@ -2335,7 +2350,7 @@ function openKanbanCapabilityWorkflow(){
   set('kanbanCapabilityMode', 'canary');
   set('kanbanCapabilityGates', 'review-required');
   const plan = document.getElementById('kanbanCapabilityPlan');
-  if (plan) plan.innerHTML = '<div class="kanban-detail-empty">Dry-run preview will show planned team graph here.</div>';
+  _kanbanCapabilitySetEmptyPlan(plan, 'Dry-run preview will show planned team graph here.');
   _kanbanCapabilitySetBusy(false);
   _kanbanPopulateCapabilityProfileSelect('default');
   modal.hidden = false;
@@ -2392,7 +2407,7 @@ function _renderKanbanCapabilityPlan(data){
   const el = document.getElementById('kanbanCapabilityPlan');
   if (!el) return;
   if (!data) {
-    el.innerHTML = '<div class="kanban-detail-empty">No plan.</div>';
+    _kanbanCapabilitySetEmptyPlan(el, 'No plan.');
     return;
   }
   const contract = data.contract || {};
@@ -2400,26 +2415,68 @@ function _renderKanbanCapabilityPlan(data){
   const gates = Array.isArray(data.gates) ? data.gates : [];
   const graph = data.graph || {};
   const edges = Array.isArray(graph.edges) ? graph.edges : [];
-  const cardHtml = cards.map(card => {
+
+  const fragment = document.createDocumentFragment();
+  const head = document.createElement('div');
+  head.className = 'kanban-capability-plan-head';
+  const profile = document.createElement('strong');
+  profile.textContent = String(contract.capability_profile || '');
+  const mode = document.createElement('span');
+  mode.textContent = String(contract.mode || 'canary');
+  head.append(profile, mode);
+  fragment.append(head);
+
+  if (contract.mode === 'live') {
+    const warning = document.createElement('div');
+    warning.className = 'kanban-capability-mode-warning';
+    warning.textContent = 'Live mode creates pending gates only; it does not restart WebUI or mutate live config.';
+    fragment.append(warning);
+  }
+
+  const graphEl = document.createElement('div');
+  graphEl.className = 'kanban-capability-graph';
+  graphEl.setAttribute('aria-label', 'Planned team graph');
+  for (const card of cards) {
     const cap = card.capability || {};
-    return `<div class="kanban-capability-node">
-      <div><strong>${esc(card.title || card.id || 'card')}</strong></div>
-      <div>${esc(cap.profile || card.profile || '')} · ${esc(cap.category || card.category || '')} · ${esc(cap.gate_state || card.gate_state || 'pending')}</div>
-    </div>`;
-  }).join('');
-  const edgeHtml = edges.length
-    ? `<div class="kanban-capability-edges">${edges.map(edge => `<span>${esc(edge.from)} → ${esc(edge.to)}</span>`).join('')}</div>`
-    : '<div class="kanban-detail-empty">No dependencies.</div>';
-  const gateHtml = gates.length
-    ? gates.map(gate => `<span class="kanban-capability-gate">${esc(gate.name || gate)}: ${esc(gate.state || 'pending')}</span>`).join('')
-    : '<span class="kanban-capability-gate">review-required: pending</span>';
-  el.innerHTML = `<div class="kanban-capability-plan-head">
-      <strong>${esc(contract.capability_profile || '')}</strong>
-      <span>${esc(contract.mode || 'canary')}</span>
-    </div>
-    ${contract.mode === 'live' ? '<div class="kanban-capability-mode-warning">Live mode creates pending gates only; it does not restart WebUI or mutate live config.</div>' : ''}
-    <div class="kanban-capability-graph" aria-label="Planned team graph">${cardHtml}${edgeHtml}</div>
-    <div class="kanban-capability-gates">${gateHtml}</div>`;
+    const node = document.createElement('div');
+    node.className = 'kanban-capability-node';
+    const titleWrap = document.createElement('div');
+    const title = document.createElement('strong');
+    title.textContent = String(card.title || card.id || 'card');
+    titleWrap.append(title);
+    const meta = document.createElement('div');
+    meta.textContent = `${cap.profile || card.profile || ''} · ${cap.category || card.category || ''} · ${cap.gate_state || card.gate_state || 'pending'}`;
+    node.append(titleWrap, meta);
+    graphEl.append(node);
+  }
+  if (edges.length) {
+    const edgeWrap = document.createElement('div');
+    edgeWrap.className = 'kanban-capability-edges';
+    for (const edge of edges) {
+      const span = document.createElement('span');
+      span.textContent = `${edge.from || ''} → ${edge.to || ''}`;
+      edgeWrap.append(span);
+    }
+    graphEl.append(edgeWrap);
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'kanban-detail-empty';
+    empty.textContent = 'No dependencies.';
+    graphEl.append(empty);
+  }
+  fragment.append(graphEl);
+
+  const gatesEl = document.createElement('div');
+  gatesEl.className = 'kanban-capability-gates';
+  const gateItems = gates.length ? gates : [{name: 'review-required', state: 'pending'}];
+  for (const gate of gateItems) {
+    const span = document.createElement('span');
+    span.className = 'kanban-capability-gate';
+    span.textContent = `${gate.name || gate}: ${gate.state || 'pending'}`;
+    gatesEl.append(span);
+  }
+  fragment.append(gatesEl);
+  el.replaceChildren(fragment);
 }
 
 async function previewKanbanCapabilityWorkflow(){
