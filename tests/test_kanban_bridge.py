@@ -98,7 +98,7 @@ class FakeConn:
             *values, task_id = params
             task = next((task for task in self.tasks if task.id == task_id), None)
             if task:
-                for field, value in zip(fields, values):
+                for field, value in zip(fields, values, strict=False):
                     setattr(task, field, value)
             return SimpleNamespace(fetchall=lambda: [], fetchone=lambda: None)
         raise AssertionError(f"unexpected SQL: {sql}")
@@ -174,6 +174,8 @@ class FakeKanbanDB:
             kwargs.get("body"),
         )
         self.tasks.append(task)
+        for parent_id in kwargs.get("parents") or ():
+            self.links.append((parent_id, task_id))
         self._event(task_id, "created", {"status": status})
         return task_id
 
@@ -1294,3 +1296,113 @@ def test_sse_honours_last_event_id_header_when_since_absent(monkeypatch):
     assert 42 in captured_cursor, (
         f"Handler must honour Last-Event-ID=42 on reconnect; saw cursors: {captured_cursor}"
     )
+
+
+def test_capability_plan_preview_is_dry_run_and_normalizes_contract(monkeypatch):
+    """Capability workflow preview returns a deterministic team graph without
+    mutating the Kanban board. This is the WebUI Task Contract dry-run surface:
+    goal/scope/constraints/profile/mode/gates go in, planned cards and gates
+    come back, but no tasks are created until the explicit create call.
+    """
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    before_ids = [task.id for task in kb.tasks]
+
+    preview = bridge._capability_plan_payload({
+        "goal": "Ship capability UX",
+        "scope": "WebUI only",
+        "constraints": "No restart. No dependency install.",
+        "capability_profile": "webui-test",
+        "mode": "canary",
+        "approval_gates": ["human review", "live mode approval"],
+        "tenant": "capability-profile-layer",
+    })
+
+    assert [task.id for task in kb.tasks] == before_ids
+    assert preview["dry_run"] is True
+    assert preview["contract"]["goal"] == "Ship capability UX"
+    assert preview["contract"]["scope"] == "WebUI only"
+    assert preview["contract"]["constraints"] == "No restart. No dependency install."
+    assert preview["contract"]["capability_profile"] == "webui-test"
+    assert preview["contract"]["mode"] == "canary"
+    assert preview["contract"]["approval_gates"] == ["human review", "live mode approval"]
+    assert preview["graph"]["nodes"][0]["profile"] == "webui-test"
+    assert {"id", "title", "profile", "category", "gate_state", "evidence"} <= set(preview["cards"][0])
+    assert preview["gates"][0]["state"] == "pending"
+
+
+def test_capability_create_payload_creates_linked_cards_with_status_evidence_and_gates(monkeypatch):
+    """Creating from a capability plan must write real Kanban cards and expose
+    enough metadata for the board/detail UI to show profile/category/status,
+    evidence, and gate state without needing a separate sidecar store.
+    """
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    create_calls = []
+    original_create_task = kb.create_task
+
+    def spy_create_task(conn, **kwargs):
+        create_calls.append(kwargs)
+        return original_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", spy_create_task)
+
+    created = bridge._capability_create_payload({
+        "goal": "Build profile resolver bridge",
+        "scope": "Backend bridge and WebUI panel",
+        "constraints": "No secret exposure",
+        "capability_profile": "webui-test",
+        "mode": "live",
+        "approval_gates": "review-required, merge approval",
+        "tenant": "capability-profile-layer",
+        "created_by": "attacker",
+        "workspace_kind": "repo",
+        "workspace_path": "/root",
+        "max_runtime_seconds": 999999,
+        "skills": ["dangerous-skill"],
+    })
+
+    assert created["dry_run"] is False
+    assert len(created["created_tasks"]) >= 2
+    first, second = created["created_tasks"][:2]
+    assert first["assignee"] == "webui-test"
+    assert first["tenant"] == "capability-profile-layer"
+    assert first["capability"]["profile"] == "webui-test"
+    assert first["capability"]["category"] == "execution"
+    assert first["capability"]["gate_state"] == "pending"
+    assert first["capability"]["evidence"]
+    assert second["capability"]["category"] == "verification"
+
+    detail = bridge._task_detail_payload(first["id"])
+    assert detail["task"]["capability"]["mode"] == "live"
+    assert detail["task"]["capability"]["approval_gates"] == ["review-required", "merge approval"]
+    verify_detail = bridge._task_detail_payload(second["id"])
+    assert first["id"] in verify_detail["links"]["parents"]
+
+    assert create_calls
+    for call in create_calls:
+        assert call["created_by"] == "webui-capability"
+        assert call["workspace_kind"] == "scratch"
+        assert call["workspace_path"] is None
+        assert call["max_runtime_seconds"] is None
+        assert call["skills"] is None
+
+
+def test_capability_contract_rejects_non_profile_slug(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    for bad_profile in (".", "..", "../secrets", "webui test", "x\nprofile", "${TOKEN}"):
+        try:
+            bridge._capability_plan_payload({
+                "goal": "Unsafe profile",
+                "capability_profile": bad_profile,
+            })
+        except ValueError as exc:
+            assert "capability_profile" in str(exc)
+        else:
+            raise AssertionError(f"unsafe profile accepted: {bad_profile!r}")
+
+
+def test_routes_dispatches_capability_workflow_endpoints_to_kanban_bridge():
+    src = open("api/kanban_bridge.py", encoding="utf-8").read()
+    assert 'path == "/api/kanban/capability/plan"' in src
+    assert 'path == "/api/kanban/capability/cards"' in src

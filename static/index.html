@@ -817,7 +817,9 @@
         </div>
         <div class="main-view-actions">
           <button class="panel-head-btn has-tooltip has-tooltip--bottom" id="btnKanbanCreateBoard" onclick="openKanbanCreateBoard()" data-tooltip="New board" data-i18n-title="kanban_new_board" aria-label="New board"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><line x1="17.5" y1="14" x2="17.5" y2="21"/><line x1="14" y1="17.5" x2="21" y2="17.5"/></svg></button>
+          <button class="panel-head-btn has-tooltip has-tooltip--bottom" id="btnKanbanCapabilityWorkflow" onclick="openKanbanCapabilityWorkflow()" data-tooltip="Capability workflow" aria-label="Capability workflow">◇</button>
           <button class="panel-head-btn has-tooltip has-tooltip--bottom kanban-nudge-dispatch-btn" id="btnKanbanPreviewDispatcher" onclick="nudgeKanbanDispatcher()" data-tooltip="Preview dispatcher (dry-run)" data-i18n-title="kanban_nudge_dispatcher" aria-label="Preview dispatcher (dry-run)">▶</button>
+
           <button class="panel-head-btn has-tooltip has-tooltip--bottom kanban-run-dispatch-btn" id="btnKanbanRunDispatcher" onclick="runKanbanDispatcher()" data-tooltip="Run dispatcher — claim Ready tasks" data-i18n-title="kanban_run_dispatcher" aria-label="Run dispatcher"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg></button>
         </div>
       </div>
@@ -1513,6 +1515,50 @@
     </div>
   </div>
 </div>
+<!-- Kanban: Capability workflow MVP. Dry-run previews only; Create writes cards through /api/kanban. -->
+<div class="kanban-modal-overlay" id="kanbanCapabilityModal" hidden onclick="if(event.target===this)closeKanbanCapabilityWorkflow()">
+  <div class="kanban-modal kanban-capability-modal" role="dialog" aria-modal="true" aria-labelledby="kanbanCapabilityTitle">
+    <h3 id="kanbanCapabilityTitle">Capability workflow</h3>
+    <div class="kanban-modal-hint">Build a Task Contract, preview the team graph, then create Kanban cards. Dry-run never restarts WebUI or mutates live config.</div>
+    <div class="kanban-modal-row">
+      <label for="kanbanCapabilityGoal">Goal</label>
+      <input type="text" id="kanbanCapabilityGoal" maxlength="500" autocomplete="off" placeholder="What should the capability team deliver?" required>
+    </div>
+    <div class="kanban-modal-row">
+      <label for="kanbanCapabilityScope">Scope</label>
+      <textarea id="kanbanCapabilityScope" rows="3" placeholder="Files, repo area, target behaviour"></textarea>
+    </div>
+    <div class="kanban-modal-row">
+      <label for="kanbanCapabilityConstraints">Constraints</label>
+      <textarea id="kanbanCapabilityConstraints" rows="3" placeholder="Safety gates, no-restart rules, verification commands"></textarea>
+    </div>
+    <div class="kanban-modal-row-inline">
+      <div class="kanban-modal-row">
+        <label for="kanbanCapabilityProfile">Capability Profile</label>
+        <select id="kanbanCapabilityProfile"></select>
+      </div>
+      <div class="kanban-modal-row">
+        <label for="kanbanCapabilityMode">Mode</label>
+        <select id="kanbanCapabilityMode">
+          <option value="canary">Canary</option>
+          <option value="live">Live</option>
+        </select>
+      </div>
+    </div>
+    <div class="kanban-modal-row">
+      <label for="kanbanCapabilityGates">Approval Gates</label>
+      <input type="text" id="kanbanCapabilityGates" value="review-required" placeholder="Comma-separated gates, e.g. security, canary, human approval">
+      <div class="kanban-modal-hint">Live mode is represented as a pending gate; this UI does not mutate live Hermes config.</div>
+    </div>
+    <div class="kanban-capability-plan" id="kanbanCapabilityPlan" aria-live="polite"></div>
+    <div class="kanban-modal-error" id="kanbanCapabilityError" aria-live="polite"></div>
+    <div class="kanban-modal-actions">
+      <button type="button" class="btn secondary" onclick="closeKanbanCapabilityWorkflow()">Cancel</button>
+      <button type="button" class="btn secondary" id="kanbanCapabilityPreview" onclick="previewKanbanCapabilityWorkflow()">Dry-run preview</button>
+      <button type="button" class="btn primary" id="kanbanCapabilityCreate" onclick="createKanbanCapabilityCards()" disabled>Create cards</button>
+    </div>
+  </div>
+</div>
 <!-- Kanban: create-task modal — same overlay pattern as the create-board modal above. -->
 <div class="kanban-modal-overlay" id="kanbanTaskModal" hidden onclick="if(event.target===this)closeKanbanTaskModal()">
   <div class="kanban-modal" role="dialog" aria-modal="true" aria-labelledby="kanbanTaskModalTitle">
@@ -1559,5 +1605,6 @@
     </div>
   </div>
 </div>
+
 </body>
 </html>

@@ -14,6 +14,7 @@ Supported operations:
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, is_dataclass
 from urllib.parse import parse_qs, unquote
@@ -22,6 +23,9 @@ from api.helpers import bad, j
 
 BOARD_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "done"]
 _TASK_PREFIX = "/api/kanban/tasks/"
+_CAPABILITY_MARKER = "<!-- hermes-kanban-capability:"
+_CAPABILITY_MARKER_END = "-->"
+_CAPABILITY_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 def _kb():
@@ -93,10 +97,36 @@ def _obj_dict(value):
     return dict(getattr(value, "__dict__", {}))
 
 
+def _capability_from_body(body):
+    if not isinstance(body, str) or _CAPABILITY_MARKER not in body:
+        return None
+    start = body.rfind(_CAPABILITY_MARKER)
+    end = body.find(_CAPABILITY_MARKER_END, start)
+    if start < 0 or end < 0:
+        return None
+    raw = body[start + len(_CAPABILITY_MARKER):end].strip()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _strip_capability_marker(body):
+    if not isinstance(body, str) or _CAPABILITY_MARKER not in body:
+        return body
+    start = body.rfind(_CAPABILITY_MARKER)
+    return body[:start].rstrip()
+
+
 def _task_dict(task):
     data = _obj_dict(task)
     if not data:
         return data
+    capability = data.get("capability") or _capability_from_body(data.get("body"))
+    if capability:
+        data["capability"] = capability
+        data["body"] = _strip_capability_marker(data.get("body"))
     try:
         age = _kb().task_age(task)
     except Exception:
@@ -309,8 +339,8 @@ def _create_task_payload(body: dict, *, board=None):
         raise ValueError("title is required")
     try:
         priority = int(body.get("priority") or 0)
-    except (TypeError, ValueError):
-        raise ValueError("priority must be an integer")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("priority must be an integer") from exc
     kb = _kb()
     requested_status = body.get("status")
     with _conn(board=board) as conn:
@@ -335,6 +365,190 @@ def _create_task_payload(body: dict, *, board=None):
         return {"task": _task_dict(kb.get_task(conn, task_id)), "read_only": False}
 
 
+def _clean_capability_text(value, default="", *, max_len=2000):
+    text = str(value if value is not None else default).strip()
+    if len(text) > max_len:
+        raise ValueError(f"capability field exceeds {max_len} characters")
+    return text
+
+
+def _clean_capability_profile(value):
+    profile = _clean_capability_text(value, "default", max_len=64) or "default"
+    if profile in {".", ".."} or not _CAPABILITY_PROFILE_RE.fullmatch(profile):
+        raise ValueError("capability_profile must be a profile slug")
+    return profile
+
+
+def _capability_gates(value):
+    if isinstance(value, (list, tuple)):
+        raw = value
+    elif isinstance(value, str):
+        raw = value.replace("\n", ",").split(",")
+    elif value:
+        raw = [value]
+    else:
+        raw = []
+    gates = []
+    seen = set()
+    for item in raw:
+        gate = _clean_capability_text(item, max_len=80)
+        key = gate.casefold()
+        if gate and key not in seen:
+            seen.add(key)
+            gates.append(gate)
+    return gates or ["review-required"]
+
+
+def _capability_contract(body: dict):
+    body = body if isinstance(body, dict) else {}
+    goal = _clean_capability_text(body.get("goal") or body.get("title"), max_len=500)
+    if not goal:
+        raise ValueError("goal is required")
+    profile = _clean_capability_profile(
+        body.get("capability_profile") or body.get("profile") or body.get("assignee")
+    )
+    mode = _clean_capability_text(body.get("mode"), "canary", max_len=20).lower() or "canary"
+    if mode not in {"canary", "live"}:
+        raise ValueError("mode must be canary or live")
+    return {
+        "goal": goal,
+        "scope": _clean_capability_text(body.get("scope"), max_len=2000),
+        "constraints": _clean_capability_text(body.get("constraints"), max_len=2000),
+        "capability_profile": profile,
+        "mode": mode,
+        "approval_gates": _capability_gates(body.get("approval_gates") or body.get("gates")),
+        "tenant": _clean_capability_text(body.get("tenant"), max_len=80),
+    }
+
+
+def _capability_plan_for_contract(contract: dict):
+    goal = contract["goal"]
+    profile = contract["capability_profile"]
+    cards = [
+        {
+            "id": "execution",
+            "title": f"Execute: {goal}",
+            "profile": profile,
+            "assignee": profile,
+            "category": "execution",
+            "gate_state": "pending",
+            "evidence": ["task contract captured", "implementation artifact required"],
+            "depends_on": [],
+        },
+        {
+            "id": "verification",
+            "title": f"Verify: {goal}",
+            "profile": profile,
+            "assignee": profile,
+            "category": "verification",
+            "gate_state": "pending",
+            "evidence": ["tests or smoke evidence required", "review handoff required"],
+            "depends_on": ["execution"],
+        },
+    ]
+    gates = [{"name": gate, "state": "pending"} for gate in contract["approval_gates"]]
+    graph = {
+        "nodes": [
+            {"id": card["id"], "title": card["title"], "profile": card["profile"], "category": card["category"]}
+            for card in cards
+        ],
+        "edges": [
+            {"from": dep, "to": card["id"]}
+            for card in cards
+            for dep in card.get("depends_on", [])
+        ],
+    }
+    enriched = []
+    for card in cards:
+        capability = {
+            "profile": card["profile"],
+            "category": card["category"],
+            "mode": contract["mode"],
+            "gate_state": card["gate_state"],
+            "approval_gates": list(contract["approval_gates"]),
+            "evidence": list(card["evidence"]),
+        }
+        enriched.append({**card, "capability": capability})
+    return {"cards": enriched, "gates": gates, "graph": graph}
+
+
+def _capability_plan_payload(body: dict, *, board=None):
+    contract = _capability_contract(body)
+    plan = _capability_plan_for_contract(contract)
+    return {
+        "dry_run": True,
+        "contract": contract,
+        "cards": plan["cards"],
+        "gates": plan["gates"],
+        "graph": plan["graph"],
+        "read_only": False,
+    }
+
+
+def _capability_card_body(contract: dict, card: dict):
+    cap = card["capability"]
+    lines = [
+        "Task Contract",
+        f"Goal: {contract['goal']}",
+    ]
+    if contract.get("scope"):
+        lines.append(f"Scope: {contract['scope']}")
+    if contract.get("constraints"):
+        lines.extend(["Constraints:", contract["constraints"]])
+    lines.extend([
+        "",
+        "Capability workflow",
+        f"- profile: {cap['profile']}",
+        f"- category: {cap['category']}",
+        f"- mode: {cap['mode']}",
+        f"- gate state: {cap['gate_state']}",
+        "- evidence: " + "; ".join(cap.get("evidence") or []),
+    ])
+    marker = json.dumps(cap, sort_keys=True, separators=(",", ":")).replace("-->", "--\\u003e")
+    return "\n".join(lines).rstrip() + f"\n\n{_CAPABILITY_MARKER}{marker} {_CAPABILITY_MARKER_END}"
+
+
+def _capability_create_payload(body: dict, *, board=None):
+    contract = _capability_contract(body)
+    plan = _capability_plan_for_contract(contract)
+    kb = _kb()
+    created = []
+    id_by_plan_id = {}
+    try:
+        priority = int((body or {}).get("priority") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("priority must be an integer") from exc
+    with _conn(board=board) as conn:
+        for card in plan["cards"]:
+            parents = [id_by_plan_id[p] for p in card.get("depends_on", []) if p in id_by_plan_id]
+            task_id = kb.create_task(
+                conn,
+                title=card["title"],
+                body=_capability_card_body(contract, card),
+                assignee=card["assignee"],
+                created_by="webui-capability",
+                tenant=contract.get("tenant") or None,
+                priority=priority,
+                parents=parents,
+                triage=False,
+                workspace_kind="scratch",
+                workspace_path=None,
+                idempotency_key=None,
+                max_runtime_seconds=None,
+                skills=None,
+            )
+            id_by_plan_id[card["id"]] = task_id
+            created.append(_task_dict(kb.get_task(conn, task_id)))
+    return {
+        "dry_run": False,
+        "contract": contract,
+        "created_tasks": created,
+        "gates": plan["gates"],
+        "graph": plan["graph"],
+        "read_only": False,
+    }
+
+
 def _patch_task(conn, task_id: str, body: dict):
     kb = _kb()
     task = kb.get_task(conn, task_id)
@@ -354,8 +568,8 @@ def _patch_task(conn, task_id: str, body: dict):
     if "priority" in body:
         try:
             updates["priority"] = int(body.get("priority") or 0)
-        except (TypeError, ValueError):
-            raise ValueError("priority must be an integer")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("priority must be an integer") from exc
 
     for field, value in updates.items():
         if hasattr(task, field):
@@ -1159,6 +1373,10 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
         board = board_q if board_q is not None else board_b
         if path == "/api/kanban/dispatch":
             return j(handler, _dispatch_payload(parsed)) or True
+        if path == "/api/kanban/capability/plan":
+            return j(handler, _capability_plan_payload(body, board=board)) or True
+        if path == "/api/kanban/capability/cards":
+            return j(handler, _capability_create_payload(body, board=board)) or True
         if path == "/api/kanban/tasks/bulk":
             return j(handler, _bulk_tasks_payload(body, board=board)) or True
         if path == "/api/kanban/tasks":
