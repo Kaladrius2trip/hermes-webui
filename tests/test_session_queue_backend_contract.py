@@ -192,11 +192,12 @@ def test_frontend_queue_reconcile_preserves_unconfirmed_local_items():
     )[0]
     assert "api('/api/session/queue'" in resync_fn
     assert "r&&r.ignored&&r.consumed" in resync_fn
-    shift_fn = src.split("function shiftQueuedSessionMessage", 1)[1].split(
-        "function getQueuedSessionCount", 1
+    ack_fn = src.split("async function ackQueuedSessionMessage", 1)[1].split(
+        "function shiftQueuedSessionMessage", 1
     )[0]
-    assert "_queueClearPending(sid,next)" in shift_fn
-    assert "r&&r.not_found" in shift_fn
+    assert "_queueClearPending(sid,next)" in ack_fn
+    assert "_queueMarkConsumed(sid,next)" in ack_fn
+    assert "await _queueAckBackend(sid,next)" in ack_fn
 
 def test_frontend_queue_helpers_call_backend_queue_api():
     src = open("static/ui.js", encoding="utf-8").read()
@@ -206,19 +207,20 @@ def test_frontend_queue_helpers_call_backend_queue_api():
     assert "/api/session/queue?session_id=" in src
     assert "api('/api/session/queue'" in src
     assert "api('/api/session/queue/replace'" in src
+    assert "function _queueAckBackend" in src
     assert "api('/api/session/queue/shift'" in src
-
     queue_fn = src.split("function queueSessionMessage", 1)[1].split(
-        "function shiftQueuedSessionMessage", 1
+        "function peekQueuedSessionMessage", 1
     )[0]
     assert "api('/api/session/queue'" in queue_fn
     assert "sessionStorage.setItem('hermes-queue-'+sid" in queue_fn
-
-    shift_fn = src.split("function shiftQueuedSessionMessage", 1)[1].split(
-        "function getQueuedSessionCount", 1
+    assert "delete _queueRenderKeys[sid]" in queue_fn
+    ack_fn = src.split("async function ackQueuedSessionMessage", 1)[1].split(
+        "function shiftQueuedSessionMessage", 1
     )[0]
-    assert "api('/api/session/queue/shift'" in shift_fn
-    assert "_setSessionQueue(sid,q)" in shift_fn
+    assert "_queueMarkConsumed(sid,next)" in ack_fn
+    assert "await _queueAckBackend(sid,next)" in ack_fn
+    assert "_setSessionQueue(sid,removed?kept:current)" in ack_fn
 
     assert "await reconcileSessionQueue(sid" in sessions_src
 

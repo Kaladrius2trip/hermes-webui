@@ -746,9 +746,11 @@ async function send(){
       stopApprovalPolling();
       stopClarifyPolling();
       // Keep the user's attempted turn by queueing it for after the current run.
-      const _retryModelState=_chatPayloadModelState();
-      queueSessionMessage(activeSid,{text:msgText,files:[],model:_retryModelState.model,model_provider:_retryModelState.model_provider,profile:S.activeProfile||'default'});
-      updateQueueBadge(activeSid);
+      if(!(typeof _queueDrainContext!=='undefined'&&_queueDrainContext&&_queueDrainContext[activeSid])){
+        const _retryModelState=_chatPayloadModelState();
+        queueSessionMessage(activeSid,{text:msgText,files:[],model:_retryModelState.model,model_provider:_retryModelState.model_provider,profile:S.activeProfile||'default'});
+        updateQueueBadge(activeSid);
+      }
       showToast('Current session is still running. Reconnected and queued your message.',2600);
       try{
         await loadSession(activeSid);
@@ -775,6 +777,7 @@ async function send(){
 
   // Open SSE stream and render tokens live
   attachLiveStream(activeSid, streamId, uploadedNames);
+  return true;
 
   }finally{ _sendInProgress=false; _sendInProgressSid=null; }
 }

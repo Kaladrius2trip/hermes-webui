@@ -15,6 +15,11 @@ const INFLIGHT={};  // keyed by session_id while request in-flight
 const SESSION_QUEUES={};  // keyed by session_id for queued follow-up turns
 const _queueMutationSeq={};  // sid -> monotonic generation for async backend reconciliation
 const _queuePendingIds={};  // sid -> optimistic ids not yet confirmed durable by backend
+const _queueDrainInFlight={};  // sid -> queue item id currently scheduled/sending
+const _queueDrainContext={};  // sid -> active drain context observed by send() error paths
+const _queueConsumedIds={};  // sid -> queue item ids already accepted by send(), awaiting/after backend ack
+const _queueConsumedAckInFlight={};
+const QUEUE_CONSUMED_TOMBSTONE_MS=10*60*1000;
 const MAX_UPLOAD_BYTES=(window.__HERMES_CONFIG__&&window.__HERMES_CONFIG__.maxUploadBytes)||20*1024*1024;
 const MAX_UPLOAD_MB=Math.round(MAX_UPLOAD_BYTES/1024/1024);
 // Tracks which session's queue to drain in setBusy(false).
@@ -192,6 +197,37 @@ function _queueClearPending(sid,itemOrId){
   delete _queuePendingIds[sid][id];
   if(!Object.keys(_queuePendingIds[sid]).length) delete _queuePendingIds[sid];
 }
+function _queuePruneConsumed(sid){
+  const bucket=_queueConsumedIds[sid];
+  if(!bucket) return;
+  const cutoff=Date.now()-QUEUE_CONSUMED_TOMBSTONE_MS;
+  Object.keys(bucket).forEach(id=>{if(bucket[id]<cutoff) delete bucket[id];});
+  if(!Object.keys(bucket).length) delete _queueConsumedIds[sid];
+}
+function _queueMarkConsumed(sid,itemOrId){
+  const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
+  if(!sid||!id) return;
+  _queuePruneConsumed(sid);
+  if(!_queueConsumedIds[sid]) _queueConsumedIds[sid]={};
+  _queueConsumedIds[sid][id]=Date.now();
+}
+function _queueIsConsumed(sid,itemOrId){
+  const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
+  if(!sid||!id) return false;
+  _queuePruneConsumed(sid);
+  return !!(_queueConsumedIds[sid]&&_queueConsumedIds[sid][id]);
+}
+function _queueAckBackend(sid,itemOrId){
+  const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
+  if(!sid||!id||typeof api!=='function') return Promise.resolve(false);
+  const key=sid+':'+id;
+  if(_queueConsumedAckInFlight[key]) return _queueConsumedAckInFlight[key];
+  _queueConsumedAckInFlight[key]=api('/api/session/queue/shift',{method:'POST',body:JSON.stringify({session_id:sid,item_id:id}),timeoutMs:10000,timeoutToast:false})
+    .then(()=>true)
+    .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Queued message sent; retrying queue acknowledgement',4000,'warning');return false;})
+    .finally(()=>{delete _queueConsumedAckInFlight[key];});
+  return _queueConsumedAckInFlight[key];
+}
 function _queueResyncMissingLocalItem(sid,item){
   const id=_queueItemId(item);
   if(!sid||!id||typeof api!=='function') return;
@@ -210,10 +246,17 @@ function _queueResyncMissingLocalItem(sid,item){
         updateQueueBadge(sid);
       }
     })
-    .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to re-sync queued message',4000,'error');});
+    .catch(e=>{_queueClearPending(sid,id);if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to re-sync queued message',4000,'error');});
 }
 function _mergeBackendQueueWithPendingLocal(sid,backendQueue){
-  const merged=Array.isArray(backendQueue)?backendQueue.filter(Boolean).slice():[];
+  const merged=[];
+  (Array.isArray(backendQueue)?backendQueue.filter(Boolean):[]).forEach(item=>{
+    if(_queueIsConsumed(sid,item)){
+      void _queueAckBackend(sid,item);
+      return;
+    }
+    merged.push(item);
+  });
   const seen={};
   merged.forEach(item=>{const id=_queueItemId(item); if(id) seen[id]=true;});
   const pending=_queuePendingIds[sid]||{};
@@ -277,32 +320,51 @@ function queueSessionMessage(sid, payload){
   _queueMarkPending(sid,entry);
   q.push(entry);
   try{sessionStorage.setItem('hermes-queue-'+sid, JSON.stringify(q));}catch(_){}
+  delete _queueRenderKeys[sid];
   if(typeof api==='function'){
     void api('/api/session/queue',{method:'POST',body:JSON.stringify({session_id:sid,item:entry}),timeoutMs:10000,timeoutToast:false})
       .then(r=>{
         _queueClearPending(sid,entry);
         if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,r.queue);updateQueueBadge(sid);}
       })
-      .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued message',4000,'error');});
+      .catch(e=>{_queueClearPending(sid,entry);if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued message',4000,'error');});
   }
   return q.length;
 }
-function shiftQueuedSessionMessage(sid){
+function peekQueuedSessionMessage(sid){
+  const q=_getSessionQueue(sid,false);
+  return q.length?q[0]:null;
+}
+async function ackQueuedSessionMessage(sid,itemOrId){
   const q=_getSessionQueue(sid,false);
   if(!q.length) return null;
-  const next=q.shift();
+  const wantedId=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
+  let idx=wantedId?q.findIndex(item=>_queueItemId(item)===wantedId):0;
+  if(idx<0) return null;
+  const next=q[idx];
+  const nextId=_queueItemId(next);
+  _queueMarkConsumed(sid,next);
   _queueClearPending(sid,next);
-  const _seq=_queueNextSeq(sid);
-  _setSessionQueue(sid,q);
-  if(typeof api==='function'){
-    void api('/api/session/queue/shift',{method:'POST',body:JSON.stringify({session_id:sid,item_id:next&&(next.id||next._queue_id)||''}),timeoutMs:10000,timeoutToast:false})
-      .then(r=>{
-        if((_queueMutationSeq[sid]||0)!==_seq) return;
-        if(r&&r.not_found){updateQueueBadge(sid);return;}
-        if(r&&Array.isArray(r.queue)){_setSessionQueue(sid,r.queue);updateQueueBadge(sid);}
-      })
-      .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to update queued messages',4000,'error');});
+  const current=_getSessionQueue(sid,false);
+  let removed=false;
+  const kept=[];
+  for(const item of current){
+    const id=_queueItemId(item);
+    if(!removed&&((nextId&&id===nextId)||(!nextId&&item===next))){removed=true;continue;}
+    kept.push(item);
   }
+  if(!removed&&idx<current.length){
+    current.forEach((item,i)=>{if(i!==idx) kept.push(item);});
+    removed=true;
+  }
+  _setSessionQueue(sid,removed?kept:current);
+  updateQueueBadge(sid);
+  await _queueAckBackend(sid,next);
+  return next;
+}
+function shiftQueuedSessionMessage(sid){
+  const next=peekQueuedSessionMessage(sid);
+  if(next) void ackQueuedSessionMessage(sid,next);
   return next;
 }
 function getQueuedSessionCount(sid){
@@ -4336,6 +4398,48 @@ function renderChatTodoSurface(messages){
   host.hidden=false;
 }
 
+async function _drainQueuedSessionMessage(sid,next){
+  if(!sid||!next) return false;
+  if(S.session&&S.session.session_id!==sid) return false;
+  const current=peekQueuedSessionMessage(sid);
+  const nextId=_queueItemId(next);
+  if(!current) return false;
+  if(nextId&&_queueItemId(current)!==nextId) return false;
+  if(next.profile&&S.activeProfile&&next.profile!==S.activeProfile){
+    if(typeof showToast==='function') showToast('Queued message belongs to another profile; switch back before sending it.',3500,'warning');
+    return false;
+  }
+  $('msg').value=next.text||'';
+  S.pendingFiles=Array.isArray(next.files)?[...next.files]:[];
+  // Restore model from queued item (sent in /api/chat/start payload).
+  // Note: profile is NOT restored — full profile switch requires server interaction.
+  if(next.model&&S.session&&next.model!==S.session.model){
+    S.session.model=next.model;
+  }
+  if(next.model_provider&&S.session) S.session.model_provider=next.model_provider;
+  if(next.model&&S.session){
+    if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'),S.session.model_provider||null);
+    if(typeof syncModelChip==='function') syncModelChip();
+  }
+  autoResize();
+  renderTray();
+  const prevCtx=_queueDrainContext[sid];
+  _queueDrainContext[sid]={sid:sid,item_id:nextId||''};
+  try{
+    const accepted=typeof send==='function'?await send():false;
+    if(accepted===true){
+      await ackQueuedSessionMessage(sid,next);
+      return true;
+    }
+    return false;
+  }catch(e){
+    if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to send queued message; it remains in queue',4000,'error');
+    return false;
+  }finally{
+    if(prevCtx) _queueDrainContext[sid]=prevCtx;
+    else delete _queueDrainContext[sid];
+  }
+}
 function setBusy(v){
   S.busy=v;
   updateSendBtn();
@@ -4346,37 +4450,20 @@ function setBusy(v){
     const sid=_queueDrainSid||(S.session&&S.session.session_id);
     _queueDrainSid=null;
     updateQueueBadge(sid);
-    // Drain one queued message for the finished session after UI settles
+    // Drain one queued message for the finished session after UI settles.
+    // Never remove it before send() confirms /api/chat/start accepted it.
     const _isViewedSid=!S.session||sid===S.session.session_id;
-    const next=sid&&_isViewedSid?shiftQueuedSessionMessage(sid):null;
+    const next=sid&&_isViewedSid&&!_queueDrainInFlight[sid]?peekQueuedSessionMessage(sid):null;
     if(next){
+      const token=_queueItemId(next)||('idx_'+Date.now());
+      _queueDrainInFlight[sid]=token;
       updateQueueBadge(sid);
-      setTimeout(()=>{
-        // Guard: if the user switched away from the drain session during
-        // the 120ms settle window, the queued message must NOT go to the
-        // wrong chat.  Put it back into the original session's queue and
-        // skip sending — it will drain when the user returns to that session
-        // or when its next stream completes while it is the active view.
-        if(S.session&&S.session.session_id!==sid){
-          queueSessionMessage(sid,next);
+      setTimeout(async()=>{
+        try{await _drainQueuedSessionMessage(sid,next);}
+        finally{
+          if(_queueDrainInFlight[sid]===token) delete _queueDrainInFlight[sid];
           updateQueueBadge(sid);
-          return;
         }
-        $('msg').value=next.text||'';
-        S.pendingFiles=Array.isArray(next.files)?[...next.files]:[];
-        // Restore model from queued item (sent in /api/chat/start payload)
-        // Note: profile is NOT restored — full profile switch requires server interaction
-        if(next.model&&S.session&&next.model!==S.session.model){
-          S.session.model=next.model;
-        }
-        if(next.model_provider&&S.session) S.session.model_provider=next.model_provider;
-        if(next.model&&S.session){
-          if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'),S.session.model_provider||null);
-          if(typeof syncModelChip==='function') syncModelChip();
-        }
-        autoResize();
-        renderTray();
-        send();
       },120);
     }
   }
