@@ -4,18 +4,30 @@ from pathlib import Path
 import api.config as config
 
 
+def _reject_workspace_candidate(monkeypatch, candidate: Path) -> None:
+    original_ensure = config._ensure_workspace_dir
+    resolved_candidate = candidate.resolve()
+
+    def wrapped(path: Path) -> bool:
+        if path.expanduser().resolve() == resolved_candidate:
+            return False
+        return original_ensure(path)
+
+    monkeypatch.setattr(config, "_ensure_workspace_dir", wrapped)
+
+
 def test_resolve_default_workspace_falls_back_to_existing_home_work(monkeypatch, tmp_path):
     preferred = tmp_path / "work"
     preferred.mkdir()
     state_dir = tmp_path / "state"
+    bad_candidate = tmp_path / "not-usable"
 
     monkeypatch.setattr(config, "HOME", tmp_path)
     monkeypatch.setattr(config, "STATE_DIR", state_dir)
     monkeypatch.delenv("HERMES_WEBUI_DEFAULT_WORKSPACE", raising=False)
-    blocked = tmp_path / "blocked"
-    blocked.write_text("not a directory", encoding="utf-8")
+    _reject_workspace_candidate(monkeypatch, bad_candidate)
 
-    resolved = config.resolve_default_workspace(blocked / "child")
+    resolved = config.resolve_default_workspace(str(bad_candidate))
 
     assert resolved == preferred.resolve()
 
@@ -26,16 +38,16 @@ def test_save_settings_rewrites_bad_default_workspace_to_fallback(monkeypatch, t
     preferred.mkdir()
     state_dir = tmp_path / "state"
     settings_file = tmp_path / "settings.json"
+    bad_candidate = tmp_path / "not-usable"
 
     monkeypatch.setattr(config, "HOME", tmp_path)
     monkeypatch.setattr(config, "STATE_DIR", state_dir)
     monkeypatch.setattr(config, "SETTINGS_FILE", settings_file)
     monkeypatch.setattr(config, "DEFAULT_WORKSPACE", preferred)
     monkeypatch.delenv("HERMES_WEBUI_DEFAULT_WORKSPACE", raising=False)
-    blocked = tmp_path / "blocked"
-    blocked.write_text("not a directory", encoding="utf-8")
+    _reject_workspace_candidate(monkeypatch, bad_candidate)
 
-    saved = config.save_settings({"default_workspace": str(blocked / "child")})
+    saved = config.save_settings({"default_workspace": str(bad_candidate)})
     on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
 
     assert saved["default_workspace"] == str(preferred.resolve())
@@ -55,15 +67,14 @@ def test_resolve_default_workspace_creates_home_workspace_when_missing(monkeypat
 
 
 def test_resolve_default_workspace_raises_when_all_candidates_fail(monkeypatch, tmp_path):
-    """RuntimeError is raised when every candidate cannot be created."""
+    """RuntimeError is raised when every candidate is unwritable."""
     import pytest
-    home_file = tmp_path / "home-file"
-    state_file = tmp_path / "state-file"
-    home_file.write_text("not a directory", encoding="utf-8")
-    state_file.write_text("not a directory", encoding="utf-8")
-    monkeypatch.setattr(config, "HOME", home_file)
-    monkeypatch.setattr(config, "STATE_DIR", state_file)
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(config, "HOME", tmp_path)
+    monkeypatch.setattr(config, "STATE_DIR", state_dir)
     monkeypatch.delenv("HERMES_WEBUI_DEFAULT_WORKSPACE", raising=False)
+    monkeypatch.setattr(config, "_ensure_workspace_dir", lambda path: False)
+
     with pytest.raises(RuntimeError, match="Could not create or access"):
         config.resolve_default_workspace(None)
 
@@ -96,9 +107,21 @@ def test_env_var_workspace_takes_priority_over_passed_raw(monkeypatch, tmp_path)
 
 def test_ensure_workspace_dir_returns_false_for_unwritable_path(monkeypatch, tmp_path):
     """_ensure_workspace_dir returns False for a path that can't be created."""
+    def fail_mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        raise PermissionError("simulated create failure")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    result = config._ensure_workspace_dir(tmp_path / "child")
+    assert result is False
+
+
+def test_ensure_workspace_dir_returns_false_when_parent_is_file(tmp_path):
     parent = tmp_path / "file_parent"
     parent.write_text("not a directory", encoding="utf-8")
+
     result = config._ensure_workspace_dir(parent / "child")
+
     assert result is False
 
 

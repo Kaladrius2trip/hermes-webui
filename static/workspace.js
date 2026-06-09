@@ -410,12 +410,13 @@ async function openArtifactPath(path, opts={}){
 
 async function loadDir(path, opts={}){
   const preservePreview=!!(opts&&opts.preservePreview);
+  const refreshExpanded=!!(opts&&opts.refreshExpanded);
   if(!S.session)return;
   const sessionId=S.session.session_id;
   try{
-    if(!path||path==='.'){
+    if(!path||path==='.'||refreshExpanded){
       S._dirCache={};
-      _restoreExpandedDirs();  // restore per-workspace expanded state on root load
+      _restoreExpandedDirs();  // restore per-workspace expanded state after root and refresh resets
       _restoreWorkspacePanelActiveTab();  // restore per-workspace active tab before rendering tabs (#2361)
       switchWorkspacePanelTab(_workspacePanelActiveTab);  // apply restored tab to the DOM
     }
@@ -427,7 +428,7 @@ async function loadDir(path, opts={}){
     if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
     // Pre-fetch contents of restored expanded dirs so they render without a second click
     // (parallelized — avoids serial waterfall when multiple dirs are expanded)
-    if(!path||path==='.'){
+    if(!path||path==='.'||refreshExpanded){
       const expanded=S._expandedDirs||new Set();
       const pending=[...expanded].filter(dirPath=>!S._dirCache[dirPath]);
       if(pending.length){
@@ -453,6 +454,12 @@ async function loadDir(path, opts={}){
     // Fetch git info for workspace root (non-blocking)
     if(!path||path==='.') _refreshGitBadge();
   }catch(e){console.warn('loadDir',e);}
+}
+
+function refreshWorkspacePanel(){
+  if(!S.session)return;
+  const targetDir = S.currentDir || '.';
+  loadDir(targetDir,{refreshExpanded:true});
 }
 
 async function _refreshGitBadge(){
