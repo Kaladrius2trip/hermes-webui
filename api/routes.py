@@ -7571,6 +7571,8 @@ def handle_post(handler, parsed) -> bool:
             s = _ensure_full_session_before_mutation(sid, s)
         except KeyError:
             return bad(handler, "Session not found", 404)
+        if getattr(s, "read_only", False) or getattr(s, "is_imported", False):
+            return bad(handler, "Read-only imported sessions cannot be modified", 403)
         with _get_session_agent_lock(sid):
             s.reasoning_effort = effort
             s.save()

@@ -388,10 +388,22 @@ async function _workspacePathExists(path){
   return (data.entries||[]).some(entry=>entry&&((entry.path===rel)||entry.name===name));
 }
 
+// Mutation tools frequently record absolute file paths. Strip the session
+// workspace prefix so /api/list receives a workspace-relative path (upstream
+// behavior); absolute paths OUTSIDE the workspace stay absolute and are then
+// rejected by _workspacePreviewRelPath's validation.
+function _stripWorkspacePrefix(path){
+  const p=String(path||'').replace(/\\/g,'/').trim();
+  const ws=String((S.session&&S.session.workspace)||'').replace(/\\/g,'/').replace(/\/+$/,'').trim();
+  if(!ws||!p) return p;
+  if(p.startsWith(ws+'/')) return p.slice(ws.length+1);
+  return p;
+}
+
 async function openArtifactPath(path, opts={}){
   if(!path) return;
   switchWorkspacePanelTab('files');
-  const rel = _workspacePreviewRelPath(path, opts);
+  const rel = _workspacePreviewRelPath(_stripWorkspacePrefix(path), opts);
   if(!rel){
     setStatus(t('file_open_failed'));
     return;

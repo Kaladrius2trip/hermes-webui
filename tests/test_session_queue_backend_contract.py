@@ -222,7 +222,9 @@ def test_frontend_queue_helpers_call_backend_queue_api():
     assert "await _queueAckBackend(sid,next)" in ack_fn
     assert "_setSessionQueue(sid,removed?kept:current)" in ack_fn
 
-    assert "await reconcileSessionQueue(sid" in sessions_src
+    # Reconcile is fire-and-forget: it must not block the first transcript
+    # paint (audit webui-state-persistence-008).
+    assert "void reconcileSessionQueue(sid" in sessions_src
 
 
 def test_session_queue_routes_reject_other_profile_sessions(tmp_path, monkeypatch):

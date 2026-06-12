@@ -110,7 +110,7 @@ def test_workspace_link_click_delegate_opens_workspace_preview():
     assert "decodeURIComponent" in UI_JS
     assert "openArtifactPath(rel,{fromWorkspaceLink:true})" in UI_JS
     assert "async function openArtifactPath(path, opts={})" in workspace_js
-    assert "_workspacePreviewRelPath(path, opts)" in workspace_js
+    assert "_workspacePreviewRelPath(_stripWorkspacePrefix(path), opts)" in workspace_js
     assert "/api/list?session_id=" in workspace_js
     assert "file_open_failed" in workspace_js
 

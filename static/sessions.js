@@ -1150,10 +1150,17 @@ async function loadSession(sid){
     // entry into the composer AND the live queue, causing double sends.
 
     // Queue storage is backend-canonical. Reconcile the optimistic browser
-    // cache from /api/session/queue before rendering queue badges/cards.
+    // cache from /api/session/queue in the background — never block the first
+    // transcript paint on a network round trip (up to 10s on a flaky link);
+    // the local optimistic cache renders immediately and the badge/chips
+    // refresh when the fetch lands.
     if(typeof reconcileSessionQueue==='function'){
-      await reconcileSessionQueue(sid);
-      if (_loadingSessionId !== sid) return;
+      void reconcileSessionQueue(sid).then(()=>{
+        if(_loadingSessionId!==null&&_loadingSessionId!==sid) return;
+        if(S.session&&S.session.session_id!==sid) return;
+        updateQueueBadge(sid);
+        if(typeof _renderQueueChips==='function') _renderQueueChips(sid);
+      }).catch(()=>{});
     }
 
     // Reconstruct tool calls from message metadata, or fall back to session-level summary.
@@ -2946,7 +2953,13 @@ async function _forceGenerateSessionTitle(session){
     if(typeof showToast==='function') showToast(t('session_title_regenerated', nextTitle),2400);
   }catch(err){
     if(err&&err.status===409){
-      const status=(err.body&&err.body.status)||(err.payload&&err.payload.status)||'';
+      // api() attaches the raw response TEXT as err.body — parse it to reach
+      // the JSON status field (otherwise the manual_title branch never fires).
+      let _parsedBody=err.body;
+      if(typeof _parsedBody==='string'){
+        try{_parsedBody=JSON.parse(_parsedBody);}catch(_){_parsedBody=null;}
+      }
+      const status=(_parsedBody&&_parsedBody.status)||(err.payload&&err.payload.status)||'';
       if(status==='manual_title'){
         if(typeof showToast==='function') showToast(t('session_title_regenerate_failed')+(err.message||''),3000,'error');
       }else if(typeof showToast==='function') showToast(t('session_title_already_generating'));

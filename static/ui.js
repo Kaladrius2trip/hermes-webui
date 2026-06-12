@@ -2283,7 +2283,6 @@ function _applyReasoningChip(eff,sessionOverride){
   }
   wrap.style.display='';
   if(mobileAction) mobileAction.style.display='';
-  if(typeof _applyReasoningOptions==='function') _applyReasoningOptions(supportedEfforts);
   const text=_formatReasoningEffortLabel(effort);
   label.textContent=text;
   if(mobileLabel) mobileLabel.textContent=text;
@@ -5807,9 +5806,19 @@ function _liveAssistantSegmentTextLength(seg){
 }
 
 function _liveAssistantSegmentsDuplicate(a,b){
+  // Distinct segment seqs are distinct segments — never duplicates.
+  const aSeq=a&&a.getAttribute?String(a.getAttribute('data-live-segment-seq')||''):'';
+  const bSeq=b&&b.getAttribute?String(b.getAttribute('data-live-segment-seq')||''):'';
+  if(aSeq&&bSeq&&aSeq!==bSeq) return false;
+  // MEDIA live rendering produces segments whose textContent is empty — they
+  // must not be treated as duplicates of arbitrary text neighbors.
+  const aMedia=!!(a&&a.querySelector&&a.querySelector('img,video,audio,canvas,iframe'));
+  const bMedia=!!(b&&b.querySelector&&b.querySelector('img,video,audio,canvas,iframe'));
+  if(aMedia!==bMedia) return false;
   const aText=_liveAssistantSegmentText(a);
   const bText=_liveAssistantSegmentText(b);
-  if(!aText||!bText) return true;
+  if(!aText&&!bText) return !aMedia; // two empty media segments: keep both
+  if(!aText||!bText) return false;
   return aText===bText||aText.startsWith(bText)||bText.startsWith(aText);
 }
 
