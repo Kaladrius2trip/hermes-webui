@@ -58,7 +58,7 @@ def test_regenerate_endpoint_persists_generated_title_without_reordering_sidebar
     endpoint_idx = ROUTES_PY.index('"/api/session/title/regenerate"')
     next_endpoint_idx = ROUTES_PY.index('"/api/personality/set"', endpoint_idx)
     block = ROUTES_PY[endpoint_idx:next_endpoint_idx]
-    assert "_handle_session_title_refresh(handler, body)" in block
+    assert "_handle_session_title_refresh(handler, body, force=True)" in block
     assert "generate_session_title_for_session" not in block
     assert "prefer_latest" not in block
 
@@ -66,7 +66,9 @@ def test_regenerate_endpoint_persists_generated_title_without_reordering_sidebar
     next_helper_idx = ROUTES_PY.index("def _reconcile_stale_stream_state_for_session_rows", handler_idx)
     handler_block = ROUTES_PY[handler_idx:next_helper_idx]
     assert "generate_session_title_for_session" in handler_block
-    assert "s.llm_title_generated = True" in handler_block
+    # mark_session_title_generated sets llm_title_generated AND clears
+    # manual_title (audit webui-state-persistence-007 / api-routes-003).
+    assert "mark_session_title_generated(s)" in handler_block
     assert "s.save(touch_updated_at=False)" in handler_block
     assert "_sync_session_title_to_insights(s)" in handler_block
     assert 'publish_session_list_changed("session_title_refresh", profile=getattr(s, "profile", None))' in handler_block

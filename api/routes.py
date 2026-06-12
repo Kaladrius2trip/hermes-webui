@@ -1543,12 +1543,18 @@ def _manual_title_blocks_generation(session) -> bool:
     return True
 
 
-def _handle_session_title_refresh(handler, body):
-    """Generate and persist a session title through the canonical title flow."""
+def _handle_session_title_refresh(handler, body, force=False):
+    """Generate and persist a session title through the canonical title flow.
+
+    ``force`` restores upstream's explicit-regenerate contract: the user asked
+    to regenerate, so a manually set title does not block generation and is
+    returned to LLM ownership (manual_title cleared) on success.
+    """
     try:
         require(body, "session_id")
     except ValueError as e:
         return bad(handler, str(e))
+    force = bool(force or body.get("force"))
     sid = str(body["session_id"])
     with _TITLE_REFRESH_INFLIGHT_LOCK:
         if sid in _TITLE_REFRESH_INFLIGHT:
@@ -1569,7 +1575,7 @@ def _handle_session_title_refresh(handler, body):
 
         if getattr(s, "read_only", False) or getattr(s, "is_imported", False):
             return bad(handler, "Read-only imported sessions cannot be renamed", 403)
-        if _manual_title_blocks_generation(s):
+        if not force and _manual_title_blocks_generation(s):
             return j(handler, {
                 "ok": False,
                 "status": "manual_title",
@@ -1600,7 +1606,7 @@ def _handle_session_title_refresh(handler, body):
                 return bad(handler, "Session not found", 404)
             if getattr(s, "read_only", False) or getattr(s, "is_imported", False):
                 return bad(handler, "Read-only imported sessions cannot be renamed", 403)
-            if _manual_title_blocks_generation(s):
+            if not force and _manual_title_blocks_generation(s):
                 return j(handler, {
                     "ok": False,
                     "status": "manual_title",
@@ -1608,8 +1614,12 @@ def _handle_session_title_refresh(handler, body):
                     "session": s.compact(),
                     "title": str(s.title or ""),
                 }, 409)
+            from api.session_ops import mark_session_title_generated
+
             s.title = str(next_title).strip()[:80] or "Untitled"
-            s.llm_title_generated = True
+            # Clears manual_title too — the title is LLM-owned again, so
+            # adaptive refresh is re-enabled (upstream regenerate contract).
+            mark_session_title_generated(s)
             s.save(touch_updated_at=False)
         _sync_session_title_to_insights(s)
         publish_reason = str(body.get("_publish_reason") or "session_title_refresh")
@@ -7485,7 +7495,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/session/title/regenerate":
         body["_publish_reason"] = "session_title_regenerate"
-        _handle_session_title_refresh(handler, body)
+        # Explicit regenerate keeps upstream's contract: it overrides a
+        # manually renamed title instead of 409ing with no escape hatch.
+        _handle_session_title_refresh(handler, body, force=True)
         return True
 
     if parsed.path == "/api/personality/set":

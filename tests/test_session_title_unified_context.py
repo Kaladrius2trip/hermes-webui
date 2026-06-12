@@ -80,7 +80,8 @@ def test_title_refresh_and_regenerate_routes_share_canonical_handler():
     regenerate_block = ROUTES_PY[regenerate_idx:next_endpoint_idx]
 
     assert "_handle_session_title_refresh(handler, body)" in refresh_block
-    assert "_handle_session_title_refresh(handler, body)" in regenerate_block
+    # Explicit regenerate forces past the manual-title guard (upstream contract).
+    assert "_handle_session_title_refresh(handler, body, force=True)" in regenerate_block
     assert "generate_session_title_for_session" not in regenerate_block
     assert "prefer_latest" not in regenerate_block
 
