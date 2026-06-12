@@ -2157,7 +2157,7 @@ function closeKanbanTaskDetail(){
 // ── Live worker-log follow (tail -f over incremental HTTP polls) ──────────
 // While the detail panel is open and the task is running, "Follow" polls
 // /api/kanban/tasks/{id}/log?offset=N every 2s and appends only new bytes.
-const _kanbanLogFollow = { taskId: null, offset: 0, timer: null, active: false };
+const _kanbanLogFollow = { taskId: null, offset: 0, timer: null, active: false, source: 'worker' };
 
 function _kanbanLogStopFollow(){
   if (_kanbanLogFollow.timer) { clearTimeout(_kanbanLogFollow.timer); _kanbanLogFollow.timer = null; }
@@ -2181,7 +2181,7 @@ async function _kanbanLogPoll(){
   const taskId = _kanbanLogFollow.taskId;
   if (!taskId || taskId !== _kanbanCurrentTaskId) { _kanbanLogStopFollow(); return; }
   try {
-    const chunk = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({offset: _kanbanLogFollow.offset}));
+    const chunk = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({offset: _kanbanLogFollow.offset, source: _kanbanLogFollow.source}));
     if (taskId !== _kanbanLogFollow.taskId) return;
     const pre = $('kanbanWorkerLogPre');
     if (pre && chunk && chunk.exists) {
@@ -3060,12 +3060,35 @@ function _kanbanWorkerLogHtml(task, log){
   const followBtn = active
     ? `<button id="kanbanWorkerLogFollowBtn" class="btn secondary" onclick="kanbanLogToggleFollow('${esc(task.id)}')">${esc(t('kanban_log_follow') || 'Follow')}</button>`
     : '';
+  const src = _kanbanLogFollow.source || 'worker';
+  const sourceBtn = `<button id="kanbanWorkerLogSourceBtn" class="btn secondary" title="stdout log vs full tmux terminal capture" onclick="kanbanLogSwitchSource('${esc(task.id)}')">${src === 'pane' ? 'terminal' : 'stdout'}</button>`;
   const status = _kanbanLogFormatSize(log.size_bytes) + (active ? ' · live' : '');
   return `<div class="kanban-worker-log-toolbar">
       <span id="kanbanWorkerLogStatus" class="kanban-meta">${esc(status)}</span>
-      ${followBtn}
+      <span>${sourceBtn}${followBtn}</span>
     </div>
     <pre id="kanbanWorkerLogPre" class="kanban-detail-pre kanban-worker-log-pre">${esc(log.content || '')}</pre>`;
+}
+
+// Switch between the stdout worker log and the tmux pipe-pane terminal
+// capture (present when the dispatcher runs with kanban.worker_tmux).
+async function kanbanLogSwitchSource(taskId){
+  const wasFollowing = !!_kanbanLogFollow.timer;
+  _kanbanLogStopFollow();
+  _kanbanLogFollow.source = _kanbanLogFollow.source === 'pane' ? 'worker' : 'pane';
+  const btn = $('kanbanWorkerLogSourceBtn');
+  if (btn) btn.textContent = _kanbanLogFollow.source === 'pane' ? 'terminal' : 'stdout';
+  try {
+    const log = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({tail: 65536, source: _kanbanLogFollow.source}));
+    const pre = $('kanbanWorkerLogPre');
+    if (pre) {
+      pre.textContent = log.exists ? (log.content || '') : ('(no ' + (_kanbanLogFollow.source === 'pane' ? 'terminal capture — enable kanban.worker_tmux' : 'stdout log') + ')');
+      pre.scrollTop = pre.scrollHeight;
+    }
+    _kanbanLogFollow.offset = Number(log.offset || log.size_bytes || 0);
+    _kanbanLogSetStatus(_kanbanLogFormatSize(log.size_bytes) + (log.active ? ' · live' : ''));
+    if (wasFollowing && log.active) kanbanLogToggleFollow(taskId);
+  } catch(_) {}
 }
 
 function _kanbanRenderTaskDetail(data){
@@ -3129,6 +3152,7 @@ async function loadKanbanTask(taskId){
     // Live tail: continue from where the initial tail read ended; auto-follow
     // running tasks so opening the card behaves like `tail -f`.
     _kanbanLogStopFollow();
+    _kanbanLogFollow.source = 'worker';
     const logInfo = data.log || {};
     _kanbanLogFollow.offset = Number(logInfo.offset || logInfo.size_bytes || 0);
     if (logInfo.active) kanbanLogToggleFollow(taskId);

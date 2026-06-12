@@ -832,6 +832,45 @@ def _assignees_payload(*, board=None):
     return {"assignees": assignees}
 
 
+def _file_chunk_payload(task_id: str, path, *, offset=None, tail=None, active=False):
+    """Offset/tail read over an arbitrary worker sidecar file (pane log)."""
+    try:
+        exists = bool(path and path.exists())
+        size = path.stat().st_size if exists else 0
+    except OSError:
+        exists, size = False, 0
+    if not exists:
+        return {"task_id": task_id, "path": str(path or ""), "exists": False,
+                "size_bytes": 0, "content": "", "offset": 0, "rotated": False,
+                "truncated": False, "active": active}
+    start = 0
+    rotated = False
+    if offset is not None:
+        start = max(0, int(offset))
+        if start > size:
+            start, rotated = 0, True
+    elif tail and size > tail:
+        start = size - tail
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            data = fh.read(65536 if offset is not None else (tail or size))
+            end = fh.tell()
+    except OSError:
+        data, end = b"", start
+    return {
+        "task_id": task_id,
+        "path": str(path),
+        "exists": True,
+        "size_bytes": size,
+        "content": data.decode("utf-8", errors="replace"),
+        "offset": end,
+        "rotated": rotated,
+        "truncated": end < size,
+        "active": active,
+    }
+
+
 def _task_log_payload(parsed, task_id: str):
     """Return the raw worker log content and on-disk metadata for a task's dispatcher run.
 
@@ -845,11 +884,18 @@ def _task_log_payload(parsed, task_id: str):
     kb = _kb()
     tail = _int_query(parsed, "tail", None, minimum=1, maximum=2_000_000)
     offset = _int_query(parsed, "offset", None, minimum=0, maximum=2_000_000_000)
+    source = _str_query(parsed, "source") or "worker"
     with _conn(board=board) as conn:
         task = kb.get_task(conn, task_id)
         if not task:
             return None
     active = str(getattr(task, "status", "") or "") == "running"
+    if source == "pane" and hasattr(kb, "worker_pane_log_path"):
+        # Full terminal stream captured by tmux pipe-pane (opt-in worker_tmux
+        # mode) — includes interactive Claude Code output that the stdout
+        # redirect in the regular worker log can't see.
+        pane_path = kb.worker_pane_log_path(task_id)
+        return _file_chunk_payload(task_id, pane_path, offset=offset, tail=tail, active=active)
     if not hasattr(kb, "read_worker_log"):
         return {"task_id": task_id, "path": "", "exists": False, "size_bytes": 0, "content": "", "truncated": False, "active": active}
     log_path = kb.worker_log_path(task_id) if hasattr(kb, "worker_log_path") else None
