@@ -109,7 +109,13 @@ def test_same_session_force_reload_keeps_loaded_transcript_width_hint():
     assert "return Math.max(_INITIAL_MSG_LIMIT,loadedRenderableCount,loadedMessageCount+appendedMessageCount);" in SESSIONS_JS
     assert "const reloadLimit = _messageReloadLimitForSession(sid);" in SESSIONS_JS
     assert "const reloadLimitParam = reloadLimit ? `&msg_limit=${reloadLimit}` : '';" in SESSIONS_JS
-    assert "finally {\n    _clearSameSessionForceReloadHint(sid);\n  }" in SESSIONS_JS
+    # The finally block also stops the lineage warm-progress poll, so check
+    # that SOME occurrence of the hint-clear inside _ensureMessagesLoaded is
+    # within a finally block (the first occurrence is the early-return path).
+    import re
+    body_start = SESSIONS_JS.index("async function _ensureMessagesLoaded")
+    body = SESSIONS_JS[body_start:body_start + 5000]
+    assert re.search(r"finally \{[\s\S]{0,300}?_clearSameSessionForceReloadHint\(sid\);", body)
 
     load_start = SESSIONS_JS.index("async function loadSession(sid)")
     load_end = SESSIONS_JS.index("// ── Handoff hint logic", load_start)
