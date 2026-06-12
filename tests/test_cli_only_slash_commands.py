@@ -181,7 +181,9 @@ def test_send_intercepts_cli_only_commands_before_agent_round_trip():
     assert "await getAgentCommandMetadata(_parsedCmd.name)" in intercept
     assert "if(_agentCmd&&_agentCmd.cli_only)" in intercept
     assert "cliOnlyCommandResponse(_parsedCmd.name,_agentCmd)" in intercept
-    assert "return;" in intercept
+    # Intercept paths report the composer as consumed (return true) so a
+    # queue drain acks the item instead of re-running it (audit core-1).
+    assert "return true;" in intercept
 
 
 def test_send_intercepts_reload_mcp_agent_command_before_agent_round_trip():

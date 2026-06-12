@@ -327,7 +327,7 @@ class TestSendBusyBranchDispatch:
         send_idx = MESSAGES_JS.find("async function send(")
         assert send_idx >= 0
         # Look in the first ~3000 chars of send() for the busy mode read
-        send_body = MESSAGES_JS[send_idx:send_idx + 3000]
+        send_body = MESSAGES_JS[send_idx:send_idx + 4000]
         assert "_busyInputMode" in send_body, (
             "send() must read window._busyInputMode in the S.busy branch"
         )
@@ -406,8 +406,9 @@ class TestSendBusyBranchDispatch:
         assert "_bc.fn(_pc.args)" in intercept_block, (
             "The intercept must call the command handler directly via _bc.fn(_pc.args)"
         )
-        assert "return;" in intercept_block, (
-            "The intercept must return after dispatching so send() does not also queue"
+        assert "return true;" in intercept_block, (
+            "The intercept must return truthy (consumed) after dispatching so "
+            "send() does not also queue and a queue drain acks its item"
         )
 
     def test_steer_intercept_clears_input_before_await(self):

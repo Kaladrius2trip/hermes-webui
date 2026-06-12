@@ -92,7 +92,7 @@ def test_pending_promise_set_synchronously():
 def test_directive_survives_local_slash_commands():
     """The consume block must appear after the slash-command early-return, not before."""
     src = read("static/messages.js")
-    early_return = src.index("autoResize();hideCmdDropdown();return;")
+    early_return = src.index("autoResize();hideCmdDropdown();return true;")
     consume = src.index("_forcedSkillDirectivePending")
     assert early_return < consume, \
         "slash-command early-return must precede the directive consume block"

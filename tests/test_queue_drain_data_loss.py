@@ -132,7 +132,7 @@ var S = {
 for (const name of [
   '_getSessionQueue', '_queueNextSeq', '_queueItemId', '_queueMarkPending', '_queueClearPending',
   '_queuePruneConsumed', '_queueMarkConsumed', '_queueIsConsumed', '_queueAckBackend',
-  '_queueResyncMissingLocalItem', '_mergeBackendQueueWithPendingLocal', '_setSessionQueue',
+  '_queueResyncMissingLocalItem', '_queuePreserveLocalFiles', '_mergeBackendQueueWithPendingLocal', '_setSessionQueue',
   'reconcileSessionQueue', '_persistSessionQueue', 'queueSessionMessage',
   'peekQueuedSessionMessage', 'ackQueuedSessionMessage', 'shiftQueuedSessionMessage',
   'getQueuedSessionCount', '_drainQueuedSessionMessage', 'setBusy'

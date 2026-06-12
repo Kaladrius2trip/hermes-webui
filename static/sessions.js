@@ -1145,35 +1145,9 @@ async function loadSession(sid){
     // Stale? A newer loadSession() call has already started (#1060).
     if (_loadingSessionId !== sid) return;
 
-    // Restore any queued message that survived page refresh via sessionStorage.
-    if(typeof queueSessionMessage==='function'){
-      try{
-        const _storedQ=sessionStorage.getItem('hermes-queue-'+sid);
-        if(_storedQ){
-          const _entries=JSON.parse(_storedQ);
-          if(Array.isArray(_entries)&&_entries.length){
-            const _lastMsg=S.messages.slice().reverse()
-              .find(m=>m&&m.role==='assistant');
-            const _lastAsst=_lastMsg?(_lastMsg.timestamp||_lastMsg._ts||0)*1000:0;
-            const _fresh=_entries.filter(e=>!e._queued_at||e._queued_at>_lastAsst);
-            if(_fresh.length){
-              const _first=_fresh[0];
-              const _msg=$&&$('msg');
-              if(_msg&&_first.text&&!_msg.value){
-                _msg.value=_first.text||'';
-                if(typeof autoResize==='function') autoResize();
-                if(typeof showToast==='function') showToast((_fresh.length>1?`${_fresh.length} queued messages restored (showing first)`:'Queued message restored')+' — review and send when ready');
-              }
-              sessionStorage.removeItem('hermes-queue-'+sid);
-            } else {
-              sessionStorage.removeItem('hermes-queue-'+sid);
-            }
-          } else {
-            sessionStorage.removeItem('hermes-queue-'+sid);
-          }
-        }
-      }catch(_){sessionStorage.removeItem('hermes-queue-'+sid);}
-    }
+    // Queue restoration after refresh is owned entirely by the backend-canonical
+    // reconcile below. The old restore-to-composer path duplicated the same
+    // entry into the composer AND the live queue, causing double sends.
 
     // Queue storage is backend-canonical. Reconcile the optimistic browser
     // cache from /api/session/queue before rendering queue badges/cards.

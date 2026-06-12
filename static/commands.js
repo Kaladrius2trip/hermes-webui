@@ -1151,6 +1151,11 @@ async function cmdSteer(args){
  * @param {boolean} explicitSteer - True if the user explicitly invoked /steer
  *   (vs the busy-mode auto-fallback). Affects toast wording only.
  */
+function _clipSteerPreview(text){
+  const s=String(text||'').trim();
+  return s.length>120?s.slice(0,117)+'…':s;
+}
+
 function _normalizePendingSteerItems(pendingSteers, legacyText){
   const raw=Array.isArray(pendingSteers)?pendingSteers:((legacyText!==undefined&&legacyText!==null&&String(legacyText).trim())?[{text:legacyText,text_preview:legacyText,order:1}]:[]);
   return raw.map((entry,idx)=>{

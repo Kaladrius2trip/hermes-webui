@@ -248,9 +248,28 @@ function _queueResyncMissingLocalItem(sid,item){
     })
     .catch(e=>{_queueClearPending(sid,id);if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to re-sync queued message',4000,'error');});
 }
+// Live File/Blob attachments exist only in the in-memory queue copy: they
+// serialize to {} in JSON, so a backend echo (or sessionStorage round-trip)
+// would silently destroy them. When applying a server payload, keep the local
+// .files for any item whose id we already hold with real blobs.
+function _queuePreserveLocalFiles(sid, incoming){
+  const items=Array.isArray(incoming)?incoming.filter(Boolean):[];
+  const local=SESSION_QUEUES[sid];
+  if(!local||!local.length) return items;
+  const localById={};
+  local.forEach(item=>{const id=_queueItemId(item); if(id) localById[id]=item;});
+  return items.map(item=>{
+    const id=_queueItemId(item);
+    const mine=id?localById[id]:null;
+    if(mine&&Array.isArray(mine.files)&&mine.files.some(f=>typeof Blob!=='undefined'&&f instanceof Blob)){
+      return {...item,files:mine.files};
+    }
+    return item;
+  });
+}
 function _mergeBackendQueueWithPendingLocal(sid,backendQueue){
   const merged=[];
-  (Array.isArray(backendQueue)?backendQueue.filter(Boolean):[]).forEach(item=>{
+  _queuePreserveLocalFiles(sid,backendQueue).forEach(item=>{
     if(_queueIsConsumed(sid,item)){
       void _queueAckBackend(sid,item);
       return;
@@ -305,7 +324,7 @@ function _persistSessionQueue(sid, queue){
   const q=_setSessionQueue(sid,queue);
   if(typeof api==='function'){
     void api('/api/session/queue/replace',{method:'POST',body:JSON.stringify({session_id:sid,queue:q}),timeoutMs:10000,timeoutToast:false})
-      .then(r=>{if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,r.queue);updateQueueBadge(sid);}})
+      .then(r=>{if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,_queuePreserveLocalFiles(sid,r.queue));updateQueueBadge(sid);}})
       .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued messages',4000,'error');});
   }
   return q.length;
@@ -325,7 +344,7 @@ function queueSessionMessage(sid, payload){
     void api('/api/session/queue',{method:'POST',body:JSON.stringify({session_id:sid,item:entry}),timeoutMs:10000,timeoutToast:false})
       .then(r=>{
         _queueClearPending(sid,entry);
-        if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,r.queue);updateQueueBadge(sid);}
+        if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,_queuePreserveLocalFiles(sid,r.queue));updateQueueBadge(sid);}
       })
       .catch(e=>{_queueClearPending(sid,entry);if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued message',4000,'error');});
   }
@@ -2210,11 +2229,17 @@ function _reasoningEffortQuery(){
   return qs?`?${qs}`:'';
 }
 
+// Session id the chip values were last resolved for. The cached
+// effort/override are per-session (#2697), so a session switch must refetch
+// instead of re-applying the previous session's values.
+let _reasoningChipSid=null;
+
 function fetchReasoningChip(){
   // #2697 — prefer the session-scoped value when a session is loaded. The
   // profile default is the fallback (matches streaming.py resolution order).
   const sid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)||null;
   const sessionOverride=sid&&S.session?_normalizeReasoningEffort(S.session.reasoning_effort||''):'';
+  _reasoningChipSid=sid;
   api('/api/reasoning'+_reasoningEffortQuery()).then(function(st){
     const profileEffort=(st&&st.reasoning_effort)||'';
     const effective=sessionOverride||profileEffort;
@@ -2223,7 +2248,8 @@ function fetchReasoningChip(){
 }
 
 function syncReasoningChip(){
-  if(_currentReasoningEffort===null){fetchReasoningChip();return;}
+  const sid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)||null;
+  if(_currentReasoningEffort===null||sid!==_reasoningChipSid){fetchReasoningChip();return;}
   _applyReasoningChip(_currentReasoningEffort,_currentReasoningSessionOverride);
 }
 

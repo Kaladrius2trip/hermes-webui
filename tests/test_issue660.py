@@ -38,39 +38,23 @@ class TestQueuePersistence:
 
 
 class TestQueueRestore:
-    """Queue is restored from sessionStorage on session load when agent is idle."""
+    """Reload recovery is owned by the backend-canonical reconcile, not the
+    legacy sessionStorage restore-to-composer path (which duplicated the same
+    entry into the composer AND the live queue)."""
 
-    def test_restore_reads_session_storage(self):
-        """sessions.js must read from sessionStorage in the idle-session load path."""
-        assert "sessionStorage.getItem('hermes-queue-'+sid)" in sess_src
+    def test_legacy_restore_to_composer_removed(self):
+        """loadSession must not copy a queued entry into the composer."""
+        assert "_msg.value=_first.text" not in sess_src
 
-    def test_restore_uses_timestamp_guard(self):
-        """Stale entries (created before last assistant response) must be dropped."""
-        assert '_queued_at' in sess_src
-        assert '_lastAsst' in sess_src
+    def test_legacy_restore_toast_removed(self):
+        """The 'Queued message restored' toast belonged to the removed path."""
+        assert 'restored' not in sess_src.lower() or 'review and send when ready' not in sess_src
 
-    def test_restore_shows_toast(self):
-        """User must see a toast notification when a queue is restored."""
-        assert 'queued message' in sess_src.lower() and 'restored' in sess_src.lower()
+    def test_loadsession_reconciles_backend_queue(self):
+        """loadSession must reconcile the queue from the backend-canonical store."""
+        assert 'reconcileSessionQueue(sid)' in sess_src
 
-    def test_restore_puts_text_in_composer(self):
-        """First queued message goes into the composer input, not auto-sent."""
-        assert "_msg.value=_first.text" in sess_src
+    def test_loadsession_does_not_read_legacy_storage_key(self):
+        """sessions.js must not read the optimistic cache key directly; ui.js owns it."""
+        assert "sessionStorage.getItem('hermes-queue-'" not in sess_src
 
-    def test_restore_clears_stale_storage(self):
-        """On timestamp mismatch, stale sessionStorage entry is removed."""
-        assert "sessionStorage.removeItem('hermes-queue-'+sid)" in sess_src
-
-    def test_restore_wrapped_in_try_catch(self):
-        """sessionStorage access must be wrapped in try/catch (private browsing may block it)."""
-        # The restore block must have a catch that clears the bad key
-        assert "catch(_){sessionStorage.removeItem" in sess_src
-
-    def test_active_session_not_restored_as_draft(self):
-        """When agent is active (INFLIGHT), queue restore must NOT run."""
-        # The restore block must be inside the else branch (idle path), not the INFLIGHT branch
-        inflight_pos = sess_src.find("if(INFLIGHT[sid]){")
-        restore_pos = sess_src.find("sessionStorage.getItem('hermes-queue-'")
-        else_pos = sess_src.find("}else{", inflight_pos)
-        assert restore_pos > else_pos, \
-            "Queue restore must be inside the else (idle) branch, not the INFLIGHT branch"

@@ -887,6 +887,9 @@ async function send(){
       S.pendingFiles=[];renderTray();
       updateQueueBadge(_targetSid);
       showToast(`Queued: "${_text.slice(0,40)}${_text.length>40?'…':''}"`,2000);
+      // The text now lives in a fresh queue entry; report consumed so a queue
+      // drain acks its original item instead of leaving a duplicate behind.
+      return true;
     }
     return;
   }
@@ -921,7 +924,7 @@ async function send(){
         if(_bc&&_immediateBusyCommands.has(_bc.name)){
           $('msg').value='';autoResize();
           await _bc.fn(_pc.args);
-          return;
+          return true;
         }
       }
       const busyMode=window._busyInputMode||'queue';
@@ -962,7 +965,9 @@ async function send(){
         showToast(`Queued: "${text.slice(0,40)}${text.length>40?'…':''}"`,2000);
       }
     }
-    return;
+    // Truthy when the composer text was consumed (steered or re-queued) so a
+    // queue drain that raced into the busy path still acks its original item.
+    return !!text;
   }
   if(S.session&&(S.session.read_only||S.session.is_read_only)){
     if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000);
@@ -993,7 +998,9 @@ async function send(){
         if(_pushedUser){S.messages.pop();renderMessages();}
         // Fall through to normal send path
       } else {
-        $('msg').value='';autoResize();hideCmdDropdown();return;
+        // Local command executed — report the composer as consumed so a
+        // queue drain acks the item instead of re-running it every turn.
+        $('msg').value='';autoResize();hideCmdDropdown();return true;
       }
     }
     if(_parsedCmd&&!_cmd){
@@ -1005,7 +1012,7 @@ async function send(){
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
         renderMessages();
-        $('msg').value='';autoResize();hideCmdDropdown();return;
+        $('msg').value='';autoResize();hideCmdDropdown();return true;
       }
       const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
       if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
@@ -1021,7 +1028,7 @@ async function send(){
         }
         S.messages.push({role:'assistant',content:String(_agentOutput||'(no output)'),_ts:Date.now()/1000});
         renderMessages();
-        $('msg').value='';autoResize();hideCmdDropdown();return;
+        $('msg').value='';autoResize();hideCmdDropdown();return true;
       }
       if(_agentCmd&&_agentCmd.category==='Plugin'){
         if(!S.session){await newSession();await renderSessionList();}
@@ -1036,7 +1043,7 @@ async function send(){
         }
         S.messages.push({role:'assistant',content:String(_pluginOutput||'(no output)'),_ts:Date.now()/1000});
         renderMessages();
-        $('msg').value='';autoResize();hideCmdDropdown();return;
+        $('msg').value='';autoResize();hideCmdDropdown();return true;
       }
     }
   }
