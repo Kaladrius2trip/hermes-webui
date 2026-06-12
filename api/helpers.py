@@ -445,6 +445,11 @@ def redact_session_data(session_dict: dict) -> dict:
     """
     from api.config import load_settings
     _enabled = bool(load_settings().get("api_redact_enabled", True))
+    if not _enabled:
+        # Fast path: with redaction disabled the recursive walk would still
+        # deep-copy the entire payload (tens of MB for long merged
+        # transcripts) only to return every string unchanged.
+        return dict(session_dict)
     result = dict(session_dict)
     if isinstance(result.get('title'), str):
         result['title'] = _redact_text(result['title'], _enabled=_enabled)
