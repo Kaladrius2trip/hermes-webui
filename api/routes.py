@@ -3611,6 +3611,20 @@ def _messages_start_with_visible_prefix(messages, prefix) -> bool:
         return False
 
 
+# Merged snapshot-lineage prefix cache, keyed by the nearest snapshot parent
+# id. Pre-compression snapshots are immutable read-only sidecars, and the
+# nearest parent id uniquely identifies the whole chain below it, so the
+# expensive part of the stitch (loading every 30-40 MB snapshot JSON and
+# merging tens of thousands of messages) only needs to run once per chain —
+# not on every GET /api/session. Without this, a session with a dozen
+# compression hops costs seconds of json.loads + merge per request, which is
+# exactly the "sessions take forever / Failed to load messages" failure mode
+# (and the multi-GB RSS spikes) observed after long-running compressed chats.
+_LINEAGE_PREFIX_CACHE: dict = {}
+_LINEAGE_PREFIX_CACHE_MAX = 2
+_LINEAGE_PREFIX_CACHE_LOCK = threading.Lock()
+
+
 def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) -> list:
     """Return WebUI sidecar messages stitched across compression snapshots.
 
@@ -3620,39 +3634,56 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
     only those snapshot parents for display; ordinary forks also carry
     ``parent_session_id`` but must remain independent conversations.
     """
-    segments = []
-    current = session
     session_messages = list(getattr(session, "messages", []) or [])
-    seen = {str(getattr(session, "session_id", "") or "")}
-    for _ in range(max(0, int(max_hops))):
-        parent_id = str(getattr(current, "parent_session_id", "") or "").strip()
-        if not parent_id or parent_id in seen or not is_safe_session_id(parent_id):
-            break
-        parent = Session.load(parent_id)
-        if not parent or not getattr(parent, "pre_compression_snapshot", False):
-            break
-        if not segments and _messages_start_with_visible_prefix(
-            session_messages,
-            getattr(parent, "messages", []) or [],
-        ):
-            return session_messages
-        segments.append(parent)
-        seen.add(parent_id)
-        current = parent
+    first_parent_id = str(getattr(session, "parent_session_id", "") or "").strip()
+    if not first_parent_id or not is_safe_session_id(first_parent_id):
+        return session_messages
 
-    if not segments:
-        return list(getattr(session, "messages", []) or [])
+    with _LINEAGE_PREFIX_CACHE_LOCK:
+        cached = _LINEAGE_PREFIX_CACHE.get(first_parent_id)
+    if cached is None:
+        segments = []
+        current = session
+        seen = {str(getattr(session, "session_id", "") or "")}
+        for _ in range(max(0, int(max_hops))):
+            parent_id = str(getattr(current, "parent_session_id", "") or "").strip()
+            if not parent_id or parent_id in seen or not is_safe_session_id(parent_id):
+                break
+            parent = Session.load(parent_id)
+            if not parent or not getattr(parent, "pre_compression_snapshot", False):
+                break
+            segments.append(parent)
+            seen.add(parent_id)
+            current = parent
 
-    merged = []
-    for segment in reversed(segments):
-        merged = merge_session_messages_append_only(
-            merged,
-            getattr(segment, "messages", []) or [],
-            truncation_watermark=getattr(segment, "truncation_watermark", None),
-        )
+        if not segments:
+            cached = {"prefix": [], "nearest_parent_messages": []}
+        else:
+            merged_prefix = []
+            for segment in reversed(segments):
+                merged_prefix = merge_session_messages_append_only(
+                    merged_prefix,
+                    getattr(segment, "messages", []) or [],
+                    truncation_watermark=getattr(segment, "truncation_watermark", None),
+                )
+            cached = {
+                "prefix": merged_prefix,
+                "nearest_parent_messages": list(getattr(segments[0], "messages", []) or []),
+            }
+        with _LINEAGE_PREFIX_CACHE_LOCK:
+            while len(_LINEAGE_PREFIX_CACHE) >= _LINEAGE_PREFIX_CACHE_MAX:
+                _LINEAGE_PREFIX_CACHE.pop(next(iter(_LINEAGE_PREFIX_CACHE)), None)
+            _LINEAGE_PREFIX_CACHE[first_parent_id] = cached
+
+    if not cached["prefix"]:
+        return session_messages
+    # Child sidecars that visibly replay the nearest snapshot's transcript are
+    # already self-contained — return them as-is (pre-cache behavior).
+    if _messages_start_with_visible_prefix(session_messages, cached["nearest_parent_messages"]):
+        return session_messages
     return merge_session_messages_append_only(
-        merged,
-        getattr(session, "messages", []) or [],
+        list(cached["prefix"]),
+        session_messages,
         truncation_watermark=None,
     )
 
