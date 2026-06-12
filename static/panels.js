@@ -1769,14 +1769,35 @@ function _kanbanCard(task, status){
   const capabilityClass = capability ? ' kanban-card-capability' : '';
   const capabilityHtml = _kanbanCapabilityCardHtml(task.capability);
   const assignee = task.assignee ? `<span class="kanban-card-assignee">@${esc(task.assignee)}</span>` : `<span class="kanban-card-unassigned">${esc(t('kanban_unassigned'))}</span>`;
+  const workerHtml = _kanbanCardWorkerHtml(task);
   return `<article class="kanban-card ${esc(stale)}${capabilityClass}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, '${esc(task.id)}')" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, '${esc(task.id)}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask('${esc(task.id)}')}">
     <div class="kanban-card-topline"><span class="kanban-card-id">${esc(task.id || '')}</span>${priority ? `<span class="kanban-badge priority">P${priority}</span>` : ''}${task.tenant ? `<span class="kanban-badge tenant">${esc(task.tenant)}</span>` : ''}</div>
     <div class="kanban-card-title">${esc(_kanbanTaskTitle(task))}</div>
     ${body ? `<div class="kanban-card-body">${_kanbanRenderMarkdown(body)}</div>` : ''}
     ${capabilityHtml}
     <div class="kanban-card-meta">${assignee}${comments ? `<span class="kanban-card-metric">💬 ${comments}</span>` : ''}${linkTotal ? `<span class="kanban-card-metric">↔ ${linkTotal}</span>` : ''}${age ? `<span class="kanban-card-age">${esc(age)}</span>` : ''}</div>
+    ${workerHtml}
     ${_kanbanCardQuickActions(task)}
   </article>`;
+}
+
+// In-flight worker state strip for running cards: live (green dot), stale
+// heartbeat (amber, >60s), failing (red, consecutive_failures > 0). Data is
+// computed server-side in kanban_bridge._task_dict.
+function _kanbanCardWorkerHtml(task){
+  const w = task.worker;
+  if (!w || String(task.status || '') !== 'running') return '';
+  const hb = (w.heartbeat_age_s === null || w.heartbeat_age_s === undefined) ? null : Number(w.heartbeat_age_s);
+  const failures = Number(w.failures || 0);
+  let cls = 'live';
+  if (failures > 0) cls = 'failing';
+  else if (hb !== null && hb > 60) cls = 'stale';
+  const parts = [];
+  if (w.pid) parts.push(`PID ${w.pid}`);
+  if (hb !== null) parts.push(`hb ${hb < 60 ? hb + 's' : Math.round(hb / 60) + 'm'} ago`);
+  if (failures > 0) parts.push(`⚠ retry ${failures}`);
+  const title = w.last_failure_error ? ` title="${esc(w.last_failure_error)}"` : '';
+  return `<div class="kanban-card-worker kanban-card-worker-${cls}"${title}><span class="kanban-worker-dot"></span>${esc(parts.join(' · '))}</div>`;
 }
 
 async function hardRefreshWebUIClient(){
@@ -2123,6 +2144,7 @@ async function unblockKanbanTask(taskId){
 
 function closeKanbanTaskDetail(){
   _kanbanCurrentTaskId = null;
+  _kanbanLogStopFollow();
   const preview = $('kanbanTaskPreview');
   if (preview) {
     preview.style.display = 'none';
@@ -2130,6 +2152,78 @@ function closeKanbanTaskDetail(){
   }
   const board = $('kanbanBoard');
   if (board) board.querySelectorAll('.kanban-card').forEach(card => card.classList.remove('selected'));
+}
+
+// ── Live worker-log follow (tail -f over incremental HTTP polls) ──────────
+// While the detail panel is open and the task is running, "Follow" polls
+// /api/kanban/tasks/{id}/log?offset=N every 2s and appends only new bytes.
+const _kanbanLogFollow = { taskId: null, offset: 0, timer: null, active: false };
+
+function _kanbanLogStopFollow(){
+  if (_kanbanLogFollow.timer) { clearTimeout(_kanbanLogFollow.timer); _kanbanLogFollow.timer = null; }
+  _kanbanLogFollow.taskId = null;
+  _kanbanLogFollow.active = false;
+}
+
+function _kanbanLogSetStatus(text){
+  const el = $('kanbanWorkerLogStatus');
+  if (el) el.textContent = text;
+}
+
+function _kanbanLogFormatSize(bytes){
+  const n = Number(bytes) || 0;
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024) return Math.round(n / 1024) + ' KB';
+  return n + ' B';
+}
+
+async function _kanbanLogPoll(){
+  const taskId = _kanbanLogFollow.taskId;
+  if (!taskId || taskId !== _kanbanCurrentTaskId) { _kanbanLogStopFollow(); return; }
+  try {
+    const chunk = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({offset: _kanbanLogFollow.offset}));
+    if (taskId !== _kanbanLogFollow.taskId) return;
+    const pre = $('kanbanWorkerLogPre');
+    if (pre && chunk && chunk.exists) {
+      if (chunk.rotated) {
+        pre.textContent = '';
+        _kanbanLogSetStatus(t('kanban_log_rotated') || 'log rotated — restarting from the top');
+      }
+      if (chunk.content) {
+        const stick = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+        pre.textContent += chunk.content;
+        if (stick) pre.scrollTop = pre.scrollHeight;
+      }
+      _kanbanLogFollow.offset = chunk.offset || _kanbanLogFollow.offset;
+      _kanbanLogSetStatus(_kanbanLogFormatSize(chunk.size_bytes) + (chunk.active ? ' · live' : ' · finished'));
+    }
+    if (chunk && chunk.active === false) {
+      // Run ended: one final chunk already applied — stop polling and
+      // flip the toggle off.
+      _kanbanLogStopFollow();
+      const btn = $('kanbanWorkerLogFollowBtn');
+      if (btn) btn.classList.remove('primary');
+      return;
+    }
+  } catch(_) { /* transient — keep polling */ }
+  if (_kanbanLogFollow.taskId === taskId) {
+    _kanbanLogFollow.timer = setTimeout(_kanbanLogPoll, 2000);
+  }
+}
+
+function kanbanLogToggleFollow(taskId){
+  const btn = $('kanbanWorkerLogFollowBtn');
+  if (_kanbanLogFollow.taskId === taskId && _kanbanLogFollow.timer) {
+    _kanbanLogStopFollow();
+    if (btn) btn.classList.remove('primary');
+    return;
+  }
+  _kanbanLogStopFollow();
+  _kanbanLogFollow.taskId = taskId;
+  if (btn) btn.classList.add('primary');
+  const pre = $('kanbanWorkerLogPre');
+  if (pre) pre.scrollTop = pre.scrollHeight;
+  void _kanbanLogPoll();
 }
 
 function _kanbanFormatTimestamp(value){
@@ -2188,12 +2282,36 @@ function _kanbanCommentHtml(comment){
 
 function _kanbanEventHtml(event){
   const at = _kanbanFormatTimestamp(event.created_at || event.ts || '');
+  if (String(event.kind || '') === 'delegation') {
+    const html = _kanbanDelegationEventHtml(event);
+    if (html) return `<div class="kanban-detail-row">${html}<div class="kanban-detail-row-meta">${esc(at)}</div></div>`;
+  }
   const payload = _kanbanFormatDetailValue(event.payload || event.data || '');
   return `<div class="kanban-detail-row">
     <div class="kanban-detail-row-main">${esc(_kanbanEventSummary(event))}</div>
     ${payload ? `<pre class="kanban-detail-pre">${esc(payload)}</pre>` : ''}
     <div class="kanban-detail-row-meta">${esc(at)}</div>
   </div>`;
+}
+
+// Render a kind='delegation' task event (tree snapshot written by
+// tools/delegate_tool.py when the worker delegated subagents) as a compact
+// agent list instead of raw JSON.
+function _kanbanDelegationEventHtml(event){
+  let payload = event.payload || event.data;
+  if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch(_) { return ''; } }
+  const agents = payload && Array.isArray(payload.agents) ? payload.agents : null;
+  if (!agents || !agents.length) return '';
+  const rows = agents.map(a => {
+    const ok = String(a.status || '').toLowerCase() !== 'error';
+    const model = a.model ? String(a.model).split('/').pop() : '';
+    const dur = a.duration_seconds ? ` · ${Math.round(a.duration_seconds)}s` : '';
+    return `<div class="delegation-row delegation-${ok ? 'done' : 'failed'}">`+
+      `<span class="delegation-icon">${ok ? '✓' : '✕'}</span> `+
+      `<span class="delegation-goal">${esc(a.goal_preview || a.subagent_id || '')}</span>`+
+      `<span class="delegation-stats">${esc(model)}${esc(dur)}</span></div>`;
+  }).join('');
+  return `<div class="kanban-detail-row-main">⑂ ${esc(String(t('kanban_delegation') || 'Delegation'))} · ${agents.length}</div><div class="delegation-panel" style="display:block">${rows}</div>`;
 }
 
 function _kanbanRunHtml(run){
@@ -2936,6 +3054,20 @@ async function addKanbanComment(taskId){
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
+function _kanbanWorkerLogHtml(task, log){
+  if (!log || (!log.content && !log.exists)) return '';
+  const active = !!log.active;
+  const followBtn = active
+    ? `<button id="kanbanWorkerLogFollowBtn" class="btn secondary" onclick="kanbanLogToggleFollow('${esc(task.id)}')">${esc(t('kanban_log_follow') || 'Follow')}</button>`
+    : '';
+  const status = _kanbanLogFormatSize(log.size_bytes) + (active ? ' · live' : '');
+  return `<div class="kanban-worker-log-toolbar">
+      <span id="kanbanWorkerLogStatus" class="kanban-meta">${esc(status)}</span>
+      ${followBtn}
+    </div>
+    <pre id="kanbanWorkerLogPre" class="kanban-detail-pre kanban-worker-log-pre">${esc(log.content || '')}</pre>`;
+}
+
 function _kanbanRenderTaskDetail(data){
   const task = data.task || {};
   const log = data.log || {};
@@ -2968,7 +3100,7 @@ function _kanbanRenderTaskDetail(data){
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}
       ${_kanbanDetailSection('kanban-detail-links', t('kanban_links'), _kanbanLinksHtml(links), 'kanban_empty')}
       ${_kanbanDetailSection('kanban-detail-runs', String(t('kanban_runs_count')).replace('{0}', runs.length), runs.map(_kanbanRunHtml).join(''), 'kanban_no_runs')}
-      ${_kanbanDetailSection('kanban-detail-log', t('kanban_worker_log'), log.content ? `<pre class="kanban-detail-pre">${esc(log.content)}</pre>` : '', 'kanban_empty')}
+      ${_kanbanDetailSection('kanban-detail-log', t('kanban_worker_log'), _kanbanWorkerLogHtml(task, log), 'kanban_empty')}
     </div>
     <div class="kanban-comment-form">
       <textarea id="kanbanCommentInput" rows="2" placeholder="${esc(t('kanban_add_comment'))}"></textarea>
@@ -2994,6 +3126,12 @@ async function loadKanbanTask(taskId){
       preview.style.display = '';
       preview.innerHTML = _kanbanRenderTaskDetail(data);
     }
+    // Live tail: continue from where the initial tail read ended; auto-follow
+    // running tasks so opening the card behaves like `tail -f`.
+    _kanbanLogStopFollow();
+    const logInfo = data.log || {};
+    _kanbanLogFollow.offset = Number(logInfo.offset || logInfo.size_bytes || 0);
+    if (logInfo.active) kanbanLogToggleFollow(taskId);
     showToast(`${t('kanban_task')}: ${title}`);
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }

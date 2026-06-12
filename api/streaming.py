@@ -6200,6 +6200,45 @@ def _run_agent_streaming(
                         _emit_metering()
                     return
 
+                # Delegation telemetry: forward subagent.* progress events to
+                # the browser so the WebUI can render a live subagent tree
+                # (mirrors the TUI gateway handler in tui_gateway/server.py).
+                # Previously these events were silently dropped here.
+                if isinstance(event_type, str) and event_type.startswith('subagent.'):
+                    sub_payload = {
+                        'event_type': event_type,
+                        'goal': str(cb_kwargs.get('goal') or ''),
+                        'task_index': int(cb_kwargs.get('task_index') or 0),
+                        'task_count': int(cb_kwargs.get('task_count') or 1),
+                    }
+                    for str_key in ('subagent_id', 'parent_id', 'model', 'status', 'summary'):
+                        if cb_kwargs.get(str_key):
+                            sub_payload[str_key] = str(cb_kwargs[str_key])
+                    for int_key in ('depth', 'tool_count', 'input_tokens', 'output_tokens', 'api_calls'):
+                        if cb_kwargs.get(int_key) is not None:
+                            try:
+                                sub_payload[int_key] = int(cb_kwargs[int_key])
+                            except (TypeError, ValueError):
+                                pass
+                    if cb_kwargs.get('cost_usd') is not None:
+                        try:
+                            sub_payload['cost_usd'] = float(cb_kwargs['cost_usd'])
+                        except (TypeError, ValueError):
+                            pass
+                    if cb_kwargs.get('toolsets'):
+                        sub_payload['toolsets'] = [str(t) for t in cb_kwargs['toolsets']]
+                    if cb_kwargs.get('duration_seconds') is not None:
+                        try:
+                            sub_payload['duration_seconds'] = float(cb_kwargs['duration_seconds'])
+                        except (TypeError, ValueError):
+                            pass
+                    if name:
+                        sub_payload['tool_name'] = str(name)
+                    if preview:
+                        sub_payload['text'] = str(preview)[:2000]
+                    put('subagent_event', sub_payload)
+                    return
+
                 # (#3587) Advance reasoning index at tool-call boundaries.
                 # on_interim_assistant is suppressed for contentless tool-call
                 # messages (run_agent.py:3834), so the index never advances

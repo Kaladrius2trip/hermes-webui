@@ -438,6 +438,83 @@ function queueSessionMessage(sid, payload){
   }
   return q.length;
 }
+// ── Delegation (subagent) live monitor ─────────────────────────────────────
+// Fed by 'subagent_event' SSE frames forwarded from api/streaming.py.
+// Renders a compact tree panel above the composer while subagents run and
+// keeps the final state visible until the next delegation starts.
+const _delegationAgents={};
+let _delegationCollapsed=false;
+
+function _ensureDelegationPanel(){
+  let panel=$('delegationPanel');
+  if(panel) return panel;
+  const anchor=$('queueChips')||$('msg');
+  if(!anchor||!anchor.parentNode) return null;
+  panel=document.createElement('div');
+  panel.id='delegationPanel';
+  panel.className='delegation-panel';
+  panel.style.display='none';
+  anchor.parentNode.insertBefore(panel,anchor);
+  return panel;
+}
+
+function updateDelegationPanel(d){
+  if(!d) return;
+  const id=String(d.subagent_id||('task-'+(d.task_index||0)));
+  const ev=String(d.event_type||'');
+  if(ev==='subagent.spawn_requested'||!_delegationAgents[id]){
+    // First event of a fresh delegation batch clears the previous tree.
+    if(ev==='subagent.spawn_requested'&&!Object.values(_delegationAgents).some(a=>a.running)){
+      for(const k of Object.keys(_delegationAgents)) delete _delegationAgents[k];
+    }
+    _delegationAgents[id]=_delegationAgents[id]||{running:true,tool_count:0};
+  }
+  const a=_delegationAgents[id];
+  if(d.goal) a.goal=String(d.goal).slice(0,120);
+  if(d.model) a.model=d.model;
+  if(d.parent_id) a.parent_id=d.parent_id;
+  if(d.depth!==undefined) a.depth=Number(d.depth)||0;
+  if(d.tool_count!==undefined) a.tool_count=Number(d.tool_count)||a.tool_count;
+  else if(ev==='subagent.tool') a.tool_count=(a.tool_count||0)+1;
+  if(d.input_tokens!==undefined) a.input_tokens=d.input_tokens;
+  if(d.output_tokens!==undefined) a.output_tokens=d.output_tokens;
+  if(d.cost_usd!==undefined) a.cost_usd=d.cost_usd;
+  if(d.status) a.status=d.status;
+  if(ev==='subagent.complete'||ev==='subagent.error'){a.running=false;a.failed=ev==='subagent.error'||String(d.status||'').toLowerCase()==='error';}
+  renderDelegationPanel();
+}
+
+function renderDelegationPanel(){
+  const panel=_ensureDelegationPanel();
+  if(!panel) return;
+  const ids=Object.keys(_delegationAgents);
+  if(!ids.length){panel.style.display='none';return;}
+  const running=ids.filter(id=>_delegationAgents[id].running).length;
+  const byParent={};
+  ids.forEach(id=>{const p=_delegationAgents[id].parent_id||'';(byParent[p]=byParent[p]||[]).push(id);});
+  const renderNode=(id,depth)=>{
+    const a=_delegationAgents[id];
+    const icon=a.running?'▶':(a.failed?'✕':'✓');
+    const cls=a.running?'running':(a.failed?'failed':'done');
+    const stats=[];
+    if(a.model) stats.push(esc(String(a.model).split('/').pop()));
+    if(a.tool_count) stats.push(a.tool_count+'t');
+    if(a.output_tokens) stats.push(Math.round(a.output_tokens/1000)+'k out');
+    if(a.cost_usd) stats.push('$'+Number(a.cost_usd).toFixed(2));
+    const kids=(byParent[id]||[]).map(k=>renderNode(k,depth+1)).join('');
+    return `<div class="delegation-row delegation-${cls}" style="padding-left:${8+depth*14}px">`+
+      `<span class="delegation-icon">${icon}</span> <span class="delegation-goal">${esc(a.goal||id)}</span>`+
+      (stats.length?` <span class="delegation-stats">${stats.join(' · ')}</span>`:'')+
+      `</div>`+kids;
+  };
+  const roots=byParent['']||ids.filter(id=>!_delegationAgents[id].parent_id);
+  const body=_delegationCollapsed?'':roots.map(id=>renderNode(id,0)).join('');
+  panel.innerHTML=`<div class="delegation-header" onclick="_delegationCollapsed=!_delegationCollapsed;renderDelegationPanel();">`+
+    `⑂ Delegation · ${ids.length} agent${ids.length>1?'s':''}${running?` · ${running} running`:' · done'}`+
+    `<span class="delegation-toggle">${_delegationCollapsed?'▸':'▾'}</span></div>${body}`;
+  panel.style.display='';
+}
+
 function peekQueuedSessionMessage(sid){
   const q=_getSessionQueue(sid,false);
   return q.length?q[0]:null;

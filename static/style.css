@@ -5429,3 +5429,24 @@ main.main.showing-logs > #mainLogs{display:flex;}
   display: block;
 }
 .interim-collapse-toggle:hover { text-decoration: underline; }
+
+/* ── Kanban live worker log + worker state (audit 2026-06-12 UX plan) ───── */
+.kanban-worker-log-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0 0;}
+.kanban-worker-log-pre{max-height:340px;overflow-y:auto;}
+.kanban-card-worker{display:flex;align-items:center;gap:5px;font-size:10px;margin-top:4px;color:var(--muted);}
+.kanban-worker-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0;}
+.kanban-card-worker-live .kanban-worker-dot{background:#39c065;box-shadow:0 0 4px rgba(57,192,101,.7);}
+.kanban-card-worker-stale .kanban-worker-dot{background:#e0a93e;}
+.kanban-card-worker-failing{color:#e05c5c;}
+.kanban-card-worker-failing .kanban-worker-dot{background:#e05c5c;}
+
+/* ── Delegation (subagent) live monitor ─────────────────────────────────── */
+.delegation-panel{margin:4px 0;border:1px solid var(--border);border-radius:8px;background:var(--input-bg);font-size:11px;max-height:200px;overflow-y:auto;}
+.delegation-header{display:flex;align-items:center;gap:6px;padding:5px 10px;cursor:pointer;color:var(--text);font-weight:600;user-select:none;}
+.delegation-toggle{margin-left:auto;color:var(--muted);}
+.delegation-row{display:flex;align-items:center;gap:6px;padding:2px 10px 2px 8px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.delegation-row .delegation-goal{overflow:hidden;text-overflow:ellipsis;}
+.delegation-running .delegation-icon{color:#39c065;}
+.delegation-done .delegation-icon{color:var(--muted);}
+.delegation-failed{color:#e05c5c;}
+.delegation-stats{margin-left:auto;color:var(--muted);font-size:10px;flex-shrink:0;}

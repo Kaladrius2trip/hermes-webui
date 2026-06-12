@@ -236,6 +236,18 @@ class FakeKanbanDB:
     def read_worker_log(self, task_id, tail_bytes=None):
         return f"worker log for {task_id}"
 
+    def read_worker_log_chunk(self, task_id, offset=0, max_bytes=65536):
+        full = f"worker log for {task_id}"
+        data = full.encode()
+        offset = min(max(0, int(offset or 0)), len(data))
+        chunk = data[offset:offset + max_bytes]
+        return {
+            "content": chunk.decode(),
+            "offset": offset + len(chunk),
+            "size": len(data),
+            "rotated": False,
+        }
+
     def worker_log_path(self, task_id):
         from pathlib import Path
         return Path(f"/tmp/hermes-kanban/{task_id}.log")
@@ -1406,3 +1418,42 @@ def test_routes_dispatches_capability_workflow_endpoints_to_kanban_bridge():
     src = open("api/kanban_bridge.py", encoding="utf-8").read()
     assert 'path == "/api/kanban/capability/plan"' in src
     assert 'path == "/api/kanban/capability/cards"' in src
+
+
+def test_kanban_log_offset_mode_returns_incremental_chunk(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+
+    first = bridge._task_log_payload(_parsed(path="/api/kanban/tasks/t_1/log", query="offset=0"), "t_1")
+    assert first["content"] == "worker log for t_1"
+    assert first["offset"] == len("worker log for t_1")
+    assert first["rotated"] is False
+    assert "active" in first
+
+    second = bridge._task_log_payload(
+        _parsed(path="/api/kanban/tasks/t_1/log", query=f"offset={first['offset']}"), "t_1"
+    )
+    assert second["content"] == ""
+    assert second["offset"] == first["offset"]
+
+
+def test_kanban_running_task_dict_exposes_worker_state(monkeypatch):
+    import time as _time
+
+    bridge = _load_bridge(monkeypatch)
+    from types import SimpleNamespace
+
+    now = int(_time.time())
+    task = SimpleNamespace(
+        id="t_run", title="x", body="", assignee="coder", status="running",
+        priority=0, created_at=now - 100, worker_pid=4412,
+        last_heartbeat_at=now - 8, claim_expires=now + 400,
+        consecutive_failures=1, last_failure_error="boom",
+    )
+    data = bridge._task_dict(task)
+
+    worker = data["worker"]
+    assert worker["pid"] == 4412
+    assert 0 <= worker["heartbeat_age_s"] <= 60
+    assert worker["claim_expires_in_s"] > 0
+    assert worker["failures"] == 1
+    assert worker["last_failure_error"] == "boom"

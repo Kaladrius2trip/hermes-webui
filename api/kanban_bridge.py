@@ -138,6 +138,20 @@ def _task_dict(task):
     data["age_seconds"] = age
     data["age"] = age
     data.setdefault("progress", None)
+    # In-flight worker state for running tasks — lets the board show
+    # live/stale/failing workers at a glance without opening the detail panel.
+    # Ages are computed server-side to avoid client clock skew.
+    if str(data.get("status") or "") == "running":
+        now = int(time.time())
+        heartbeat = data.get("last_heartbeat_at")
+        claim_expires = data.get("claim_expires")
+        data["worker"] = {
+            "pid": data.get("worker_pid"),
+            "heartbeat_age_s": (now - int(heartbeat)) if heartbeat else None,
+            "claim_expires_in_s": (int(claim_expires) - now) if claim_expires else None,
+            "failures": int(data.get("consecutive_failures") or 0),
+            "last_failure_error": (str(data.get("last_failure_error") or "")[:200] or None),
+        }
     return data
 
 
@@ -819,17 +833,46 @@ def _assignees_payload(*, board=None):
 
 
 def _task_log_payload(parsed, task_id: str):
-    """Return the raw worker log content and on-disk metadata for a task's dispatcher run."""
+    """Return the raw worker log content and on-disk metadata for a task's dispatcher run.
+
+    Two modes:
+    - default: whole/tail read (``?tail=N``), backward compatible.
+    - incremental (``?offset=N``): returns only bytes past ``offset`` plus the
+      next offset — the WebUI "Follow" mode polls this while a run is live so
+      the panel behaves like ``tail -f`` without re-sending the whole file.
+    """
     board = _resolve_board(parsed)
     kb = _kb()
     tail = _int_query(parsed, "tail", None, minimum=1, maximum=2_000_000)
+    offset = _int_query(parsed, "offset", None, minimum=0, maximum=2_000_000_000)
     with _conn(board=board) as conn:
-        if not kb.get_task(conn, task_id):
+        task = kb.get_task(conn, task_id)
+        if not task:
             return None
+    active = str(getattr(task, "status", "") or "") == "running"
     if not hasattr(kb, "read_worker_log"):
-        return {"task_id": task_id, "path": "", "exists": False, "size_bytes": 0, "content": "", "truncated": False}
-    content = kb.read_worker_log(task_id, tail_bytes=tail)
+        return {"task_id": task_id, "path": "", "exists": False, "size_bytes": 0, "content": "", "truncated": False, "active": active}
     log_path = kb.worker_log_path(task_id) if hasattr(kb, "worker_log_path") else None
+    if offset is not None and hasattr(kb, "read_worker_log_chunk"):
+        chunk = kb.read_worker_log_chunk(task_id, offset=offset, max_bytes=65536)
+        if chunk is None:
+            return {
+                "task_id": task_id, "path": str(log_path or ""), "exists": False,
+                "size_bytes": 0, "content": "", "offset": 0, "rotated": False,
+                "truncated": False, "active": active,
+            }
+        return {
+            "task_id": task_id,
+            "path": str(log_path or ""),
+            "exists": True,
+            "size_bytes": chunk["size"],
+            "content": chunk["content"],
+            "offset": chunk["offset"],
+            "rotated": chunk["rotated"],
+            "truncated": chunk["offset"] < chunk["size"],
+            "active": active,
+        }
+    content = kb.read_worker_log(task_id, tail_bytes=tail)
     try:
         size = log_path.stat().st_size if log_path and log_path.exists() else 0
     except OSError:
@@ -840,7 +883,9 @@ def _task_log_payload(parsed, task_id: str):
         "exists": content is not None,
         "size_bytes": size,
         "content": content or "",
+        "offset": size,
         "truncated": bool(tail and size > tail),
+        "active": active,
     }
 
 
