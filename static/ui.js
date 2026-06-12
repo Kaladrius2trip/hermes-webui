@@ -18,6 +18,7 @@ const _queuePendingIds={};  // sid -> optimistic ids not yet confirmed durable b
 const _queueDrainInFlight={};  // sid -> queue item id currently scheduled/sending
 const _queueDrainContext={};  // sid -> active drain context observed by send() error paths
 const _queueConsumedIds={};  // sid -> queue item ids already accepted by send(), awaiting/after backend ack
+const _queueConfirmedIds={};  // sid -> ids whose backend append was confirmed (missing later = deleted elsewhere)
 const _queueConsumedAckInFlight={};
 const QUEUE_CONSUMED_TOMBSTONE_MS=10*60*1000;
 const MAX_UPLOAD_BYTES=(window.__HERMES_CONFIG__&&window.__HERMES_CONFIG__.maxUploadBytes)||20*1024*1024;
@@ -172,7 +173,17 @@ function _getSessionQueue(sid, create=false){
       const raw=sessionStorage.getItem('hermes-queue-'+sid);
       if(raw){
         const stored=JSON.parse(raw);
-        if(Array.isArray(stored)&&stored.length) SESSION_QUEUES[sid]=stored.filter(Boolean);
+        if(Array.isArray(stored)&&stored.length){
+          // Assign synthetic ids to pre-upgrade entries (old schema had no
+          // id) so the id-based ack/merge machinery doesn't drop them.
+          SESSION_QUEUES[sid]=stored.filter(Boolean).map(item=>{
+            if(item&&typeof item==='object'&&!_queueItemId(item)){
+              const _id='q_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
+              return {...item,id:_id,_queue_id:_id};
+            }
+            return item;
+          });
+        }
       }
     }catch(_){try{sessionStorage.removeItem('hermes-queue-'+sid);}catch(__){}}
   }
@@ -197,12 +208,35 @@ function _queueClearPending(sid,itemOrId){
   delete _queuePendingIds[sid][id];
   if(!Object.keys(_queuePendingIds[sid]).length) delete _queuePendingIds[sid];
 }
+// Consumed-id tombstones are persisted to sessionStorage so a reload between
+// a drain's local ack and the backend shift cannot resurrect (and re-send) an
+// already-sent message when reconcile merges the backend copy back in.
+function _queueConsumedHydrate(sid){
+  if(!sid||_queueConsumedIds[sid]) return;
+  try{
+    const raw=sessionStorage.getItem('hermes-queue-consumed-'+sid);
+    if(raw){
+      const stored=JSON.parse(raw);
+      if(stored&&typeof stored==='object'&&!Array.isArray(stored)) _queueConsumedIds[sid]=stored;
+    }
+  }catch(_){try{sessionStorage.removeItem('hermes-queue-consumed-'+sid);}catch(__){}}
+}
+function _queueConsumedPersist(sid){
+  try{
+    const bucket=_queueConsumedIds[sid];
+    if(bucket&&Object.keys(bucket).length) sessionStorage.setItem('hermes-queue-consumed-'+sid,JSON.stringify(bucket));
+    else sessionStorage.removeItem('hermes-queue-consumed-'+sid);
+  }catch(_){}
+}
 function _queuePruneConsumed(sid){
+  _queueConsumedHydrate(sid);
   const bucket=_queueConsumedIds[sid];
   if(!bucket) return;
   const cutoff=Date.now()-QUEUE_CONSUMED_TOMBSTONE_MS;
-  Object.keys(bucket).forEach(id=>{if(bucket[id]<cutoff) delete bucket[id];});
+  let changed=false;
+  Object.keys(bucket).forEach(id=>{if(bucket[id]<cutoff){delete bucket[id];changed=true;}});
   if(!Object.keys(bucket).length) delete _queueConsumedIds[sid];
+  if(changed) _queueConsumedPersist(sid);
 }
 function _queueMarkConsumed(sid,itemOrId){
   const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
@@ -210,6 +244,7 @@ function _queueMarkConsumed(sid,itemOrId){
   _queuePruneConsumed(sid);
   if(!_queueConsumedIds[sid]) _queueConsumedIds[sid]={};
   _queueConsumedIds[sid][id]=Date.now();
+  _queueConsumedPersist(sid);
 }
 function _queueIsConsumed(sid,itemOrId){
   const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
@@ -217,14 +252,35 @@ function _queueIsConsumed(sid,itemOrId){
   _queuePruneConsumed(sid);
   return !!(_queueConsumedIds[sid]&&_queueConsumedIds[sid][id]);
 }
-function _queueAckBackend(sid,itemOrId){
+function _queueMarkConfirmed(sid,itemOrId){
+  const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
+  if(!sid||!id) return;
+  if(!_queueConfirmedIds[sid]) _queueConfirmedIds[sid]={};
+  _queueConfirmedIds[sid][id]=Date.now();
+}
+function _queueIsConfirmed(sid,itemOrId){
+  const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
+  if(!sid||!id) return false;
+  return !!(_queueConfirmedIds[sid]&&_queueConfirmedIds[sid][id]);
+}
+function _queueAckBackend(sid,itemOrId,attempt=0){
   const id=typeof itemOrId==='string'?itemOrId:_queueItemId(itemOrId);
   if(!sid||!id||typeof api!=='function') return Promise.resolve(false);
   const key=sid+':'+id;
   if(_queueConsumedAckInFlight[key]) return _queueConsumedAckInFlight[key];
   _queueConsumedAckInFlight[key]=api('/api/session/queue/shift',{method:'POST',body:JSON.stringify({session_id:sid,item_id:id}),timeoutMs:10000,timeoutToast:false})
     .then(()=>true)
-    .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Queued message sent; retrying queue acknowledgement',4000,'warning');return false;})
+    .catch(e=>{
+      // Retry with backoff: the local tombstone alone expires after
+      // QUEUE_CONSUMED_TOMBSTONE_MS, after which an unacked backend copy
+      // would resurface and re-send.
+      if(attempt<3){
+        setTimeout(()=>{void _queueAckBackend(sid,id,attempt+1);},4000*(attempt+1));
+      }else if(typeof showToast==='function'){
+        showToast(e&&e.message?e.message:'Queued message sent; queue acknowledgement keeps failing',4000,'warning');
+      }
+      return false;
+    })
     .finally(()=>{delete _queueConsumedAckInFlight[key];});
   return _queueConsumedAckInFlight[key];
 }
@@ -270,6 +326,9 @@ function _queuePreserveLocalFiles(sid, incoming){
 function _mergeBackendQueueWithPendingLocal(sid,backendQueue){
   const merged=[];
   _queuePreserveLocalFiles(sid,backendQueue).forEach(item=>{
+    // Anything the backend returns is durable — remember that so a later
+    // absence means "deleted elsewhere", not "append got lost".
+    _queueMarkConfirmed(sid,item);
     if(_queueIsConsumed(sid,item)){
       void _queueAckBackend(sid,item);
       return;
@@ -283,12 +342,33 @@ function _mergeBackendQueueWithPendingLocal(sid,backendQueue){
   local.forEach(item=>{
     const id=_queueItemId(item);
     if(id&&!seen[id]){
+      if(!pending[id]&&_queueIsConfirmed(sid,item)){
+        // The append was confirmed durable earlier and the backend no longer
+        // has it: it was removed in another tab (delete/steer/combine).
+        // Re-appending would undo that removal and auto-send the message.
+        return;
+      }
       merged.push(item);
       seen[id]=true;
       if(!pending[id]) _queueResyncMissingLocalItem(sid,item);
     }
   });
   return merged;
+}
+// Apply a backend POST echo (append/replace response) to the local queue:
+// honor consumed tombstones (the drain may have acked an item while the POST
+// was in flight) and preserve live File attachments.
+function _applyBackendQueueEcho(sid,queue){
+  const filtered=(Array.isArray(queue)?queue.filter(Boolean):[]).filter(item=>{
+    _queueMarkConfirmed(sid,item);
+    if(_queueIsConsumed(sid,item)){
+      void _queueAckBackend(sid,item);
+      return false;
+    }
+    return true;
+  });
+  _setSessionQueue(sid,_queuePreserveLocalFiles(sid,filtered));
+  updateQueueBadge(sid);
 }
 function _setSessionQueue(sid, queue){
   if(!sid) return [];
@@ -324,7 +404,7 @@ function _persistSessionQueue(sid, queue){
   const q=_setSessionQueue(sid,queue);
   if(typeof api==='function'){
     void api('/api/session/queue/replace',{method:'POST',body:JSON.stringify({session_id:sid,queue:q}),timeoutMs:10000,timeoutToast:false})
-      .then(r=>{if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,_queuePreserveLocalFiles(sid,r.queue));updateQueueBadge(sid);}})
+      .then(r=>{if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_applyBackendQueueEcho(sid,r.queue);}})
       .catch(e=>{if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued messages',4000,'error');});
   }
   return q.length;
@@ -352,7 +432,7 @@ function queueSessionMessage(sid, payload){
           if(typeof showToast==='function') showToast('Message queue is full — send or remove queued messages first',5000,'error');
           return;
         }
-        if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,_queuePreserveLocalFiles(sid,r.queue));updateQueueBadge(sid);}
+        if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_applyBackendQueueEcho(sid,r.queue);}
       })
       .catch(e=>{_queueClearPending(sid,entry);if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued message',4000,'error');});
   }
@@ -362,6 +442,25 @@ function peekQueuedSessionMessage(sid){
   const q=_getSessionQueue(sid,false);
   return q.length?q[0]:null;
 }
+// Drain selection: skip (don't head-of-line block on) items queued under a
+// different profile; they stay queued until the user switches back. The
+// mismatch toast fires once per item, not on every turn end.
+const _queueProfileMismatchToasted={};
+function _peekDrainableSessionMessage(sid){
+  const q=_getSessionQueue(sid,false);
+  for(const item of q){
+    if(item&&item.profile&&S.activeProfile&&item.profile!==S.activeProfile){
+      const key=sid+':'+(_queueItemId(item)||'noid');
+      if(!_queueProfileMismatchToasted[key]){
+        _queueProfileMismatchToasted[key]=true;
+        if(typeof showToast==='function') showToast('Queued message belongs to another profile; switch back before sending it.',3500,'warning');
+      }
+      continue;
+    }
+    return item||null;
+  }
+  return null;
+}
 async function ackQueuedSessionMessage(sid,itemOrId){
   const q=_getSessionQueue(sid,false);
   if(!q.length) return null;
@@ -370,6 +469,9 @@ async function ackQueuedSessionMessage(sid,itemOrId){
   if(idx<0) return null;
   const next=q[idx];
   const nextId=_queueItemId(next);
+  // Invalidate in-flight POST echoes: a response captured before this ack
+  // would otherwise restore the consumed item into the local queue.
+  _queueNextSeq(sid);
   _queueMarkConsumed(sid,next);
   _queueClearPending(sid,next);
   const current=_getSessionQueue(sid,false);
@@ -4484,14 +4586,16 @@ function renderChatTodoSurface(messages){
 async function _drainQueuedSessionMessage(sid,next){
   if(!sid||!next) return false;
   if(S.session&&S.session.session_id!==sid) return false;
-  const current=peekQueuedSessionMessage(sid);
+  // Never call send() while another turn is starting/running: its busy branch
+  // would re-queue the drained text as a NEW entry while the original stays
+  // queued — both copies would later auto-send. The item simply waits for the
+  // next setBusy(false) drain.
+  if(S.busy||(typeof _sendInProgress!=='undefined'&&_sendInProgress)) return false;
   const nextId=_queueItemId(next);
+  const liveQ=_getSessionQueue(sid,false);
+  const current=nextId?liveQ.find(item=>_queueItemId(item)===nextId):liveQ[0];
   if(!current) return false;
-  if(nextId&&_queueItemId(current)!==nextId) return false;
-  if(next.profile&&S.activeProfile&&next.profile!==S.activeProfile){
-    if(typeof showToast==='function') showToast('Queued message belongs to another profile; switch back before sending it.',3500,'warning');
-    return false;
-  }
+  if(next.profile&&S.activeProfile&&next.profile!==S.activeProfile) return false;
   $('msg').value=next.text||'';
   S.pendingFiles=Array.isArray(next.files)?[...next.files]:[];
   // Restore model from queued item (sent in /api/chat/start payload).
@@ -4536,7 +4640,7 @@ function setBusy(v){
     // Drain one queued message for the finished session after UI settles.
     // Never remove it before send() confirms /api/chat/start accepted it.
     const _isViewedSid=!S.session||sid===S.session.session_id;
-    const next=sid&&_isViewedSid&&!_queueDrainInFlight[sid]?peekQueuedSessionMessage(sid):null;
+    const next=sid&&_isViewedSid&&!_queueDrainInFlight[sid]?_peekDrainableSessionMessage(sid):null;
     if(next){
       const token=_queueItemId(next)||('idx_'+Date.now());
       _queueDrainInFlight[sid]=token;
@@ -4702,7 +4806,10 @@ function _renderQueueChips(sid){
         const liveQ=_getSessionQueue(sid,false);
         const first=snapshot.find(e=>e)||{};
         const firstFiles=(snapshot.find(e=>e&&Array.isArray(e.files)&&e.files.length)||{files:[]}).files;
-        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
+        // Stamp a client id like queueSessionMessage does — id-less entries
+        // cannot be acked/tombstoned and are dropped by the id-based merge.
+        const _mergedId='q_'+Date.now()+'_'+Math.random().toString(36).slice(2,8);
+        liveQ.length=0;liveQ.push({id:_mergedId,_queue_id:_mergedId,text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
         _persistSessionQueue(sid,liveQ);
         updateQueueBadge(sid);
       };

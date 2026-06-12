@@ -119,7 +119,10 @@ var _queueDrainSid = null;
 var _queueDrainInFlight = {};
 var _queueDrainContext = {};
 var _queueConsumedIds = {};
+var _queueConfirmedIds = {};
+var _queueProfileMismatchToasted = {};
 var _queueConsumedAckInFlight = {};
+var _sendInProgress = false;
 const QUEUE_CONSUMED_TOMBSTONE_MS = 10*60*1000;
 var S = {
   busy: true,
@@ -131,10 +134,13 @@ var S = {
 
 for (const name of [
   '_getSessionQueue', '_queueNextSeq', '_queueItemId', '_queueMarkPending', '_queueClearPending',
-  '_queuePruneConsumed', '_queueMarkConsumed', '_queueIsConsumed', '_queueAckBackend',
-  '_queueResyncMissingLocalItem', '_queuePreserveLocalFiles', '_mergeBackendQueueWithPendingLocal', '_setSessionQueue',
+  '_queueConsumedHydrate', '_queueConsumedPersist',
+  '_queuePruneConsumed', '_queueMarkConsumed', '_queueIsConsumed',
+  '_queueMarkConfirmed', '_queueIsConfirmed', '_queueAckBackend',
+  '_queueResyncMissingLocalItem', '_queuePreserveLocalFiles', '_mergeBackendQueueWithPendingLocal',
+  '_applyBackendQueueEcho', '_setSessionQueue',
   'reconcileSessionQueue', '_persistSessionQueue', 'queueSessionMessage',
-  'peekQueuedSessionMessage', 'ackQueuedSessionMessage', 'shiftQueuedSessionMessage',
+  'peekQueuedSessionMessage', '_peekDrainableSessionMessage', 'ackQueuedSessionMessage', 'shiftQueuedSessionMessage',
   'getQueuedSessionCount', '_drainQueuedSessionMessage', 'setBusy'
 ]) {
   eval(extractFunc(name));
