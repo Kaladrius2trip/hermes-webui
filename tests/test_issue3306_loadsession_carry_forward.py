@@ -31,7 +31,9 @@ def _load_session_clear_block() -> str:
 
 def _ensure_messages_loaded_body() -> str:
     start = SESSIONS_JS.index("async function _ensureMessagesLoaded")
-    return SESSIONS_JS[start: start + 3000]
+    # Widened again: lineage warm-progress polling (snapshot stitch UI)
+    # added ~1.4k chars at the top of the function.
+    return SESSIONS_JS[start: start + 5000]
 
 
 def test_pending_carry_forward_snapshot_declared_at_module_scope():

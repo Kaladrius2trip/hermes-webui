@@ -3623,6 +3623,10 @@ def _messages_start_with_visible_prefix(messages, prefix) -> bool:
 _LINEAGE_PREFIX_CACHE: dict = {}
 _LINEAGE_PREFIX_CACHE_MAX = 2
 _LINEAGE_PREFIX_CACHE_LOCK = threading.Lock()
+# Live progress of a cold lineage warm, keyed by the LIVE session id, so the
+# frontend can show "stitching snapshot N…" instead of a frozen loading state
+# while the first GET walks a long compression chain.
+_LINEAGE_WARM_PROGRESS: dict = {}
 
 
 def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) -> list:
@@ -3641,39 +3645,49 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
 
     with _LINEAGE_PREFIX_CACHE_LOCK:
         cached = _LINEAGE_PREFIX_CACHE.get(first_parent_id)
+    live_sid_for_progress = str(getattr(session, "session_id", "") or "")
     if cached is None:
-        segments = []
-        current = session
-        seen = {str(getattr(session, "session_id", "") or "")}
-        for _ in range(max(0, int(max_hops))):
-            parent_id = str(getattr(current, "parent_session_id", "") or "").strip()
-            if not parent_id or parent_id in seen or not is_safe_session_id(parent_id):
-                break
-            parent = Session.load(parent_id)
-            if not parent or not getattr(parent, "pre_compression_snapshot", False):
-                break
-            segments.append(parent)
-            seen.add(parent_id)
-            current = parent
+        try:
+            segments = []
+            current = session
+            seen = {str(getattr(session, "session_id", "") or "")}
+            for _ in range(max(0, int(max_hops))):
+                parent_id = str(getattr(current, "parent_session_id", "") or "").strip()
+                if not parent_id or parent_id in seen or not is_safe_session_id(parent_id):
+                    break
+                _LINEAGE_WARM_PROGRESS[live_sid_for_progress] = {
+                    "state": "loading", "done": len(segments) + 1,
+                }
+                parent = Session.load(parent_id)
+                if not parent or not getattr(parent, "pre_compression_snapshot", False):
+                    break
+                segments.append(parent)
+                seen.add(parent_id)
+                current = parent
 
-        if not segments:
-            cached = {"prefix": [], "nearest_parent_messages": []}
-        else:
-            merged_prefix = []
-            for segment in reversed(segments):
-                merged_prefix = merge_session_messages_append_only(
-                    merged_prefix,
-                    getattr(segment, "messages", []) or [],
-                    truncation_watermark=getattr(segment, "truncation_watermark", None),
-                )
-            cached = {
-                "prefix": merged_prefix,
-                "nearest_parent_messages": list(getattr(segments[0], "messages", []) or []),
-            }
-        with _LINEAGE_PREFIX_CACHE_LOCK:
-            while len(_LINEAGE_PREFIX_CACHE) >= _LINEAGE_PREFIX_CACHE_MAX:
-                _LINEAGE_PREFIX_CACHE.pop(next(iter(_LINEAGE_PREFIX_CACHE)), None)
-            _LINEAGE_PREFIX_CACHE[first_parent_id] = cached
+            if not segments:
+                cached = {"prefix": [], "nearest_parent_messages": []}
+            else:
+                merged_prefix = []
+                for idx, segment in enumerate(reversed(segments)):
+                    _LINEAGE_WARM_PROGRESS[live_sid_for_progress] = {
+                        "state": "merging", "done": idx + 1, "total": len(segments),
+                    }
+                    merged_prefix = merge_session_messages_append_only(
+                        merged_prefix,
+                        getattr(segment, "messages", []) or [],
+                        truncation_watermark=getattr(segment, "truncation_watermark", None),
+                    )
+                cached = {
+                    "prefix": merged_prefix,
+                    "nearest_parent_messages": list(getattr(segments[0], "messages", []) or []),
+                }
+            with _LINEAGE_PREFIX_CACHE_LOCK:
+                while len(_LINEAGE_PREFIX_CACHE) >= _LINEAGE_PREFIX_CACHE_MAX:
+                    _LINEAGE_PREFIX_CACHE.pop(next(iter(_LINEAGE_PREFIX_CACHE)), None)
+                _LINEAGE_PREFIX_CACHE[first_parent_id] = cached
+        finally:
+            _LINEAGE_WARM_PROGRESS.pop(live_sid_for_progress, None)
 
     if not cached["prefix"]:
         return session_messages
@@ -6236,6 +6250,16 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/session/compress/status":
         query = parse_qs(parsed.query)
         _handle_session_compress_status(handler, query.get("session_id", [""])[0])
+        return True
+
+    if parsed.path == "/api/session/lineage_status":
+        # Cheap dict lookup only — polled by the frontend while a session GET
+        # is warming a long compression-snapshot chain, so the loading screen
+        # can show "stitching snapshot N…" instead of appearing frozen.
+        query = parse_qs(parsed.query)
+        sid = (query.get("session_id", [""])[0] or "").strip()
+        progress = _LINEAGE_WARM_PROGRESS.get(sid) if sid else None
+        j(handler, progress or {"state": "idle"})
         return True
 
 

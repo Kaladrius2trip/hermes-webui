@@ -1903,9 +1903,32 @@ async function _ensureMessagesLoaded(sid) {
   // omits it to keep its raw transport cap.
   const expandParam = reloadLimit ? '&expand_renderable=1' : '';
   let data;
+  // While the server warms a long compression-snapshot chain (first open
+  // after a restart), surface live progress in the loading placeholder
+  // instead of an apparently frozen screen.
+  let _lineagePollTimer = null;
+  const _lineagePoll = async () => {
+    try {
+      const st = await api(`/api/session/lineage_status?session_id=${encodeURIComponent(sid)}`, {timeoutMs: 4000, timeoutToast: false});
+      if (_loadingSessionId !== sid) return;
+      const inner = $('msgInner');
+      const target = inner && inner.querySelector('div');
+      if (target && st && st.state && st.state !== 'idle') {
+        target.textContent = st.state === 'merging'
+          ? `${t('lineage_merging') || 'Merging compressed history'}… ${st.done}/${st.total}`
+          : `${t('lineage_loading') || 'Loading compressed history snapshots'}… ${st.done}`;
+      }
+    } catch(_) {}
+    if (_lineagePollTimer !== null) _lineagePollTimer = setTimeout(_lineagePoll, 900);
+  };
+  const _lineageDelay = setTimeout(() => { _lineagePollTimer = setTimeout(_lineagePoll, 0); }, 1500);
   try {
-    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`);
+    // 120s: first open after a server restart may stitch a long snapshot
+    // chain server-side; the lineage poll above keeps the user informed.
+    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`, {timeoutMs: 120000});
   } finally {
+    clearTimeout(_lineageDelay);
+    if (_lineagePollTimer !== null) { clearTimeout(_lineagePollTimer); _lineagePollTimer = null; }
     _clearSameSessionForceReloadHint(sid);
   }
   // Guard: api() may have redirected (401) and returned undefined.
