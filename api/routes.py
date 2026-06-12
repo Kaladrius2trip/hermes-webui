@@ -3681,11 +3681,30 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
     # already self-contained — return them as-is (pre-cache behavior).
     if _messages_start_with_visible_prefix(session_messages, cached["nearest_parent_messages"]):
         return session_messages
-    return merge_session_messages_append_only(
+    # Incremental tail merge: the UI only ever needs a window of the merged
+    # transcript per request, so re-merging the live messages onto a 50k-row
+    # prefix on EVERY GET is wasted work. The merged result only changes when
+    # the live session changes — fingerprint it (sid, count, last timestamp)
+    # and recompute once per new turn instead of once per request.
+    live_sid = str(getattr(session, "session_id", "") or "")
+    last = session_messages[-1] if session_messages else None
+    fingerprint = (
+        live_sid,
+        len(session_messages),
+        (last or {}).get("timestamp") if isinstance(last, dict) else None,
+        (last or {}).get("_ts") if isinstance(last, dict) else None,
+    )
+    merged_entry = cached.get("merged")
+    if merged_entry and merged_entry.get("fingerprint") == fingerprint:
+        return list(merged_entry["messages"])
+    merged = merge_session_messages_append_only(
         list(cached["prefix"]),
         session_messages,
         truncation_watermark=None,
     )
+    with _LINEAGE_PREFIX_CACHE_LOCK:
+        cached["merged"] = {"fingerprint": fingerprint, "messages": merged}
+    return list(merged)
 
 
 def _merged_session_messages_for_display(session, cli_messages=None) -> list:

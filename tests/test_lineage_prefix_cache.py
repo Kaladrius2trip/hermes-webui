@@ -46,3 +46,36 @@ def test_no_snapshot_parent_returns_child_messages(monkeypatch):
     child = _sess("c", parent="p1", msgs=[{"role": "user", "content": "only"}])
 
     assert [m["content"] for m in routes._webui_sidecar_lineage_messages_for_display(child)] == ["only"]
+
+
+def test_full_merge_reused_until_live_session_changes(monkeypatch):
+    routes._LINEAGE_PREFIX_CACHE.clear()
+    chain = {"p1": _sess("p1", msgs=[{"role": "user", "content": "old", "timestamp": 1}], snapshot=True)}
+    monkeypatch.setattr(routes.Session, "load", staticmethod(lambda sid: chain.get(sid)))
+
+    merges = []
+    real_merge = routes.merge_session_messages_append_only
+
+    def counting_merge(*a, **k):
+        merges.append(1)
+        return real_merge(*a, **k)
+
+    monkeypatch.setattr(routes, "merge_session_messages_append_only", counting_merge)
+
+    child = _sess("c", parent="p1", msgs=[{"role": "user", "content": "new", "timestamp": 5}])
+    first = routes._webui_sidecar_lineage_messages_for_display(child)
+    baseline = len(merges)
+    second = routes._webui_sidecar_lineage_messages_for_display(child)
+    assert len(merges) == baseline  # unchanged session: no re-merge
+    assert second == first
+
+    # New turn -> fingerprint changes -> exactly one incremental re-merge.
+    child.messages = child.messages + [{"role": "assistant", "content": "reply", "timestamp": 6}]
+    third = routes._webui_sidecar_lineage_messages_for_display(child)
+    assert len(merges) == baseline + 1
+    assert [m["content"] for m in third] == ["old", "new", "reply"]
+
+    # Returned list is a defensive copy — caller mutation must not poison cache.
+    third.append({"role": "user", "content": "mutant"})
+    fourth = routes._webui_sidecar_lineage_messages_for_display(child)
+    assert [m["content"] for m in fourth] == ["old", "new", "reply"]
