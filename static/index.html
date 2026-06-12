@@ -662,7 +662,7 @@
               </button>
             </div>
             <div class="composer-todo-wrap" id="composerTodoWrap" style="display:none">
-              <button class="composer-todo-chip" id="composerTodoChip" type="button" onclick="toggleTodoDropdown()" title="Current task list" data-i18n-title="tab_todos">
+              <button class="composer-todo-chip" id="composerTodoChip" type="button" onclick="openWorkspaceTodos()" title="Current task list" data-i18n-title="tab_todos">
                 <span class="composer-todo-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="6" height="6" rx="1"/><path d="m3 17 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></svg></span>
                 <span class="composer-todo-label" id="composerTodoLabel"></span>
                 <span class="composer-todo-chevron" aria-hidden="true"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
@@ -731,7 +731,6 @@
           </div>
           <div class="profile-dropdown" id="profileDropdown"></div>
           <div class="ws-dropdown ws-dropdown-footer" id="composerWsDropdown"></div>
-          <div class="composer-todo-dropdown" id="composerTodoDropdown" role="menu" aria-label="Current task list"></div>
           <div class="composer-reasoning-dropdown" id="composerReasoningDropdown">
             <!-- #2697 — scope picker: write target for the effort options below.
                  'session' writes /api/session/reasoning (no profile change);
@@ -1465,10 +1464,12 @@
     <div class="workspace-panel-tabs" role="tablist" aria-label="Workspace panel views">
       <button class="workspace-panel-tab active" id="workspaceFilesTab" type="button" onclick="switchWorkspacePanelTab('files')" role="tab" aria-selected="true">Files</button>
       <button class="workspace-panel-tab" id="workspaceArtifactsTab" type="button" onclick="switchWorkspacePanelTab('artifacts')" role="tab" aria-selected="false">Artifacts <span id="workspaceArtifactsCount" class="workspace-artifacts-count">0</span></button>
+      <button class="workspace-panel-tab" id="workspaceTodosTab" type="button" onclick="switchWorkspacePanelTab('todos')" role="tab" aria-selected="false">Todos <span id="workspaceTodosCount" class="workspace-artifacts-count" hidden>0</span></button>
     </div>
     <div class="breadcrumb-bar" id="breadcrumbBar" style="display:none"></div>
     <div class="file-tree" id="fileTree"></div>
     <div class="workspace-artifacts" id="workspaceArtifacts" hidden></div>
+    <div class="workspace-todos" id="workspaceTodos" hidden></div>
     <div id="wsEmptyState" style="display:none;flex:1;align-items:center;justify-content:center;padding:24px 16px;text-align:center;color:var(--muted);font-size:12px;line-height:1.6"></div>
     <div class="preview-area" id="previewArea">
       <div class="preview-path" id="previewPath">

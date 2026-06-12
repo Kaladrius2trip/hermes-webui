@@ -4716,38 +4716,54 @@ function _todoSourceMessages(){
     : S.messages;
 }
 
-// ── Todo chip + popover (chat-adjacent menu) ───────────────────────────────
-// The full todo list lives in a composer-anchored popover (same pattern as
-// the reasoning/toolsets chips) so checking progress never leaves the chat.
-// Data source is identical to the chat todo surface: the latest todo tool
-// state from the transcript, refreshed live by the todo_state SSE listener.
+// ── Todo chip + Workspace-sidebar Todos tab ────────────────────────────────
+// The full todo list lives as a passive vertical tab in the right Workspace
+// sidebar — always visible alongside the chat without touching its layout.
+// The composer chip is a live progress indicator; clicking it opens the
+// sidebar on the Todos tab. Data source: the latest todo tool state from the
+// transcript, refreshed live by the todo_state SSE flow.
+
+let _workspaceTodosState=null;
 
 function syncTodoChip(state){
+  _workspaceTodosState=state||null;
   const wrap=$('composerTodoWrap');
   const label=$('composerTodoLabel');
-  if(!wrap||!label) return;
-  if(!state||!state.found||!Array.isArray(state.todos)||!state.todos.length){
-    wrap.style.display='none';
-    closeTodoDropdown();
-    return;
+  const tabCount=$('workspaceTodosCount');
+  const hasTodos=!!(state&&state.found&&Array.isArray(state.todos)&&state.todos.length);
+  if(tabCount){
+    tabCount.hidden=!hasTodos;
+    if(hasTodos){
+      const c=_todoStatusCounts(state.todos);
+      tabCount.textContent=c.active>0?String(c.active):'✓';
+    }
   }
-  const counts=_todoStatusCounts(state.todos);
-  wrap.style.display='';
-  label.textContent=counts.active>0
-    ? `${counts.total-counts.active}/${counts.total}`
-    : `✓ ${counts.total}`;
-  const chip=$('composerTodoChip');
-  if(chip) chip.classList.toggle('all-done',counts.active===0);
-  if($('composerTodoDropdown')&&$('composerTodoDropdown').classList.contains('open')){
-    renderTodoDropdown(state);
+  if(wrap&&label){
+    if(!hasTodos){
+      wrap.style.display='none';
+    }else{
+      const counts=_todoStatusCounts(state.todos);
+      wrap.style.display='';
+      label.textContent=counts.active>0
+        ? `${counts.total-counts.active}/${counts.total}`
+        : `✓ ${counts.total}`;
+      const chip=$('composerTodoChip');
+      if(chip) chip.classList.toggle('all-done',counts.active===0);
+    }
   }
+  const host=$('workspaceTodos');
+  if(host&&!host.hidden) renderWorkspaceTodos();
 }
 
-function renderTodoDropdown(state){
-  const dd=$('composerTodoDropdown');
-  if(!dd) return;
-  state=state||_latestTodoToolState(_todoSourceMessages());
+function renderWorkspaceTodos(){
+  const host=$('workspaceTodos');
+  if(!host) return;
+  const state=_workspaceTodosState||_latestTodoToolState(_todoSourceMessages());
   const todos=(state&&state.found&&Array.isArray(state.todos))?state.todos:[];
+  if(!todos.length){
+    host.innerHTML=`<div class="todo-menu-empty">${esc(t('todos_no_active')||'No active todos')}</div>`;
+    return;
+  }
   const counts=_todoStatusCounts(todos);
   const rows=todos.map(item=>{
     const status=_todoStatusClass(item&&item.status);
@@ -4756,116 +4772,38 @@ function renderTodoDropdown(state){
       `<span class="todo-menu-dot" aria-hidden="true"></span>`+
       `<span class="todo-menu-text">${esc(text)}</span></div>`;
   }).join('');
-  dd.innerHTML=`<div class="todo-menu-head">`+
+  host.innerHTML=`<div class="todo-menu-head">`+
       `<span class="todo-menu-title">${esc(t('current_task_list')||'Current task list')}</span>`+
       `<span class="todo-menu-summary">${esc(_chatTodoSummaryText(counts))}</span>`+
     `</div>`+
-    `<div class="todo-menu-list">${rows||`<div class="todo-menu-empty">${esc(t('todos_no_active')||'No active todos')}</div>`}</div>`;
+    `<div class="todo-menu-list todo-menu-list--sidebar">${rows}</div>`;
 }
 
-function toggleTodoDropdown(){
-  const dd=$('composerTodoDropdown');
-  const chip=$('composerTodoChip');
-  if(!dd||!chip) return;
-  if(dd.classList.contains('open')){closeTodoDropdown();return;}
-  if(typeof closeProfileDropdown==='function') closeProfileDropdown();
-  if(typeof closeWsDropdown==='function') closeWsDropdown();
-  if(typeof closeModelDropdown==='function') closeModelDropdown();
-  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
-  if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();
-  renderTodoDropdown();
-  dd.classList.add('open');
-  _positionTodoDropdown();
-  chip.classList.add('active');
-}
-
-function _positionTodoDropdown(){
-  const dd=$('composerTodoDropdown');
-  const chip=$('composerTodoChip');
-  const footer=document.querySelector('.composer-footer');
-  if(!dd||!chip||!footer) return;
-  const chipRect=chip.getBoundingClientRect();
-  const footerRect=footer.getBoundingClientRect();
-  let left=chipRect.left-footerRect.left;
-  const maxLeft=Math.max(0,footer.clientWidth-dd.offsetWidth);
-  left=Math.max(0,Math.min(left,maxLeft));
-  dd.style.left=`${left}px`;
-}
-
-function closeTodoDropdown(){
-  const dd=$('composerTodoDropdown');
-  const chip=$('composerTodoChip');
-  if(dd) dd.classList.remove('open');
-  if(chip) chip.classList.remove('active');
-}
-
-document.addEventListener('click',function(e){
-  if(
-    !e.target.closest('#composerTodoChip') &&
-    !e.target.closest('#composerTodoDropdown') &&
-    !e.target.closest('.chat-todo-open')
-  ) closeTodoDropdown();
-});
-
-// Rail/mobile Todos tab: open the chat-adjacent menu instead of a separate
-// panel — return to the chat first when another panel is active.
-function openTodoMenuFromRail(){
+// Open the right Workspace sidebar on the Todos tab (chip, rail and mobile
+// Todos entries all land here).
+function openWorkspaceTodos(){
   try{
     if(typeof switchPanel==='function'&&typeof _currentPanel!=='undefined'&&_currentPanel&&_currentPanel!=='chat'){
       switchPanel('chat');
     }
   }catch(_){}
-  setTimeout(function(){
-    const wrap=$('composerTodoWrap');
-    if(wrap&&wrap.style.display==='none'){
-      if(typeof showToast==='function') showToast(t('todos_no_active')||'No active todos');
-      return;
-    }
-    toggleTodoDropdown();
-  },60);
+  if(typeof toggleWorkspacePanel==='function') toggleWorkspacePanel(true);
+  if(typeof switchWorkspacePanelTab==='function') switchWorkspacePanelTab('todos');
+}
+
+function openTodoMenuFromRail(){
+  openWorkspaceTodos();
 }
 
 function renderChatTodoSurface(messages){
-  const host=$('chatTodoSurface');
-  if(!host) return;
+  // The in-chat horizontal todo card is retired: the list now lives in the
+  // Workspace sidebar's Todos tab (passive, vertical, scrollable) with the
+  // composer chip as the live progress indicator. This function remains the
+  // single update entry point for the todo_state flow.
   const state=_latestTodoToolState(Array.isArray(messages)?messages:_todoSourceMessages());
   if(typeof syncTodoChip==='function') syncTodoChip(state);
-  if(!state.found){
-    host.hidden=true;
-    host.innerHTML='';
-    return;
-  }
-  const todos=Array.isArray(state.todos)?state.todos:[];
-  const counts=_todoStatusCounts(todos);
-  const preferred=counts.active>0
-    ? todos.filter(item=>{
-        const status=String(item&&item.status||'').trim().toLowerCase();
-        return status==='pending'||status==='in_progress';
-      })
-    : todos;
-  const shown=preferred.slice(0,4);
-  const itemHtml=shown.map(item=>{
-    const status=_todoStatusClass(item&&item.status);
-    const text=String((item&&item.content)||(item&&item.id)||'Todo').trim()||'Todo';
-    return `<span class="chat-todo-item chat-todo-item-status-${esc(status)}" title="${esc(text)}"><span class="chat-todo-item-dot"></span><span class="chat-todo-item-text">${esc(text)}</span></span>`;
-  }).join('');
-  const moreCount=Math.max(0, preferred.length-shown.length);
-  const moreHtml=moreCount?`<span class="chat-todo-more">+${moreCount} more</span>`:'';
-  const emptyHtml=!todos.length?`<span class="chat-todo-empty">${esc(t('todos_no_active')||'No active todos')}</span>`:'';
-  const doneClass=counts.total&&counts.active===0?' chat-todo-card-done':'';
-  host.innerHTML=`
-    <div class="chat-todo-card${doneClass}">
-      <span class="chat-todo-icon" aria-hidden="true">${li('list-todo',14)}</span>
-      <div class="chat-todo-body">
-        <div class="chat-todo-head">
-          <span class="chat-todo-title">${esc(t('current_task_list')||'Current task list')}</span>
-          <span class="chat-todo-summary">${esc(_chatTodoSummaryText(counts))}</span>
-        </div>
-        <div class="chat-todo-items">${itemHtml}${moreHtml}${emptyHtml}</div>
-      </div>
-      <button type="button" class="chat-todo-open" onclick="toggleTodoDropdown()">Open</button>
-    </div>`;
-  host.hidden=false;
+  const host=$('chatTodoSurface');
+  if(host){host.hidden=true;host.innerHTML='';}
 }
 
 async function _drainQueuedSessionMessage(sid,next){

@@ -150,7 +150,7 @@ function _restoreWorkspacePanelActiveTab(){
   if(!key){_workspacePanelActiveTab='files';return;}
   try{
     const raw=localStorage.getItem(key);
-    _workspacePanelActiveTab = raw==='artifacts' ? 'artifacts' : 'files';
+    _workspacePanelActiveTab = (raw==='artifacts'||raw==='todos') ? raw : 'files';
   }catch(e){_workspacePanelActiveTab='files';}
 }
 
@@ -168,22 +168,25 @@ if(typeof document !== 'undefined'){
 }
 
 function switchWorkspacePanelTab(tab){
-  _workspacePanelActiveTab = tab === 'artifacts' ? 'artifacts' : 'files';
+  _workspacePanelActiveTab = (tab === 'artifacts' || tab === 'todos') ? tab : 'files';
   _saveWorkspacePanelActiveTab();
   _setWorkspacePanelTabDataset();
-  const filesTab = $('workspaceFilesTab');
-  const artifactsTab = $('workspaceArtifactsTab');
-  if(filesTab){
-    filesTab.classList.toggle('active', _workspacePanelActiveTab === 'files');
-    filesTab.setAttribute('aria-selected', _workspacePanelActiveTab === 'files' ? 'true' : 'false');
-  }
-  if(artifactsTab){
-    artifactsTab.classList.toggle('active', _workspacePanelActiveTab === 'artifacts');
-    artifactsTab.setAttribute('aria-selected', _workspacePanelActiveTab === 'artifacts' ? 'true' : 'false');
+  const tabs = {
+    files: $('workspaceFilesTab'),
+    artifacts: $('workspaceArtifactsTab'),
+    todos: $('workspaceTodosTab'),
+  };
+  for (const [name, btn] of Object.entries(tabs)){
+    if(!btn) continue;
+    btn.classList.toggle('active', _workspacePanelActiveTab === name);
+    btn.setAttribute('aria-selected', _workspacePanelActiveTab === name ? 'true' : 'false');
   }
   const artifacts = $('workspaceArtifacts');
   if(artifacts) artifacts.hidden = _workspacePanelActiveTab !== 'artifacts';
+  const todos = $('workspaceTodos');
+  if(todos) todos.hidden = _workspacePanelActiveTab !== 'todos';
   if(_workspacePanelActiveTab === 'artifacts') renderSessionArtifacts();
+  if(_workspacePanelActiveTab === 'todos' && typeof renderWorkspaceTodos === 'function') renderWorkspaceTodos();
 }
 
 const ARTIFACT_IGNORE_RE = /(^|\/)(?:\.git|\.hg|\.svn|node_modules|\.venv|venv|__pycache__|dist|build|\.next|\.cache)(?:\/|$)/;

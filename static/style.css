@@ -4743,6 +4743,8 @@ main.main > .main-view:not([id="mainChat"]):not([id="mainSettings"]) .main-view-
 .rightpanel[data-active-tab="artifacts"] .breadcrumb-bar,.rightpanel[data-active-tab="artifacts"] .file-tree,.rightpanel[data-active-tab="artifacts"] #wsEmptyState{display:none!important;}
 .rightpanel[data-active-tab="artifacts"] .workspace-artifacts{display:block;}
 .rightpanel[data-active-tab="files"] .workspace-artifacts{display:none!important;}
+.rightpanel[data-active-tab="todos"] .breadcrumb-bar,.rightpanel[data-active-tab="todos"] .file-tree,.rightpanel[data-active-tab="todos"] #wsEmptyState,.rightpanel[data-active-tab="todos"] .workspace-artifacts,.rightpanel[data-active-tab="todos"] .preview-area{display:none!important;}
+.rightpanel[data-active-tab="todos"] .workspace-todos{display:flex;}
 .cron-run-usage-strip{display:inline-flex;align-items:center;gap:4px;margin-left:8px;color:var(--text-secondary);font-size:11px;opacity:.72;white-space:nowrap;}
 .cron-run-usage-footer{display:flex;margin:8px 0 0 0;padding-top:8px;border-top:1px solid var(--border-subtle);}
 .cron-item.active,.ws-row.active,.profile-card.active{background:var(--accent-bg);}
@@ -5518,8 +5520,9 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 .composer-todo-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;border:1px solid var(--border2);background:var(--input-bg);color:var(--muted);font-size:11px;cursor:pointer;white-space:nowrap;}
 .composer-todo-chip:hover,.composer-todo-chip.active{color:var(--text);border-color:var(--accent-bg-strong,var(--border2));}
 .composer-todo-chip.all-done{color:#39c065;}
-.composer-todo-dropdown{display:none;position:absolute;bottom:calc(100% + 4px);left:0;min-width:260px;max-width:360px;background:var(--surface);border:1px solid var(--border2);border-radius:10px;box-shadow:0 -4px 24px rgba(0,0,0,.4);z-index:200;padding:6px;overflow:hidden;}
-.composer-todo-dropdown.open{display:block;}
+.workspace-todos{display:none;flex:1;flex-direction:column;min-height:0;overflow:hidden;padding:6px 8px;}
+.workspace-todos .todo-menu-head{padding:4px 6px 8px;}
+.workspace-todos .todo-menu-list--sidebar{max-height:none;flex:1;overflow-y:auto;}
 .todo-menu-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 8px 6px;border-bottom:1px solid var(--border);}
 .todo-menu-title{font-size:11px;font-weight:600;color:var(--text);}
 .todo-menu-summary{font-size:10px;color:var(--muted);white-space:nowrap;}

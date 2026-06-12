@@ -1,8 +1,9 @@
-"""Tests for the chat-adjacent Todos menu (chip + popover).
+"""Tests for the chat-adjacent Todos surface.
 
-Todos moved from a separate panel into a composer-anchored popover so
-checking progress never leaves the chat. The rail/mobile Todos tabs open
-the same menu instead of switching panels.
+Todos live as a passive vertical tab in the right Workspace sidebar; the
+composer chip is a live progress indicator that opens that tab. The old
+horizontal in-chat card and the popover are retired. Rail/mobile Todos
+entries open the same sidebar tab.
 """
 
 import json
@@ -19,20 +20,40 @@ STYLE_CSS = (REPO_ROOT / "static" / "style.css").read_text(encoding="utf-8")
 NODE = shutil.which("node")
 
 
+WORKSPACE_JS = (REPO_ROOT / "static" / "workspace.js").read_text(encoding="utf-8")
+
+
 class TestMarkup:
-    def test_chip_and_dropdown_present(self):
+    def test_chip_present_and_opens_sidebar_tab(self):
         assert 'id="composerTodoWrap"' in INDEX_HTML
         assert 'id="composerTodoChip"' in INDEX_HTML
-        assert 'id="composerTodoDropdown"' in INDEX_HTML
+        assert 'onclick="openWorkspaceTodos()"' in INDEX_HTML
+        # popover retired
+        assert 'composerTodoDropdown' not in INDEX_HTML
 
-    def test_rail_tabs_open_menu_not_panel(self):
+    def test_workspace_sidebar_has_todos_tab(self):
+        assert 'id="workspaceTodosTab"' in INDEX_HTML
+        assert 'id="workspaceTodos"' in INDEX_HTML
+        assert 'id="workspaceTodosCount"' in INDEX_HTML
+        assert "switchWorkspacePanelTab('todos')" in INDEX_HTML
+
+    def test_tab_switcher_supports_todos(self):
+        assert "tab === 'todos'" in WORKSPACE_JS
+        assert "renderWorkspaceTodos" in WORKSPACE_JS
+        assert "raw==='todos'" in WORKSPACE_JS  # localStorage restore
+
+    def test_rail_tabs_open_sidebar_not_panel(self):
         assert "openTodoMenuFromRail()" in INDEX_HTML
         assert "switchPanel('todos',{fromRailClick:true})" not in INDEX_HTML
 
-    def test_chat_surface_open_button_opens_popover(self):
-        assert 'class="chat-todo-open" onclick="toggleTodoDropdown()"' in UI_JS
+    def test_in_chat_horizontal_card_retired(self):
+        # renderChatTodoSurface now only feeds the chip/sidebar and keeps the
+        # legacy host hidden — no horizontal card markup is produced.
+        assert 'class="chat-todo-open"' not in UI_JS
+        assert 'host.hidden=true' in UI_JS
 
-    def test_css_uses_underscored_status_class(self):
+    def test_css_rules_for_sidebar_tab(self):
+        assert '.rightpanel[data-active-tab="todos"] .workspace-todos{display:flex;}' in STYLE_CSS
         assert ".todo-menu-item-status-in_progress" in STYLE_CSS
 
 
@@ -58,12 +79,12 @@ function el(){
   return {style:{},textContent:'',innerHTML:'',hidden:false,
     classList:{_s:new Set(),add(c){this._s.add(c);},remove(c){this._s.delete(c);},toggle(c,v){v?this._s.add(c):this._s.delete(c);},contains(c){return this._s.has(c);}}};
 }
-const els={composerTodoWrap:el(),composerTodoLabel:el(),composerTodoChip:el(),composerTodoDropdown:el()};
+const els={composerTodoWrap:el(),composerTodoLabel:el(),composerTodoChip:el(),workspaceTodos:el(),workspaceTodosCount:el()};
+els.workspaceTodos.hidden=true;
 function $(id){return els[id]||null;}
 function esc(x){return String(x);}
 function t(){return '';}
-function closeTodoDropdown(){els.composerTodoDropdown.classList.remove('open');}
-function renderTodoDropdown(){}
+function renderWorkspaceTodos(){}
 
 eval(extractFunc('_todoStatusCounts'));
 eval(extractFunc('syncTodoChip'));
