@@ -110,16 +110,54 @@ def test_default_cost_protection_tolerates_routine_diagnostic_tool_errors():
 
 
 def test_default_cost_protection_pauses_on_repeated_tool_error_pattern():
+    """Production wiring: each identical failing call arrives once via the
+    tool_complete callback (with a unique tool_call_id and parsed-dict args)
+    and once via record_step's prev_tools batch (with JSON-string args).
+    The repeats must accumulate toward tool_error_threshold and must not be
+    double-counted across the two report streams."""
+    guard = CostProtectionGuard(session_id="sid", stream_id="stream")
+    payload = None
+    for step in range(1, 4):
+        guard.record_tool_complete(
+            tool_call_id=f"call_{step}",
+            name="terminal",
+            arguments={"command": "retry-the-same-failing-probe"},
+            is_error=True,
+            result="Error: same failure",
+        )
+        payload = guard.record_step(
+            step,
+            prev_tools=[{
+                "name": "terminal",
+                "arguments": '{"command": "retry-the-same-failing-probe"}',
+                "result": "Error: same failure",
+                "is_error": True,
+            }],
+        )
+        if payload is not None:
+            break
+
+    assert payload is not None
+    assert payload["reason"] == "repeated_tool_errors"
+    assert payload["stats"]["repeated_tool_error_count"] == 3
+    assert payload["stats"]["tool_calls"] == 3
+    assert payload["stats"]["tool_errors"] == 3
+
+
+def test_default_cost_protection_pauses_on_repeated_errors_without_callback():
+    """Fallback wiring (no tool_complete callback): the same failing batch
+    reported through prev_tools on consecutive steps still accumulates."""
     guard = CostProtectionGuard(session_id="sid", stream_id="stream")
     tool = {
         "name": "terminal",
-        "arguments": {"command": "retry-the-same-failing-probe"},
+        "arguments": '{"command": "retry-the-same-failing-probe"}',
         "result": {"is_error": True, "output": "same failure"},
+        "is_error": True,
     }
 
     assert guard.record_step(1, prev_tools=[dict(tool)]) is None
-    assert guard.record_step(2, prev_tools=[dict(tool), dict(tool)]) is None
-    payload = guard.record_step(3, prev_tools=[dict(tool), dict(tool), dict(tool)])
+    assert guard.record_step(2, prev_tools=[dict(tool)]) is None
+    payload = guard.record_step(3, prev_tools=[dict(tool)])
 
     assert payload is not None
     assert payload["reason"] == "repeated_tool_errors"

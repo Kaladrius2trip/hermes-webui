@@ -170,18 +170,24 @@ def test_adaptive_title_refresh_uses_recent_configured_exchange_window(monkeypat
     assert "Latest exchange Assistant: Recent answer four" in assistant_context
 
 
-def test_force_title_route_rejects_sessions_without_complete_exchange(tmp_path, monkeypatch):
+def test_force_title_route_titles_sessions_without_assistant_reply(tmp_path, monkeypatch):
+    """Upstream contract (audit streaming-005): a session whose assistant turn
+    errored, is tool-call-only, or hasn't answered yet must still be titleable
+    from the user text alone instead of 422 empty_assistant_message."""
     _isolate_session_store(tmp_path, monkeypatch)
-    session = _session(title="Untitled", messages=[{"role": "user", "content": "Only user so far"}])
+    session = _session(
+        title="Untitled",
+        messages=[{"role": "user", "content": "Refactor the websocket reconnect backoff logic"}],
+    )
     captured = _capture_post(monkeypatch, {"session_id": session.session_id})
 
     assert routes.handle_post(object(), SimpleNamespace(path="/api/session/title/refresh")) is True
 
-    assert captured["status"] == 422
-    assert "empty_assistant_message" in captured["payload"]["error"]
+    assert captured["status"] == 200
+    assert captured["payload"].get("title")
     saved = Session.load(session.session_id)
     assert saved is not None
-    assert saved.title == "Untitled"
+    assert saved.title == captured["payload"]["title"]
 
 
 def test_force_title_route_rejects_duplicate_inflight_request(tmp_path, monkeypatch):

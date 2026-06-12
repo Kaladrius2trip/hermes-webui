@@ -91,6 +91,18 @@ def _record_pending_steer(stream_id: str, session_id: str, text: str) -> list[di
         return []
     cleaned = str(text or "").strip()
     now = time.time()
+    # Re-check liveness under STREAMS_LOCK (taken before
+    # STREAM_PENDING_STEERS_LOCK, same order as the terminal cleanup): if the
+    # stream's finally block or cancel_stream ran between agent.steer() and
+    # this record, inserting now would leak an entry keyed by a dead stream id
+    # for the process lifetime — nothing sweeps entries for dead streams.
+    with STREAMS_LOCK:
+        if stream_id not in STREAMS:
+            return []
+        return _record_pending_steer_locked(stream_id, session_id, cleaned, now)
+
+
+def _record_pending_steer_locked(stream_id: str, session_id: str, cleaned: str, now: float) -> list[dict]:
     with STREAM_PENDING_STEERS_LOCK:
         pending = list(STREAM_PENDING_STEERS.get(stream_id) or [])
         last_order = int(pending[-1].get("order") or len(pending)) if pending else 0
@@ -502,7 +514,10 @@ class CostProtectionGuard:
         self.paused_payload = None
         self._counted_tool_key_counts = {}
         self._tool_error_key_counts = {}
-        self._seen_prev_tool_key_counts = {}
+        # True once any tool completion was reported via the structured
+        # callback/event path; record_step() then skips prev_tools counting
+        # entirely instead of trying to reconcile the two report streams.
+        self._tool_reports_seen = False
 
     def record_status(self, kind: str, message: str) -> None:
         message_text = str(message or "").strip()
@@ -539,12 +554,17 @@ class CostProtectionGuard:
         is_error: bool = False,
         result=None,
     ) -> None:
+        # Key by tool identity/value, never by tool_call_id: the id is unique
+        # per call, so id-keyed error counts would stay at 1 forever and the
+        # repeated_tool_errors trigger could never fire (the headline
+        # cost-protection scenario — an agent re-running the same failing
+        # tool once per iteration).
         key = self._tool_key(
-            tool_call_id=tool_call_id,
             name=name,
             arguments=arguments,
             result=result,
         )
+        self._tool_reports_seen = True
         self._counted_tool_key_counts[key] = self._counted_tool_key_counts.get(key, 0) + 1
         self._record_tool_count(key=key, is_error=is_error, result=result)
 
@@ -559,31 +579,36 @@ class CostProtectionGuard:
 
     def record_step(self, api_call_count: int, prev_tools=None):
         self.api_call_count = max(self.api_call_count, int(api_call_count or 0))
-        prev_seen_this_step = {}
-        for tool in prev_tools or []:
-            if isinstance(tool, dict):
-                key = self._tool_key(
-                    name=tool.get("name"),
-                    arguments=tool.get("arguments"),
-                    result=tool.get("result"),
-                )
-                prev_seen_this_step[key] = prev_seen_this_step.get(key, 0) + 1
-                occurrence = prev_seen_this_step[key]
-                if occurrence <= self._seen_prev_tool_key_counts.get(key, 0):
-                    continue
-                self._seen_prev_tool_key_counts[key] = occurrence
-                counted = self._counted_tool_key_counts.get(key, 0)
-                if counted > 0:
-                    if counted == 1:
-                        self._counted_tool_key_counts.pop(key, None)
-                    else:
-                        self._counted_tool_key_counts[key] = counted - 1
-                    continue
-                self._record_tool_count(
-                    key=key,
-                    is_error=bool(tool.get("is_error", False)),
-                    result=tool.get("result"),
-                )
+        # prev_tools is the most recent assistant message's tool batch
+        # (agent/conversation_loop.py), reported once per iteration.  When the
+        # structured tool_complete callback/event is wired (production), every
+        # one of those tools was already counted there — counting the batch
+        # again would double every tool, so skip it.  prev_tools counting is
+        # only the fallback for agents without tool completion reporting.
+        if not self._tool_reports_seen:
+            for tool in prev_tools or []:
+                if isinstance(tool, dict):
+                    key = self._tool_key(
+                        name=tool.get("name"),
+                        arguments=tool.get("arguments"),
+                        result=tool.get("result"),
+                    )
+                    counted = self._counted_tool_key_counts.get(key, 0)
+                    if counted > 0:
+                        if counted == 1:
+                            self._counted_tool_key_counts.pop(key, None)
+                        else:
+                            self._counted_tool_key_counts[key] = counted - 1
+                        continue
+                    # No cross-step seen-key watermark here: an agent stuck
+                    # re-running the same failing call produces value-identical
+                    # batches every step, and those repeats are exactly what
+                    # tool_error_threshold must accumulate.
+                    self._record_tool_count(
+                        key=key,
+                        is_error=bool(tool.get("is_error", False)),
+                        result=tool.get("result"),
+                    )
         return self._maybe_pause()
 
     def interrupt_message(self) -> str:
@@ -653,14 +678,26 @@ class CostProtectionGuard:
             text = str(value)
         return text[:limit]
 
+    @staticmethod
+    def _normalize_tool_arguments(arguments):
+        # The completion callback receives parsed dict arguments while
+        # prev_tools carries the raw OpenAI-format JSON string — parse strings
+        # so both report streams produce the same key.
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except Exception:
+                return arguments
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        return arguments
+
     @classmethod
-    def _tool_key(cls, *, tool_call_id=None, name=None, arguments=None, result=None):
-        if tool_call_id:
-            return ("id", str(tool_call_id))
+    def _tool_key(cls, *, name=None, arguments=None, result=None):
         return (
             "value",
             cls._stable_key_part(name or "", 120),
-            cls._stable_key_part(arguments or {}, 512),
+            cls._stable_key_part(cls._normalize_tool_arguments(arguments) or {}, 512),
             cls._stable_key_part(result or "", 512),
         )
 
@@ -3150,7 +3187,10 @@ def _generate_llm_session_title_for_agent(agent, user_text: str, assistant_text:
         return None, status, ''
     title = _sanitize_generated_title(raw)
     if title:
-        if _title_language_mismatch(user_text, title):
+        # Strip the English balanced-context labels ("Opening goal User:" ...)
+        # before the script comparison: for short non-Latin chats the labels
+        # would dominate _dominant_script and invert the #3293 drift guard.
+        if _title_language_mismatch(_strip_title_context_labels(user_text), title):
             return None, 'llm_language_mismatch', str(raw)[:120]
         return title, status, ''
     return None, 'llm_invalid', str(raw)[:120]
@@ -3184,7 +3224,8 @@ def _generate_llm_session_title_via_aux(user_text: str, assistant_text: str, age
         return None, status, ''
     title = _sanitize_generated_title(raw)
     if title:
-        if _title_language_mismatch(user_text, title):
+        # Same label-stripping as the agent route — see the note there.
+        if _title_language_mismatch(_strip_title_context_labels(user_text), title):
             return None, 'llm_language_mismatch_aux', str(raw)[:120]
         return title, status, ''
     return None, 'llm_invalid_aux', str(raw)[:120]
@@ -3494,8 +3535,9 @@ def generate_session_title_for_session(
     )
     if not user_text:
         return None, 'empty_user_message', ''
-    if not assistant_text:
-        return None, 'empty_assistant_message', ''
+    # No assistant reply yet (errored turn, tool-call-only, or still running):
+    # generate from the user context alone, matching the upstream contract
+    # where manual title refresh works for user-only sessions.
     from api import profiles as profiles_api
 
     with profiles_api.profile_env_for_background_worker(session, "manual title regeneration", logger_override=logger):

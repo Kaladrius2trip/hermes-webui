@@ -413,6 +413,9 @@ class TestLeftoverDelivery:
         from api.streaming import _record_pending_steer, _emit_pending_steer_leftovers
 
         sid, stream_id = "sid_leftover_order", "stream_leftover_order"
+        import queue as _q
+        with config.STREAMS_LOCK:
+            config.STREAMS[stream_id] = _q.Queue()
         _record_pending_steer(stream_id, sid, "first hint")
         _record_pending_steer(stream_id, sid, "second hint")
 
@@ -433,7 +436,12 @@ class TestLeftoverDelivery:
     def test_leftover_emit_uses_agent_drain_when_metadata_diverges(self, _clear_caches):
         from api.streaming import _record_pending_steer, _emit_pending_steer_leftovers
 
+        from api import config
+        import queue as _q
+
         sid, stream_id = "sid_leftover_diverged", "stream_leftover_diverged"
+        with config.STREAMS_LOCK:
+            config.STREAMS[stream_id] = _q.Queue()
         _record_pending_steer(stream_id, sid, "already applied")
         _record_pending_steer(stream_id, sid, "still pending")
 
