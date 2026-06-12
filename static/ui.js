@@ -2447,22 +2447,23 @@ function _syncReasoningScopeUI(){
   }
 }
 
+function _reasoningEffortContext(){
+  const sel=$('modelSelect');
+  const model=(S&&S.session&&S.session.model)||(sel&&sel.value)||'';
+  let provider=(S&&S.session&&S.session.model_provider)||'';
+  if(!provider&&sel&&model&&typeof _modelStateForSelect==='function'){
+    provider=_modelStateForSelect(sel, model).model_provider||'';
+  }
+  const ctx={};
+  if(model) ctx.model=model;
+  if(provider) ctx.provider=provider;
+  return ctx;
+}
+
 function _reasoningEffortQuery(){
-  const params=new URLSearchParams();
-  const sid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)||null;
-  let model=sid&&S.session?String(S.session.model||'').trim():'';
-  let provider=sid&&S.session?String(S.session.model_provider||'').trim():'';
-  if(!model){
-    const sel=typeof $==='function' ? $('modelSelect') : null;
-    if(sel) model=String(sel.value||'').trim();
-  }
-  if(model&&!provider&&typeof _modelProviderForSend==='function'){
-    try{provider=String(_modelProviderForSend(model)||'').trim();}catch(_){}
-  }
-  if(model) params.set('model',model);
-  if(provider) params.set('provider',provider);
+  const params=new URLSearchParams(_reasoningEffortContext());
   const qs=params.toString();
-  return qs?`?${qs}`:'';
+  return qs?('?'+qs):'';
 }
 
 // Session id the chip values were last resolved for. The cached
@@ -2589,7 +2590,7 @@ document.addEventListener('click',function(e){
         })
         .catch(function(){showToast('🧠 Failed to set session effort');});
     }else{
-      api('/api/reasoning',{method:'POST',body:JSON.stringify({effort:effort})})
+      api('/api/reasoning',{method:'POST',body:JSON.stringify(Object.assign({effort:effort},_reasoningEffortContext()))})
         .then(function(st){
           const profileEffort=(st&&st.reasoning_effort)||effort;
           // Profile write does not change the session override; keep showing

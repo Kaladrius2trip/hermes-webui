@@ -4998,7 +4998,7 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                     # comes from the OpenAI-compatible endpoint. Keep both sources
                     # independent so an import success does not suppress live local
                     # discovery.
-                    lm_cfg = cfg.get("providers", {}).get("lmstudio", {}) or {}
+                    lm_cfg = _get_provider_cfg("lmstudio")
                     lm_base_url = _get_provider_base_url("lmstudio") or ""
                     lm_api_key = str(lm_cfg.get("api_key") or "").strip() if isinstance(lm_cfg, dict) else ""
                     if lm_base_url:
