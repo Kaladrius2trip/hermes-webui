@@ -344,6 +344,14 @@ function queueSessionMessage(sid, payload){
     void api('/api/session/queue',{method:'POST',body:JSON.stringify({session_id:sid,item:entry}),timeoutMs:10000,timeoutToast:false})
       .then(r=>{
         _queueClearPending(sid,entry);
+        if(r&&r.queue_full){
+          // Backend refused the append at capacity — drop the optimistic copy
+          // and tell the user instead of silently losing the message later.
+          _setSessionQueue(sid,_getSessionQueue(sid,false).filter(item=>_queueItemId(item)!==_id));
+          updateQueueBadge(sid);
+          if(typeof showToast==='function') showToast('Message queue is full — send or remove queued messages first',5000,'error');
+          return;
+        }
         if((_queueMutationSeq[sid]||0)===_seq&&r&&Array.isArray(r.queue)){_setSessionQueue(sid,_queuePreserveLocalFiles(sid,r.queue));updateQueueBadge(sid);}
       })
       .catch(e=>{_queueClearPending(sid,entry);if(typeof showToast==='function') showToast(e&&e.message?e.message:'Failed to save queued message',4000,'error');});
