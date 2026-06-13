@@ -4895,6 +4895,31 @@ function _queuePanelHasEditingFocus(inner){
   return tag==='TEXTAREA'||tag==='INPUT';
 }
 
+// Authoritative client-side removal of a queued item from its card (Steer /
+// Delete / steer-fallback). Mirrors ackQueuedSessionMessage: tombstone the id
+// and bump the mutation seq BEFORE the optimistic /replace so a reconcile or
+// in-flight POST echo racing the removal (steering fires SSE activity that
+// triggers exactly such a reconcile) cannot resurrect the item — the bug where
+// a steered/deleted message stayed visually queued and remained deletable.
+function _removeQueuedSessionMessage(sid, entry){
+  if(!sid||!entry) return false;
+  const liveQ=_getSessionQueue(sid,false);
+  const id=_queueItemId(entry);
+  let idx=id?liveQ.findIndex(e=>_queueItemId(e)===id):liveQ.indexOf(entry);
+  if(idx<0){
+    const ts=entry&&entry._queued_at;
+    if(ts!=null) idx=liveQ.findIndex(e=>e&&e._queued_at===ts);
+  }
+  if(idx<0) return false;
+  _queueNextSeq(sid);                 // stale POST echoes bail on the seq check
+  if(id) _queueMarkConsumed(sid,id);  // merge filter drops late backend copies
+  liveQ.splice(idx,1);
+  _persistSessionQueue(sid,liveQ);
+  delete _queueRenderKeys[sid];
+  updateQueueBadge(sid);
+  return true;
+}
+
 async function _steerQueuedSessionMessage(sid, entryTs, fallbackIndex){
   if(!sid) return;
   if(!S.session||S.session.session_id!==sid){
@@ -4922,13 +4947,12 @@ async function _steerQueuedSessionMessage(sid, entryTs, fallbackIndex){
     model_provider:entry.model_provider||null,
     profile:entry.profile||S.activeProfile||'default',
   };
-  liveQ.splice(idx,1);
-  _persistSessionQueue(sid,liveQ);
   const activeEl=document.activeElement;
   const queueInner=document.getElementById('queueChips');
   if(activeEl&&activeEl.blur&&queueInner&&queueInner.contains(activeEl)) activeEl.blur();
-  delete _queueRenderKeys[sid];
-  updateQueueBadge(sid);
+  // Authoritative removal (tombstone + seq bump) so the SSE activity the steer
+  // triggers cannot reconcile the item back into the visual queue.
+  _removeQueuedSessionMessage(sid,entry);
 
   if(!S.busy||!S.activeStreamId){
     const inp=$('msg');
@@ -5157,9 +5181,8 @@ function _renderQueueChips(sid){
     delBtn.onclick=()=>{
       const liveQ=_getSessionQueue(sid,false);
       const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
-      if(idx!==-1) liveQ.splice(idx,1);
-      _persistSessionQueue(sid,liveQ);
-      updateQueueBadge(sid);
+      const target=idx!==-1?liveQ[idx]:null;
+      if(target) _removeQueuedSessionMessage(sid,target);
     };
     row.appendChild(drag);
     row.appendChild(msgSpan);

@@ -29,19 +29,25 @@ def test_queue_rows_render_a_per_item_steer_button():
 def test_queue_item_steer_removes_item_and_refreshes_before_calling_steer():
     helper = _between(UI_JS, "async function _steerQueuedSessionMessage", "function _renderQueueChips")
 
-    remove_idx = helper.find("liveQ.splice(idx,1)")
-    persist_idx = helper.find("_persistSessionQueue(sid,liveQ)")
-    badge_idx = helper.find("updateQueueBadge(sid)")
+    # Removal is now authoritative (tombstone + seq bump + persist + badge)
+    # via the shared _removeQueuedSessionMessage helper, called before steering.
+    remove_idx = helper.find("_removeQueuedSessionMessage(sid,entry)")
     steer_idx = helper.find("_trySteer(entryText,true,fallbackPayload)")
     send_idx = helper.find("await send()")
 
-    assert remove_idx >= 0, "helper must remove only the clicked queue item"
-    assert persist_idx > remove_idx, "queue removal must persist through backend queue API"
-    assert badge_idx > remove_idx, "badge/list/count must refresh immediately after removal"
+    assert remove_idx >= 0, "helper must remove the clicked queue item via the shared helper"
     assert "sessionStorage.setItem('hermes-queue'" not in helper
     assert "sessionStorage.removeItem('hermes-queue'" not in helper
-    assert steer_idx > badge_idx, "active-stream steer must run after the queue UI is updated"
-    assert send_idx > badge_idx, "idle /steer send fallback must also run after queue removal"
+    assert steer_idx > remove_idx, "active-stream steer must run after the queue item is removed"
+    assert send_idx > remove_idx, "idle /steer send fallback must also run after queue removal"
+
+    # The shared remover must tombstone + bump seq so a racing reconcile cannot
+    # resurrect the steered/deleted item.
+    remover = _between(UI_JS, "function _removeQueuedSessionMessage(sid, entry)", "async function _steerQueuedSessionMessage")
+    assert "_queueNextSeq(sid)" in remover
+    assert "_queueMarkConsumed(sid,id)" in remover
+    assert "_persistSessionQueue(sid,liveQ)" in remover
+    assert "updateQueueBadge(sid)" in remover
 
 
 def test_queue_item_steer_blocks_file_bearing_items_without_removing_them():
@@ -49,7 +55,7 @@ def test_queue_item_steer_blocks_file_bearing_items_without_removing_them():
 
     files_idx = helper.find("Array.isArray(entry.files)")
     guard_idx = helper.find("Queued items with attachments cannot be steered")
-    remove_idx = helper.find("liveQ.splice(idx,1)")
+    remove_idx = helper.find("_removeQueuedSessionMessage(sid,entry)")
 
     assert files_idx >= 0, "helper must inspect queued attachments"
     assert guard_idx > files_idx, "file-bearing queued items need explicit blocked UX"
