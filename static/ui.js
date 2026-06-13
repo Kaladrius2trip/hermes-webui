@@ -703,6 +703,23 @@ function _statusCardHtml(card){
 }
 
 const MESSAGE_RENDER_WINDOW_DEFAULT=50;
+// Ceiling for the "expand window so the settled/done render doesn't hide
+// Activity" paths. The render window is tail-anchored (renderMessages shows
+// the LAST N renderable rows), so a finished turn's activity is always at the
+// bottom — expanding the window to the FULL transcript (used to be
+// Math.max(current, renderableCount())) forced a full DOM rebuild of every
+// message on every turn, freezing the UI for seconds on multi-thousand-message
+// sessions. Capping the expansion keeps recent activity visible without
+// re-rendering ancient history; older rows stay reachable via "Load earlier".
+const MESSAGE_RENDER_WINDOW_ACTIVITY_MAX=400;
+function _expandRenderWindowForActivity(){
+  if(typeof _messageRenderableMessageCount!=='function') return;
+  const renderable=_messageRenderableMessageCount();
+  const current=typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():MESSAGE_RENDER_WINDOW_DEFAULT;
+  // Never shrink below what's already shown; never grow past the cap (unless
+  // the user had already loaded more); never exceed the actual message count.
+  _messageRenderWindowSize=Math.min(renderable,Math.max(current,MESSAGE_RENDER_WINDOW_ACTIVITY_MAX));
+}
 let _messageRenderWindowSid=null;
 let _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
 // Cached visWithIdx array — invalidated when S.messages.length changes.

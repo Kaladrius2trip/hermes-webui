@@ -3365,11 +3365,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // delivered the final messages and tool calls.
           if(typeof window!=='undefined') window._streamJustFinished=true;
           setTimeout(()=>{ if(typeof window!=='undefined') window._streamJustFinished=false; }, 5000);
-          // Expand render window to cover all messages so the done render
-          // doesn't hide Activity behind a tiny window (winSize=50).
-          if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
-            _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, _messageRenderableMessageCount());
-          }
+          // Expand render window (capped) so the done render shows the new
+          // turn's Activity without rebuilding the entire transcript DOM.
+          if(typeof _expandRenderWindowForActivity==='function') _expandRenderWindowForActivity();
           syncTopbar();renderMessages({preserveScroll:true});
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
           if(typeof noteWorkspaceMutationsFromToolCalls==='function') noteWorkspaceMutationsFromToolCalls(S.toolCalls);
@@ -3852,10 +3850,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           S.toolCalls=[];
         }
         if(isSessionViewed) _markSessionViewed(completedSid, session.message_count ?? S.messages.length);
-        // Expand render window so the settled render doesn't hide Activity.
-        if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
-          _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, _messageRenderableMessageCount());
-        }
+        // Expand render window (capped) so the settled render shows recent
+        // Activity without a full-transcript DOM rebuild.
+        if(typeof _expandRenderWindowForActivity==='function') _expandRenderWindowForActivity();
         syncTopbar();renderMessages({preserveScroll:true});
       }
       if(_isActiveSession()) _queueDrainSid=activeSid;
