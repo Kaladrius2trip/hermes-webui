@@ -912,6 +912,22 @@ async function loadSession(sid){
     // close streams for the session the user actually landed on (#1060 guard,
     // extended to cover the new pre-switch await).
     if (_loadingSessionId !== sid) return;
+    // Snapshot the live turn before msgInner is replaced. Preserves the activity
+    // timer, partial response, and tool cards so switching back does not rebuild
+    // the stream UI from scratch.
+    if(
+      (S.busy||S.activeStreamId||(INFLIGHT&&INFLIGHT[currentSid]))&&
+      typeof snapshotLiveTurnHtmlForSession==='function'
+    ){
+      if(!INFLIGHT[currentSid]){
+        INFLIGHT[currentSid]={
+          messages:Array.isArray(S.messages)?[...S.messages]:[],
+          uploaded:[],
+          toolCalls:Array.isArray(S.toolCalls)?[...S.toolCalls]:[],
+        };
+      }
+      snapshotLiveTurnHtmlForSession(currentSid);
+    }
   }
   if (currentSid !== sid || forceReload) {
     // #3306: When force-reloading the currently-active session (e.g. external
@@ -1074,14 +1090,21 @@ async function loadSession(sid){
   if(typeof startSessionStream==='function') startSessionStream(S.session.session_id);
 
   const activeStreamId=S.session.active_stream_id||null;
-  // If the server says the session is idle, discard any browser-side inflight
-  // cache left behind by a crashed/restarted stream. Otherwise the UI can keep
-  // showing a permanent thinking/running state even though active_streams=0.
-  if(!activeStreamId&&INFLIGHT[sid]){
-    delete INFLIGHT[sid];
-    if(typeof clearInflightState==='function') clearInflightState(sid);
+  // If the server says the session is idle, reset browser-side streaming flags
+  // NOW — before the async _ensureMessagesLoaded gap below. Without this,
+  // S.busy can remain true from a still-running stream in the PREVIOUS session
+  // while S.session.session_id has already advanced to the new one.
+  // _isSessionLocallyStreaming() checks (isActive && S.busy), so during the
+  // async window the new session would appear locally-streaming (sidebar spinner,
+  // Stop button, thinking state on an idle chat). Also clears stale INFLIGHT
+  // entries left behind by a crashed/restarted stream.
+  if(!activeStreamId){
     S.activeStreamId=null;
     S.busy=false;
+    if(INFLIGHT[sid]){
+      delete INFLIGHT[sid];
+      if(typeof clearInflightState==='function') clearInflightState(sid);
+    }
   }
 
   function _mergePendingSessionMessage(session,messages){
@@ -1290,10 +1313,15 @@ async function loadSession(sid){
       updateSendBtn();
       setStatus('');
       setComposerStatus('');
-      // syncTopbar();renderMessages();appendThinking();loadDir('.');
       syncTopbar();renderMessages(sameSessionForceReload?{preserveScroll:true}:undefined);
-      if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
-      else appendThinking();
+      let restoredLiveTurn=false;
+      if(typeof restoreLiveTurnHtmlForSession==='function'){
+        restoredLiveTurn=restoreLiveTurnHtmlForSession(sid);
+      }
+      if(!restoredLiveTurn){
+        if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
+        else appendThinking();
+      }
       loadDir('.');
       updateQueueBadge(sid);
       startApprovalPolling(sid);
@@ -3501,7 +3529,7 @@ function _applySessionListPayload(sessData, projData){
   _reconcileActiveSessionIdleStateFromList(serverSessions);
   _allSessions = _mergeOptimisticFirstTurnSessions(serverSessions);
   _syncSessionAttentionSoundState(_allSessions);
-  _clearLineageReportCache();
+  _pruneLineageReportCacheToVisibleSessions(_allSessions);
   _allProjects = projData.projects||[];
   _markPollingCompletionUnreadTransitions(_allSessions);
   const isStreaming = _allSessions.some(s => _isSessionEffectivelyStreaming(s));
@@ -4340,6 +4368,35 @@ function _clearLineageReportCache(){
   _lineageReportCacheGeneration++;
 }
 
+function _pruneLineageReportCacheToVisibleSessions(sessions){
+  const visibleKeys=new Set();
+  const rows=Array.isArray(sessions)?sessions:[];
+  for(const s of rows){
+    const key=_sidebarLineageKeyForRow(s);
+    if(key) visibleKeys.add(key);
+  }
+  // Also retain the cache keys derived from the COLLAPSED/rendered rows. The
+  // render loop keys the lineage-report cache by _sidebarLineageKeyForRow on
+  // the COLLAPSED row (see renderSessionListFromCache), and collapse can merge
+  // segments so a collapsed row's key differs from any single raw input row's
+  // key. Mirroring the precedent in _resolveSessionIdFromSidebarLineage, fold
+  // the collapsed rows' keys in so a still-visible expanded row is never evicted
+  // (and re-fetched every payload) on a chain the raw keys alone wouldn't cover.
+  try{
+    for(const row of _collapseSessionLineageForSidebar(rows)){
+      if(!row||_isChildSession(row)) continue;
+      const key=_lineageReportCacheKey(row,_sidebarLineageKeyForRow(row));
+      if(key) visibleKeys.add(key);
+    }
+  }catch(_){ /* defensive: never let a prune-key derivation break list apply */ }
+  for(const key of Array.from(_lineageReportCache.keys())){
+    if(!visibleKeys.has(key)) _lineageReportCache.delete(key);
+  }
+  for(const key of Array.from(_lineageReportInflight.keys())){
+    if(!visibleKeys.has(key)) _lineageReportInflight.delete(key);
+  }
+}
+
 function _lineageReportCacheKey(s,lineageKey){
   return lineageKey||_sidebarLineageKeyForRow(s)||null;
 }
@@ -4384,14 +4441,16 @@ function _fetchLineageReportForRow(s,lineageKey){
   let request;
   request=api('/api/session/lineage/report?session_id='+encodeURIComponent(s.session_id))
     .then(report=>{
-      if(generation===_lineageReportCacheGeneration){
+      if(generation===_lineageReportCacheGeneration&&_lineageReportInflight.get(key)===request){
         _lineageReportCache.set(key,(report&&report.found!==false)?report:{error:true});
       }
       return report;
     })
     .catch(err=>{
       console.warn('lineage report',err);
-      if(generation===_lineageReportCacheGeneration) _lineageReportCache.set(key,{error:true});
+      if(generation===_lineageReportCacheGeneration&&_lineageReportInflight.get(key)===request){
+        _lineageReportCache.set(key,{error:true});
+      }
       return null;
     })
     .finally(()=>{
@@ -4829,26 +4888,22 @@ function _sidebarWorkspaceFilterState(){
 }
 
 function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
-  let webuiSessionCount=0;
   let cliSessionCount=0;
-  for(const s of allMatched){
-    if(!_sidebarRowHasVisibleMessages(s, activeSidForSidebar)) continue;
-    if(_isCliSession(s)) cliSessionCount++;
-    else webuiSessionCount++;
-  }
-  if(_sessionSourceFilter==='cli' && !window._showCliSessions && cliSessionCount===0){
-    _sessionSourceFilter='webui';
-  }
-  const showCliOnly=_sessionSourceFilter==='cli';
-  const profileFiltered=[];
-  const sessionsRaw=[];
-  let archivedCount=0;
+  const webuiProfileFiltered=[];
+  const cliProfileFiltered=[];
+  const webuiSessionsRaw=[];
+  const cliSessionsRaw=[];
+  let webuiArchivedCount=0;
+  let cliArchivedCount=0;
+  // Fork #2549: optional active-workspace filter, applied to both buckets.
   const {showAllWorkspaces, activeWorkspacePath}=_sidebarWorkspaceFilterState();
   for(const s of allMatched){
     if(!_sidebarRowHasVisibleMessages(s, activeSidForSidebar)) continue;
     const isCli=_isCliSession(s);
-    if(showCliOnly ? !isCli : isCli) continue;
+    if(isCli) cliSessionCount++;
     if(s.default_hidden&&!(_activeProject&&_activeProject!==NO_PROJECT_FILTER&&s.project_id===_activeProject)) continue;
+    const profileFiltered=isCli ? cliProfileFiltered : webuiProfileFiltered;
+    const sessionsRaw=isCli ? cliSessionsRaw : webuiSessionsRaw;
     profileFiltered.push(s);
     if(_activeProject===NO_PROJECT_FILTER){
       if(s.project_id) continue;
@@ -4858,19 +4913,36 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
     // Optional: hide sessions whose workspace !== the currently active workspace (#2549).
     // Pinned rows and rows without workspace metadata remain visible.
     if(!showAllWorkspaces&&activeWorkspacePath&&!s.pinned&&s.workspace&&s.workspace!==activeWorkspacePath) continue;
-    if(s.archived) archivedCount++;
+    if(s.archived){
+      if(isCli) cliArchivedCount++;
+      else webuiArchivedCount++;
+    }
     if(!_showArchived&&s.archived) continue;
     sessionsRaw.push(s);
   }
+  if(_sessionSourceFilter==='cli' && !window._showCliSessions && cliSessionCount===0){
+    _sessionSourceFilter='webui';
+  }
+  const showCliOnly=_sessionSourceFilter==='cli';
   return {
-    webuiSessionCount,
     cliSessionCount,
-    profileFiltered,
-    sessionsRaw,
-    archivedCount,
+    profileFiltered: showCliOnly ? cliProfileFiltered : webuiProfileFiltered,
+    sessionsRaw: showCliOnly ? cliSessionsRaw : webuiSessionsRaw,
+    archivedCount: showCliOnly ? cliArchivedCount : webuiArchivedCount,
+    webuiSessionsRaw,
+    cliSessionsRaw,
     showAllWorkspaces,
     activeWorkspacePath,
   };
+}
+
+function _renderSidebarRowsFromRawSessions(sessionsRaw){
+  return _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw);
+}
+
+function _countRenderedSidebarRowsFromRawSessions(sessionsRaw){
+  // Keep inactive-tab chip counts on the exact same top-level row path as render.
+  return _renderSidebarRowsFromRawSessions(sessionsRaw).length;
 }
 
 function renderSessionListFromCache(){
@@ -4896,15 +4968,22 @@ function renderSessionListFromCache(){
   const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,_contentSearchResults);
   const allMatched=_ensureActiveSessionRowPresent(searchMatches,sidebarRows);
   const {
-    webuiSessionCount,
     cliSessionCount,
     profileFiltered,
     sessionsRaw,
     archivedCount,
+    webuiSessionsRaw,
+    cliSessionsRaw,
     showAllWorkspaces,
     activeWorkspacePath,
   }=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
-  const sessions=_attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw);
+  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw);
+  const renderedWebuiSessionCount=_sessionSourceFilter==='webui'
+    ? sessions.length
+    : _countRenderedSidebarRowsFromRawSessions(webuiSessionsRaw);
+  const renderedCliSessionCount=_sessionSourceFilter==='cli'
+    ? sessions.length
+    : _countRenderedSidebarRowsFromRawSessions(cliSessionsRaw);
   _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);
   const list=$('sessionList');
   const animateRefresh=_sessionListRefreshAnimationPending;
@@ -4939,7 +5018,7 @@ function renderSessionListFromCache(){
     const sourceTabs=document.createElement('div');
     sourceTabs.className='session-source-tabs';
     for(const filter of ['webui','cli']){
-      const count=filter==='cli'?cliSessionCount:webuiSessionCount;
+      const count=filter==='cli'?renderedCliSessionCount:renderedWebuiSessionCount;
       const btn=document.createElement('button');
       btn.type='button';
       btn.className='session-source-tab'+(_sessionSourceFilter===filter?' active':'');
@@ -5357,6 +5436,9 @@ function renderSessionListFromCache(){
     const lineageReportKey=showLineageMetadata?_lineageReportCacheKey(s,lineageKey):null;
     const canExpandLineageSegments=showLineageMetadata&&Boolean(lineageKey&&segmentCount>1&&(lineageSegments.length>0||needsLineageReport||_lineageReportInflight.has(lineageReportKey)));
     const lineageSegmentsExpanded=canExpandLineageSegments&&_expandedLineageKeys.has(lineageKey);
+    if(lineageSegmentsExpanded&&needsLineageReport){
+      _fetchLineageReportForRow(s,lineageKey).then(()=>renderSessionListFromCache());
+    }
     if(segmentCount>0){
       const segmentCountEl=document.createElement('span');
       segmentCountEl.className='session-lineage-count'+(canExpandLineageSegments?' expandable':'');
