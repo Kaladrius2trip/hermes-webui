@@ -6221,6 +6221,13 @@ def handle_get(handler, parsed) -> bool:
         with profile_env_for_active_request("/api/providers", logger_override=logger):
             return j(handler, get_providers())
 
+    if parsed.path == "/api/providers/custom":
+        # Read-only list of configured custom (OpenAI-compatible) providers,
+        # including base_url + key metadata the edit form needs (api_key is
+        # never returned verbatim — only has_key / key_env).
+        from api.config import list_custom_providers
+        return j(handler, {"providers": list_custom_providers()})
+
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
     if parsed.path == "/api/plugins":
         return _handle_plugins(handler, parsed)
@@ -7981,6 +7988,43 @@ def handle_post(handler, parsed) -> bool:
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
         return j(handler, result)
+
+    # ── Custom (OpenAI-compatible) providers: create / update / delete ──
+    if parsed.path == "/api/providers/custom":
+        from api.config import upsert_custom_provider
+        name = str(body.get("name") or "").strip()
+        base_url = str(body.get("base_url") or "").strip()
+        api_key = body.get("api_key")
+        api_key = "" if api_key is None else str(api_key)
+        models = body.get("models")
+        probe = body.get("probe")
+        probe = True if probe is None else bool(probe)
+        original_name = body.get("original_name")
+        try:
+            result = upsert_custom_provider(
+                name,
+                base_url,
+                api_key,
+                models,
+                probe=probe,
+                original_name=original_name,
+            )
+        except ValueError as exc:
+            return bad(handler, str(exc))
+        except Exception as exc:  # pragma: no cover - unexpected disk/yaml errors
+            return bad(handler, f"Failed to save custom provider: {exc}", 500)
+        return j(handler, {"ok": True, **result})
+
+    if parsed.path == "/api/providers/custom/delete":
+        from api.config import remove_custom_provider
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return bad(handler, "name is required")
+        try:
+            result = remove_custom_provider(name)
+        except ValueError as exc:
+            return bad(handler, str(exc))
+        return j(handler, {"ok": True, **result})
 
     if parsed.path == "/api/models/refresh":
         provider_id = (body.get("provider") or "").strip().lower()

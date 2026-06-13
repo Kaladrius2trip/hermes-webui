@@ -7547,6 +7547,7 @@ async function loadProvidersPanel(){
   const empty=$('providersEmpty');
   if(!list) return;
   try{
+    loadCustomProvidersSection(); // fire-and-forget; renders its own section
     const data=await api('/api/providers');
     const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
     const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider);
@@ -8132,6 +8133,193 @@ function _refreshModelDropdownsAfterProviderChange(){
   }catch(_e){
     // Swallow — dropdown refresh is best-effort, providers panel must still update.
   }
+}
+
+// ── Custom (OpenAI-compatible) providers management ──────────────────────────
+// Lets the user register multiple LM-Studio / Ollama-style servers, each with
+// its own base URL (IP) + token, persisted to config.yaml `custom_providers`
+// via /api/providers/custom. Models are auto-discovered from {base_url}/v1/models
+// on save and can be supplemented manually.
+let _customProviderFormHost=null;
+
+function _customProviderKeyHint(p){
+  if(p.key_is_env){
+    return p.has_key?('env '+esc(p.key_env)+' ✓'):('env '+esc(p.key_env)+' — unset');
+  }
+  return p.has_key?(t('custom_providers_key_set')||'token set'):(t('custom_providers_no_key')||'no token');
+}
+
+function _closeCustomProviderForm(){
+  if(_customProviderFormHost&&_customProviderFormHost.parentNode){
+    _customProviderFormHost.parentNode.removeChild(_customProviderFormHost);
+  }
+  _customProviderFormHost=null;
+}
+
+function _openCustomProviderForm(existing){
+  _closeCustomProviderForm();
+  const list=$('customProvidersList');
+  if(!list) return;
+  const isEdit=!!existing;
+  const wrap=document.createElement('div');
+  _customProviderFormHost=wrap;
+  wrap.style.cssText='border:1px solid var(--accent,#6b7cff);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px;background:var(--panel,rgba(255,255,255,0.02))';
+
+  const title=document.createElement('div');
+  title.style.cssText='font-size:13px;font-weight:600';
+  title.textContent=isEdit?((t('custom_providers_edit')||'Edit provider')+': '+existing.name):(t('custom_providers_add')||'Add provider');
+  wrap.appendChild(title);
+
+  const mkField=(labelText,el)=>{
+    const f=document.createElement('label');
+    f.style.cssText='display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)';
+    const s=document.createElement('span'); s.textContent=labelText; f.appendChild(s); f.appendChild(el);
+    return f;
+  };
+  const inputStyle='padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg,#111);color:var(--fg,#eee);font-size:13px;width:100%;box-sizing:border-box';
+
+  const nameInput=document.createElement('input');
+  nameInput.type='text'; nameInput.style.cssText=inputStyle; nameInput.placeholder='LM Studio Local';
+  nameInput.value=isEdit?existing.name:'';
+  if(isEdit) nameInput.disabled=false; // rename allowed; original_name handles match
+
+  const baseInput=document.createElement('input');
+  baseInput.type='text'; baseInput.style.cssText=inputStyle; baseInput.placeholder='http://192.168.1.50:1234';
+  baseInput.value=isEdit?(existing.base_url||''):'';
+
+  const keyInput=document.createElement('input');
+  keyInput.type='password'; keyInput.style.cssText=inputStyle;
+  keyInput.placeholder=isEdit?(t('custom_providers_key_keep')||'leave blank to keep current token'):'token or ${ENV_VAR} (optional)';
+  keyInput.value='';
+
+  const modelsInput=document.createElement('textarea');
+  modelsInput.style.cssText=inputStyle+';resize:vertical;font-family:inherit'; modelsInput.rows=3;
+  modelsInput.placeholder='gpt-oss-20b, qwen2.5  ('+(t('custom_providers_models_hint')||'optional — auto-discovered from /v1/models')+')';
+  modelsInput.value=(isEdit&&Array.isArray(existing.models))?existing.models.join('\n'):'';
+
+  wrap.appendChild(mkField(t('custom_providers_name')||'Name',nameInput));
+  wrap.appendChild(mkField(t('custom_providers_base_url')||'Base URL (IP)',baseInput));
+  wrap.appendChild(mkField(t('custom_providers_token')||'Token',keyInput));
+  wrap.appendChild(mkField(t('custom_providers_models')||'Models (one per line, optional)',modelsInput));
+
+  const row=document.createElement('div');
+  row.style.cssText='display:flex;gap:8px;margin-top:2px';
+  const saveBtn=document.createElement('button');
+  saveBtn.type='button'; saveBtn.className='btn'; saveBtn.textContent=t('providers_save')||'Save';
+  const cancelBtn=document.createElement('button');
+  cancelBtn.type='button'; cancelBtn.className='btn'; cancelBtn.textContent=t('cancel')||'Cancel';
+  cancelBtn.style.cssText='background:transparent;border:1px solid var(--border)';
+  cancelBtn.onclick=()=>_closeCustomProviderForm();
+  saveBtn.onclick=()=>_saveCustomProvider({
+    name:nameInput.value, base_url:baseInput.value, api_key:keyInput.value,
+    models:modelsInput.value, original_name:isEdit?existing.name:null, btn:saveBtn,
+  });
+  row.appendChild(saveBtn); row.appendChild(cancelBtn);
+  wrap.appendChild(row);
+
+  list.insertBefore(wrap,list.firstChild);
+  nameInput.focus();
+}
+
+async function _saveCustomProvider(opts){
+  const name=(opts.name||'').trim();
+  const base_url=(opts.base_url||'').trim();
+  if(!name){ showToast(t('custom_providers_need_name')||'Provider name is required'); return; }
+  if(!base_url){ showToast(t('custom_providers_need_base')||'Base URL is required'); return; }
+  if(opts.btn){ opts.btn.disabled=true; opts.btn.textContent=t('providers_saving')||'Saving...'; }
+  try{
+    const payload={name,base_url,models:opts.models||''};
+    // Empty token field on edit preserves the stored secret server-side.
+    if((opts.api_key||'').trim()) payload.api_key=opts.api_key.trim();
+    if(opts.original_name) payload.original_name=opts.original_name;
+    const res=await api('/api/providers/custom',{method:'POST',body:JSON.stringify(payload)});
+    if(res&&res.ok){
+      let msg=(res.created?(t('custom_providers_created')||'Provider added'):(t('custom_providers_updated')||'Provider updated'))+': '+res.name;
+      if(Array.isArray(res.models)) msg+=' · '+res.models.length+' model(s)';
+      if(res.probe_error) msg+=' · '+(t('custom_providers_probe_failed')||'auto-discovery failed')+': '+res.probe_error;
+      showToast(msg,res.probe_error?6000:3000);
+      _closeCustomProviderForm();
+      _refreshModelDropdownsAfterProviderChange();
+      await loadProvidersPanel();
+    }else{
+      showToast((res&&res.error)||'Failed to save provider');
+      if(opts.btn){ opts.btn.disabled=false; opts.btn.textContent=t('providers_save')||'Save'; }
+    }
+  }catch(e){
+    showToast('Error: '+(e.message||String(e)));
+    if(opts.btn){ opts.btn.disabled=false; opts.btn.textContent=t('providers_save')||'Save'; }
+  }
+}
+
+async function _deleteCustomProvider(name,btn){
+  if(!confirm((t('custom_providers_confirm_delete')||'Delete custom provider')+' "'+name+'"?')) return;
+  if(btn){ btn.disabled=true; }
+  try{
+    const res=await api('/api/providers/custom/delete',{method:'POST',body:JSON.stringify({name})});
+    if(res&&res.ok&&res.removed){
+      showToast((t('custom_providers_removed')||'Provider removed')+': '+name);
+      _refreshModelDropdownsAfterProviderChange();
+      await loadProvidersPanel();
+    }else{
+      showToast((res&&res.error)||'Provider not found');
+      if(btn) btn.disabled=false;
+    }
+  }catch(e){
+    if(e&&e.status===403){ showToast(e.message||'Session expired. Reload the page and try again.',6000,'error'); }
+    else{ showToast('Error: '+(e.message||String(e))); }
+    if(btn) btn.disabled=false;
+  }
+}
+
+function _buildCustomProviderCard(p){
+  const card=document.createElement('div');
+  card.style.cssText='border:1px solid var(--border);border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:12px';
+  const info=document.createElement('div');
+  info.style.cssText='flex:1;min-width:0';
+  const nm=document.createElement('div');
+  nm.style.cssText='font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+  nm.textContent=p.name;
+  const meta=document.createElement('div');
+  meta.style.cssText='font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+  meta.innerHTML=esc(p.base_url||'')+' · '+(p.models?p.models.length:0)+' model(s) · '+_customProviderKeyHint(p);
+  info.appendChild(nm); info.appendChild(meta);
+  const editBtn=document.createElement('button');
+  editBtn.type='button'; editBtn.className='btn'; editBtn.textContent=t('custom_providers_edit')||'Edit';
+  editBtn.onclick=()=>_openCustomProviderForm(p);
+  const delBtn=document.createElement('button');
+  delBtn.type='button'; delBtn.className='btn'; delBtn.textContent=t('providers_remove')||'Delete';
+  delBtn.style.cssText='background:transparent;border:1px solid var(--border);color:var(--error,#e66)';
+  delBtn.onclick=()=>_deleteCustomProvider(p.name,delBtn);
+  card.appendChild(info); card.appendChild(editBtn); card.appendChild(delBtn);
+  return card;
+}
+
+async function loadCustomProvidersSection(){
+  const list=$('customProvidersList');
+  const addBtn=$('customProviderAddBtn');
+  if(!list) return;
+  if(addBtn&&!addBtn._wired){ addBtn._wired=true; addBtn.onclick=()=>_openCustomProviderForm(null); }
+  const formWasOpen=!!_customProviderFormHost;
+  _customProviderFormHost=null;
+  list.innerHTML='';
+  try{
+    const data=await api('/api/providers/custom');
+    const providers=(data&&data.providers)||[];
+    if(providers.length===0){
+      const empty=document.createElement('div');
+      empty.style.cssText='font-size:12px;color:var(--muted);padding:6px 2px';
+      empty.textContent=t('custom_providers_empty')||'No custom providers yet. Add one to connect an OpenAI-compatible server.';
+      list.appendChild(empty);
+    }else{
+      for(const p of providers) list.appendChild(_buildCustomProviderCard(p));
+    }
+  }catch(e){
+    const err=document.createElement('div');
+    err.style.cssText='color:var(--error);font-size:12px;padding:6px 2px';
+    err.textContent='Failed to load custom providers: '+(e.message||String(e));
+    list.appendChild(err);
+  }
+  if(formWasOpen) _openCustomProviderForm(null);
 }
 
 async function _refreshProviderModels(providerId, btn){

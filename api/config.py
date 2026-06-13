@@ -497,6 +497,259 @@ def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
     )
 
 
+def _load_raw_yaml_config_file(config_path: Path) -> dict:
+    """Load config.yaml WITHOUT expanding ``${ENV}`` references.
+
+    Read-modify-write of custom_providers must round-trip the literal
+    ``${ENV}`` token, not the resolved secret — ``_load_yaml_config_file``
+    expands env vars and would persist the secret in plaintext.
+    """
+    try:
+        import yaml as _yaml
+    except ImportError:
+        return {}
+    if not config_path.exists():
+        return {}
+    try:
+        loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        logger.debug("Failed to parse raw yaml config from %s", config_path)
+        return {}
+
+
+def _normalize_custom_provider_base_url(base_url: object) -> str:
+    """Validate + normalize a custom provider base_url. Raises ValueError."""
+    raw = str(base_url or "").strip()
+    if not raw:
+        raise ValueError("base_url is required")
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"base_url scheme must be http or https (got '{parsed.scheme}')")
+    if not parsed.hostname:
+        raise ValueError("base_url must include a host")
+    return raw.rstrip("/")
+
+
+def _normalize_custom_provider_models(models: object) -> list[str]:
+    """Coerce a models spec (list / dict / comma-or-newline string) to ids."""
+    out: list[str] = []
+
+    def add(value: object) -> None:
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text)
+
+    if models is None:
+        return out
+    if isinstance(models, str):
+        for part in re.split(r"[\n,]+", models):
+            add(part)
+    elif isinstance(models, dict):
+        for key in models:
+            add(key)
+    elif isinstance(models, (list, tuple)):
+        for item in models:
+            if isinstance(item, dict):
+                add(item.get("id") or item.get("model") or item.get("name"))
+            else:
+                add(item)
+    return out
+
+
+def probe_custom_provider_models(base_url: object, api_key: object = "") -> tuple[list[str], str | None]:
+    """Best-effort GET {base_url}/v1/models → (ids, error_message).
+
+    User-entered custom providers are trusted configuration (same policy as
+    the live-discovery path in get_available_models, which skips the private-IP
+    DNS preflight for configured base_urls), so no SSRF guard here beyond the
+    http/https scheme check already enforced by base_url normalization.
+    """
+    base = str(base_url or "").strip()
+    if not base:
+        return [], None
+    try:
+        import urllib.error
+        import urllib.request
+
+        endpoint = base.rstrip("/")
+        endpoint = endpoint + "/models" if endpoint.endswith("/v1") else endpoint + "/v1/models"
+        key = str(api_key or "").strip()
+        if key.startswith("${") and key.endswith("}"):
+            key = os.getenv(key[2:-1], "").strip()
+        req = urllib.request.Request(endpoint, method="GET")
+        req.add_header("User-Agent", "OpenAI/Python 1.0")
+        if key:
+            req.add_header("Authorization", f"Bearer {key}")
+        with urllib.request.urlopen(req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as response:  # nosec B310
+            data = json.loads(response.read().decode("utf-8"))
+        raw_list: object = None
+        if isinstance(data, dict):
+            raw_list = data.get("data")
+            if not isinstance(raw_list, list):
+                raw_list = data.get("models")
+        ids: list[str] = []
+        if isinstance(raw_list, list):
+            for model in raw_list:
+                if isinstance(model, dict):
+                    mid = str(model.get("id") or model.get("name") or model.get("model") or "").strip()
+                else:
+                    mid = str(model or "").strip()
+                if mid and mid not in ids:
+                    ids.append(mid)
+        return ids, None
+    except urllib.error.HTTPError as exc:
+        return [], f"Models endpoint returned {getattr(exc, 'code', '?')}"
+    except Exception as exc:
+        return [], str(exc) or "Models endpoint unreachable"
+
+
+def list_custom_providers() -> list[dict]:
+    """Return the configured custom providers as UI-facing dicts.
+
+    api_key is never returned verbatim — only whether one is set and, for
+    ``${ENV}`` references, the env-var name and whether it resolves.
+    """
+    result: list[dict] = []
+    for entry in _custom_provider_entries():
+        name = str(entry.get("name") or "").strip()
+        slug = _custom_provider_slug_from_name(name)
+        if not name or not slug:
+            continue
+        raw_key = str(entry.get("api_key") or "").strip()
+        env_ref = None
+        has_key = bool(raw_key)
+        if raw_key.startswith("${") and raw_key.endswith("}"):
+            env_ref = raw_key[2:-1]
+            has_key = bool(os.getenv(env_ref, "").strip())
+        elif not raw_key and entry.get("key_env"):
+            env_ref = str(entry.get("key_env"))
+            has_key = bool(os.getenv(env_ref, "").strip())
+        result.append({
+            "slug": slug,
+            "name": name,
+            "base_url": str(entry.get("base_url") or "").strip(),
+            "models": _normalize_custom_provider_models(
+                entry.get("models") if entry.get("models") is not None else entry.get("model")
+            ),
+            "has_key": has_key,
+            "key_is_env": env_ref is not None,
+            "key_env": env_ref,
+        })
+    return result
+
+
+def upsert_custom_provider(
+    name: object,
+    base_url: object,
+    api_key: object = "",
+    models: object = None,
+    *,
+    probe: bool = True,
+    original_name: object = None,
+) -> dict:
+    """Create or update a custom OpenAI-compatible provider in config.yaml.
+
+    Models are the union of the supplied ``models`` (manual) and, when
+    ``probe`` is set, ids auto-discovered from ``{base_url}/v1/models``. An
+    empty ``api_key`` on an existing entry preserves the stored key (so the
+    UI need not re-send the secret on every edit).
+    """
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("Provider name is required")
+    slug = _custom_provider_slug_from_name(name)
+    if not slug:
+        raise ValueError("Provider name produces an empty slug")
+    base_url = _normalize_custom_provider_base_url(base_url)
+    api_key = str(api_key or "").strip()
+    manual_models = _normalize_custom_provider_models(models)
+
+    discovered: list[str] = []
+    probe_error: str | None = None
+    if probe:
+        discovered, probe_error = probe_custom_provider_models(base_url, api_key)
+    merged_models = list(dict.fromkeys([*manual_models, *discovered]))
+
+    target_slugs = {slug}
+    if original_name:
+        os_slug = _custom_provider_slug_from_name(original_name)
+        if os_slug:
+            target_slugs.add(os_slug)
+
+    config_path = _get_config_path()
+    raw = _load_raw_yaml_config_file(config_path)
+    providers = raw.get("custom_providers")
+    if not isinstance(providers, list):
+        providers = []
+
+    managed = {"name": name, "base_url": base_url}
+    if api_key:
+        managed["api_key"] = api_key
+    if merged_models:
+        managed["models"] = merged_models
+
+    new_list: list = []
+    replaced = False
+    for entry in providers:
+        if (
+            not replaced
+            and isinstance(entry, dict)
+            and _custom_provider_slug_from_name(entry.get("name")) in target_slugs
+        ):
+            # Preserve unmanaged keys (e.g. key_env) but let managed fields win.
+            new_entry = {**entry, **managed}
+            new_list.append(new_entry)
+            replaced = True
+        else:
+            new_list.append(entry)
+    if not replaced:
+        new_list.append(managed)
+
+    raw["custom_providers"] = new_list
+    _save_yaml_config_file(config_path, raw)
+    reload_config()
+    invalidate_models_cache()
+    return {
+        "slug": slug,
+        "name": name,
+        "base_url": base_url,
+        "models": merged_models,
+        "discovered": discovered,
+        "probe_error": probe_error,
+        "created": not replaced,
+    }
+
+
+def remove_custom_provider(name: object) -> dict:
+    """Delete a custom provider (matched by name slug) from config.yaml."""
+    slug = _custom_provider_slug_from_name(name)
+    if not slug:
+        raise ValueError("Provider name produces an empty slug")
+    config_path = _get_config_path()
+    raw = _load_raw_yaml_config_file(config_path)
+    providers = raw.get("custom_providers")
+    if not isinstance(providers, list):
+        return {"removed": False, "slug": slug}
+    kept = [
+        entry
+        for entry in providers
+        if not (isinstance(entry, dict) and _custom_provider_slug_from_name(entry.get("name")) == slug)
+    ]
+    removed = len(kept) != len(providers)
+    if removed:
+        if kept:
+            raw["custom_providers"] = kept
+        else:
+            raw.pop("custom_providers", None)
+        _save_yaml_config_file(config_path, raw)
+        reload_config()
+        invalidate_models_cache()
+    return {"removed": removed, "slug": slug}
+
+
 # Initial load
 reload_config()
 cfg = _cfg_cache  # alias for backward compat with existing references
