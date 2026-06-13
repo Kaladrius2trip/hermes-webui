@@ -2144,8 +2144,32 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _smdReconnect=false;
     _resetStreamFadeState();
     assistantBody.classList.remove('stream-fade-active');
+    // A MEDIA-bearing live segment re-renders via full innerHTML on every
+    // token tick (the streamed text grows, so the equality guard above never
+    // short-circuits). Recreating each <img> forces the browser to re-decode
+    // it, blanking the element for a frame — the visible "flicker in segments"
+    // while images stream. Capture the already-decoded <img> nodes and
+    // transplant them into the freshly rendered tree (matched by src) so their
+    // painted state survives the rebuild.
+    const _prevImgs=new Map();
+    if(assistantBody.querySelectorAll){
+      assistantBody.querySelectorAll('img[src]').forEach(im=>{
+        const k=im.getAttribute('src');
+        if(k&&!_prevImgs.has(k)) _prevImgs.set(k, im);
+      });
+    }
     assistantBody.innerHTML=renderMd ? renderMd(text) : esc(text);
     _sanitizeSmdLinks(assistantBody);
+    if(_prevImgs.size&&assistantBody.querySelectorAll){
+      assistantBody.querySelectorAll('img[src]').forEach(im=>{
+        const k=im.getAttribute('src');
+        const old=k?_prevImgs.get(k):null;
+        if(old&&old!==im&&im.parentNode){
+          im.parentNode.replaceChild(old, im);
+          _prevImgs.delete(k);  // reuse each cached node at most once
+        }
+      });
+    }
     if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(assistantBody);
     _renderMdLiveSegmentText=text;
     _renderMdLiveSegmentBody=assistantBody;
