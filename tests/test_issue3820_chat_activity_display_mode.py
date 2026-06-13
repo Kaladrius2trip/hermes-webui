@@ -395,8 +395,11 @@ def test_fade_text_effect_uses_dynamic_window_check():
 
     # The preferences listener must update the runtime flag immediately, not
     # only after autosave/save completes.
-    fade_cb_start = PANELS_JS.index("const fadeTextCb=$('settingsFadeTextEffect');", 300000)
-    fade_cb_end = PANELS_JS.index("const terminalAutoExpandCb", fade_cb_start)
+    # Anchor on the settings-load/change block (distinguished by `if(fadeTextCb){`),
+    # not the save-payload block (`if(fadeTextCb) payload...`). A fixed byte
+    # offset is fragile against fork-added settings shifting file positions.
+    fade_cb_start = PANELS_JS.index("const fadeTextCb=$('settingsFadeTextEffect');\n    if(fadeTextCb){")
+    fade_cb_end = PANELS_JS.index("}", PANELS_JS.index("_schedulePreferencesAutosave();", fade_cb_start))
     fade_cb_block = PANELS_JS[fade_cb_start:fade_cb_end]
     assert "window._fadeTextEffect=fadeTextCb.checked" in fade_cb_block
     assert "fadeTextCb.addEventListener('change',()=>{" in fade_cb_block

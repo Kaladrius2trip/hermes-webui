@@ -3159,6 +3159,116 @@ def _minimal_static_models_catalog(*, allow_local_probe: bool = False) -> dict:
         }
 
 
+def _configured_model_badges_from_static_catalog(
+    groups: list[dict],
+    *,
+    active_provider: str | None,
+    default_model: str,
+) -> dict[str, dict[str, str]]:
+    configured_entries: list[dict[str, str]] = []
+    if active_provider and default_model:
+        configured_entries.append(
+            {
+                "provider": active_provider,
+                "model": default_model,
+                "role": "primary",
+                "label": "Primary",
+            }
+        )
+
+    fallback_cfg = cfg.get("fallback_providers", []) if isinstance(cfg, dict) else []
+    if isinstance(fallback_cfg, list):
+        for idx, entry in enumerate(fallback_cfg, start=1):
+            if not isinstance(entry, dict):
+                continue
+            provider = _resolve_provider_alias(entry.get("provider"))
+            model = str(entry.get("model") or "").strip()
+            if not provider or not model:
+                continue
+            configured_entries.append(
+                {
+                    "provider": provider,
+                    "model": model,
+                    "role": "fallback",
+                    "label": f"Fallback {idx}",
+                }
+            )
+
+    option_ids = [
+        m.get("id", "")
+        for g in groups
+        for m in g.get("models", [])
+        if m.get("id")
+    ]
+    option_lookup = {str(opt_id): str(opt_id) for opt_id in option_ids}
+    option_provider_lookup = {
+        str(m.get("id")): str(g.get("provider_id") or "")
+        for g in groups
+        for m in g.get("models", [])
+        if m.get("id")
+    }
+
+    def _norm_static_model_id(model_id: str) -> str:
+        s = str(model_id or "").strip().lower()
+        if s.startswith("@") and ":" in s:
+            parts = s.split(":")
+            s = parts[-1] or s
+        if "://" not in s and "/" in s:
+            stripped = s.split("/", 1)[1]
+            s = stripped or s
+        return s.replace("-", ".")
+
+    norm_lookup: dict[str, list[str]] = {}
+    for opt_id in option_ids:
+        norm_lookup.setdefault(_norm_static_model_id(opt_id), []).append(opt_id)
+
+    badges: dict[str, dict[str, str]] = {}
+    for entry in configured_entries:
+        provider = entry["provider"]
+        model = entry["model"]
+        raw_candidates = []
+        for candidate in (model, f"{provider}/{model}", f"@{provider}:{model}"):
+            if candidate and candidate not in raw_candidates:
+                raw_candidates.append(candidate)
+
+        match_id = None
+        for candidate in raw_candidates:
+            if (
+                candidate in option_lookup
+                and option_provider_lookup.get(candidate) == provider
+            ):
+                match_id = option_lookup[candidate]
+                break
+        if match_id is None:
+            for candidate in raw_candidates:
+                normalized = _norm_static_model_id(candidate)
+                matches = norm_lookup.get(normalized, [])
+                if not matches:
+                    continue
+                provider_match = next(
+                    (m for m in matches if option_provider_lookup.get(m) == provider),
+                    None,
+                )
+                match_id = provider_match or matches[0]
+                if match_id:
+                    break
+
+        badge_payload = {
+            "role": entry["role"],
+            "label": entry["label"],
+            "provider": provider,
+        }
+        for candidate in raw_candidates:
+            candidate_provider = option_provider_lookup.get(candidate)
+            if candidate_provider and candidate_provider != provider:
+                continue
+            badges[candidate] = badge_payload
+        if match_id:
+            badges[match_id] = badge_payload
+
+    return badges
+
+
 def _static_models_catalog_without_live_probes() -> dict:
     """Return a network-free /api/models catalog from local config/auth only."""
     try:
@@ -5887,7 +5997,7 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
         # PR #2971: the previous ``if disk_groups is not None`` branch
         # here was dead code. Fall back directly to the static minimal
         # catalog (no second disk read).
-        return copy.deepcopy(_minimal_static_models_catalog(allow_local_probe=True))
+        return copy.deepcopy(_static_models_catalog_without_live_probes())
 
 
 # ── Static file path ─────────────────────────────────────────────────────────
