@@ -4083,6 +4083,9 @@ def _session_context_messages(session):
     return session.messages or []
 
 
+_ID_CACHE_MISS = object()
+
+
 def _message_identity(msg):
     if not isinstance(msg, dict):
         return None
@@ -4560,15 +4563,44 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     # at/after a cursor. Any context messages between the cursor and that
     # match are context-only gaps that get spliced in before the display msg.
     if previous_display and previous_context:
-        _display_id_set = {_message_identity(m) for m in previous_display}
+        # Memoize identities: _message_identity does json.dumps + regex per
+        # message, and this block is re-run at the end of EVERY turn over the
+        # full (lineage-stitched) transcript. Without the cache the loop below
+        # recomputed identities O(n^2) times, pinning a CPU core for minutes on
+        # long sessions — the "running but doing nothing" hang.
+        _id_cache = {}
+        def _idc(m):
+            k = id(m)
+            v = _id_cache.get(k, _ID_CACHE_MISS)
+            if v is _ID_CACHE_MISS:
+                v = _message_identity(m)
+                _id_cache[k] = v
+            return v
+        _display_id_set = {_idc(m) for m in previous_display}
         _context_id_set = {
-            _message_identity(m)
+            _idc(m)
             for m in previous_context
             if not _is_context_compression_marker(m)
         }
         _has_context_only_turns = bool(_context_id_set - _display_id_set)
         if _has_context_only_turns:
-            context_keys = [_message_identity(m) for m in previous_context]
+            context_keys = [_idc(m) for m in previous_context]
+            display_keys = [_idc(m) for m in previous_display]
+            # last position of each context key (None keys included so the
+            # original `key in context_keys[_cursor:]` membership — which can
+            # match a None identity — is preserved exactly).
+            _last_ctx_pos = {}
+            for _ci, _ck in enumerate(context_keys):
+                _last_ctx_pos[_ck] = _ci
+            # suffix_max[i] = max context position reachable by any display key
+            # AFTER index i; lets the "flush remaining context" test below run
+            # in O(1) instead of scanning all future display rows × context.
+            _n_disp = len(previous_display)
+            _suffix_max_ctx_pos = [-1] * (_n_disp + 1)
+            for _di in range(_n_disp - 1, -1, -1):
+                _nxt = _suffix_max_ctx_pos[_di + 1]
+                _cand = _last_ctx_pos.get(display_keys[_di], -1)
+                _suffix_max_ctx_pos[_di] = _cand if _cand > _nxt else _nxt
             _backfilled = []
             # #3300 fix: track ONLY context rows we splice in, so the
             # visible-display backbone is never suppressed. Sharing one set
@@ -4580,7 +4612,7 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             _context_inserted = set()
             _cursor = 0
             for _display_idx, _dmsg in enumerate(previous_display):
-                _dkey = _message_identity(_dmsg)
+                _dkey = display_keys[_display_idx]
                 if _dkey is not None:
                     _j = _cursor
                     while _j < len(context_keys) and context_keys[_j] != _dkey:
@@ -4593,10 +4625,7 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                                 _backfilled.append(copy.deepcopy(_cmsg))
                                 _context_inserted.add(_ckey)
                         _cursor = _j + 1
-                    elif not any(
-                        _message_identity(_future_dmsg) in context_keys[_cursor:]
-                        for _future_dmsg in previous_display[_display_idx + 1:]
-                    ):
+                    elif _suffix_max_ctx_pos[_display_idx + 1] < _cursor:
                         for _k in range(_cursor, len(context_keys)):
                             _ckey = context_keys[_k]
                             _cmsg = previous_context[_k]
