@@ -4497,6 +4497,49 @@ function setStatus(t){
   showToast(t, 4000);
 }
 
+// ── Live "waiting for the model" indicator ─────────────────────────────────
+// The top run-activity card was removed (Phase C), so between hitting send and
+// the first streamed token/reasoning/tool event there was NO visible progress
+// — a reasoning model on a large context can take tens of seconds of pre-token
+// latency, surfacing as a bare "running" that seems hung. This shows a calm
+// "Waiting for the model · Ns" line during exactly that gap and clears the
+// moment any output (content / reasoning / tool) or a terminal event arrives.
+let _chatPendingTimer=null;
+let _chatPendingStartedAt=0;
+function _chatPendingHost(){
+  return document.getElementById('messages');
+}
+function showChatPendingIndicator(){
+  const host=_chatPendingHost();
+  if(!host) return;
+  let el=document.getElementById('chatPendingIndicator');
+  if(!el){
+    el=document.createElement('div');
+    el.id='chatPendingIndicator';
+    el.className='chat-pending';
+    el.innerHTML='<span class="chat-pending-dots" aria-hidden="true"><i></i><i></i><i></i></span>'
+      +'<span class="chat-pending-text"></span><span class="chat-pending-elapsed"></span>';
+  }
+  el.querySelector('.chat-pending-text').textContent=(typeof t==='function'&&t('chat_waiting_model'))||'Waiting for the model';
+  host.appendChild(el);  // keep it last so it sits below the live turn
+  _chatPendingStartedAt=Date.now();
+  const tick=()=>{
+    const cur=document.getElementById('chatPendingIndicator');
+    if(!cur){ if(_chatPendingTimer){clearInterval(_chatPendingTimer);_chatPendingTimer=null;} return; }
+    const secs=Math.floor((Date.now()-_chatPendingStartedAt)/1000);
+    const span=cur.querySelector('.chat-pending-elapsed');
+    if(span) span.textContent=secs>=1?` · ${secs<60?secs+'s':Math.floor(secs/60)+'m '+(secs%60)+'s'}`:'';
+  };
+  tick();
+  if(_chatPendingTimer) clearInterval(_chatPendingTimer);
+  _chatPendingTimer=setInterval(tick,1000);
+}
+function hideChatPendingIndicator(){
+  if(_chatPendingTimer){clearInterval(_chatPendingTimer);_chatPendingTimer=null;}
+  const el=document.getElementById('chatPendingIndicator');
+  if(el) el.remove();
+}
+
 function setComposerStatus(t){
   const el=$('composerStatus');
   if(!el)return;
@@ -4872,6 +4915,7 @@ function setBusy(v){
   updateSendBtn();
   if(!v){
     if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
+    if(typeof hideChatPendingIndicator==='function') hideChatPendingIndicator();
     setStatus('');
     setComposerStatus('');
     const sid=_queueDrainSid||(S.session&&S.session.session_id);

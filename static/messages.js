@@ -2812,6 +2812,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       try{existingLive.source.close();}catch(_){ }
     }
     LIVE_STREAMS[activeSid]={streamId,source};
+    // No output yet — show the "waiting for the model" indicator until the
+    // first token/reasoning/tool (or a terminal event) arrives.
+    if(typeof showChatPendingIndicator==='function'&&!assistantText&&!(typeof reasoningText!=='undefined'&&reasoningText)) showChatPendingIndicator();
 
     // Note on #631 Bug B: the original PR description stated the server
     // "replays buffered token events" on reconnect, and proposed resetting
@@ -2834,6 +2837,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       assistantText+=d.text;
       syncInflightAssistantMessage();
       if(!S.session||S.session.session_id!==activeSid) return;
+      if(typeof hideChatPendingIndicator==='function') hideChatPendingIndicator();
       _completeAutomaticCompressionOnLiveProgress(activeSid);
       const parsed=_parseStreamState();
       if(_freshSegment) appendThinking('', _liveThinkingPlacement());
@@ -2843,6 +2847,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('interim_assistant',e=>{
       if(_terminalStateReached||_streamFinalized) return;
+      if(typeof hideChatPendingIndicator==='function') hideChatPendingIndicator();
       const d=JSON.parse(e.data);
       const visible=String(d&&d.text?d.text:'').trim();
       const alreadyStreamed=!!(d&&d.already_streamed);
@@ -2918,6 +2923,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('reasoning',e=>{
       if(_terminalStateReached||_streamFinalized) return;
+      if(typeof hideChatPendingIndicator==='function') hideChatPendingIndicator();
       const d=JSON.parse(e.data);
       const text=d.text||'';
       reasoningText += text;
@@ -2940,6 +2946,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('tool',e=>{
       if(_terminalStateReached||_streamFinalized) return;
+      if(typeof hideChatPendingIndicator==='function') hideChatPendingIndicator();
       if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
@@ -3181,6 +3188,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('done',e=>{
       if(_streamFinalized) return;
+      if(typeof hideChatPendingIndicator==='function') hideChatPendingIndicator();
       _clearStreamEndRecovery();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       // Set _streamFinalized IMMEDIATELY — before any fade delay. Without this,
@@ -3635,6 +3643,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('error',async e=>{
+      if(typeof hideChatPendingIndicator==='function') hideChatPendingIndicator();
       if(_bailOutOfTerminalEventsFromStaleStream(source) && !_streamFinalized){
         return;
       }
@@ -3695,6 +3704,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('cancel',e=>{
+      if(typeof hideChatPendingIndicator==='function') hideChatPendingIndicator();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       _clearStreamEndRecovery();
       _terminalStateReached=true;

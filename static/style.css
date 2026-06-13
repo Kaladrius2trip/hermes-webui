@@ -5535,3 +5535,13 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 .todo-menu-item-status-completed .todo-menu-text{color:var(--muted);text-decoration:line-through;}
 .todo-menu-text{overflow-wrap:anywhere;line-height:1.35;}
 .todo-menu-empty{padding:10px;font-size:11px;color:var(--muted);text-align:center;}
+
+/* ── "Waiting for the model" pending indicator (pre-token latency) ──────── */
+.chat-pending{display:flex;align-items:center;gap:8px;margin:8px auto;max-width:min(var(--msg-max,760px),100%);padding:6px 12px;color:var(--muted);font-size:12px;}
+.chat-pending-dots{display:inline-flex;gap:3px;}
+.chat-pending-dots i{width:5px;height:5px;border-radius:50%;background:var(--accent,#888);display:inline-block;animation:chat-pending-bounce 1.2s infinite ease-in-out both;}
+.chat-pending-dots i:nth-child(1){animation-delay:-0.24s;}
+.chat-pending-dots i:nth-child(2){animation-delay:-0.12s;}
+.chat-pending-elapsed{font-variant-numeric:tabular-nums;opacity:.8;}
+@keyframes chat-pending-bounce{0%,80%,100%{transform:scale(.5);opacity:.4;}40%{transform:scale(1);opacity:1;}}
+@media (prefers-reduced-motion:reduce){.chat-pending-dots i{animation:none;opacity:.7;}}
