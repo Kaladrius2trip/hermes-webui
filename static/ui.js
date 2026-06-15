@@ -10144,6 +10144,20 @@ function _restoreMessageScrollStateForSession(sid){
   if(!sid||!activeSid||sid!==activeSid) return;
   const snapshot=_loadMessageScrollState(sid);
   if(!snapshot) return;
+  // Virtualized transcripts (upstream message virtualization, post-merge) size
+  // the scroll container from ESTIMATED row heights, so a persisted raw-pixel
+  // offset (#2361) no longer maps to the same content — applying it lands the
+  // reader mid-nowhere, drops rendered rows, and makes the scrollbar jump.
+  // Skip the pixel restore when virtualized (the natural render lands near the
+  // tail, matching upstream's load-at-bottom default); keep it for small,
+  // fully-rendered sessions where scrollHeight is stable.
+  try{
+    if(typeof _currentMessageVirtualWindow==='function'&&typeof _getVisibleMessagesWithIdx==='function'){
+      const _vw=_currentMessageVirtualWindow(_getVisibleMessagesWithIdx(),
+        typeof _messageVirtualKeepTailCount==='function'?_messageVirtualKeepTailCount():0);
+      if(_vw&&_vw.virtualized) return;
+    }
+  }catch(_){}
   if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
   _restoreMessageScrollSnapshot(snapshot);
   const el=$('messages');
