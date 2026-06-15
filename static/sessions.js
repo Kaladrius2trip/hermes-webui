@@ -2509,6 +2509,13 @@ async function _loadOlderMessages() {
         container.scrollTop = oldTop + addedHeight;
         requestAnimationFrame(()=>{ _programmaticScroll = false; });
       }
+      // renderMessages({preserveScroll}) can take the follow-to-bottom branch
+      // when the reader is briefly near the bottom of a short loaded window and
+      // schedule delayed bottom-settle re-applies. Those async settles fire
+      // AFTER the synchronous prepend restore above and yank the viewport to the
+      // bottom — the reported "scroll jumps down, I lose my place when older
+      // messages load". Cancel any pending settle so the prepend anchor stays put.
+      if (typeof _cancelBottomSettle === 'function') _cancelBottomSettle();
     }
     _scrollPinned = false;
   } catch(e) {
