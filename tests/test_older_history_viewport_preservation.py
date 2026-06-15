@@ -39,8 +39,11 @@ def test_loading_older_messages_preserves_viewport_without_bottom_snap():
     assert "renderMessages({ preserveScroll: true });" in body
     assert "const viewportAnchor = (container && typeof _captureMessageViewportAnchor === 'function')" in body
     assert "_captureMessageViewportAnchor()" in body
-    assert "_restoreMessageViewportAnchor(viewportAnchor, olderMsgs.length)" in body
-    assert "const restoredViaAnchor = (viewportAnchor && typeof _restoreMessageViewportAnchor === 'function')" in body
+    # Anchor restore now runs through the ResizeObserver-backed settle so it is
+    # re-applied as Prism/KaTeX/late images resize rows after the prepend render
+    # (a single synchronous restore drifted on large "load earlier" pages).
+    assert "_settleMessageScrollToAnchor(viewportAnchor, olderMsgs.length)" in body
+    assert "const restoredViaAnchor = (viewportAnchor && typeof _settleMessageScrollToAnchor === 'function')" in body
     assert "if (!restoredViaAnchor) {" in body
     assert "const virtualAddedHeight = (typeof _messageVirtualPrependedHeightDelta === 'function')" in body
     assert "_messageVirtualPrependedHeightDelta(addedRenderable)" in body
@@ -48,7 +51,7 @@ def test_loading_older_messages_preserves_viewport_without_bottom_snap():
     assert "container.scrollTop = oldTop + addedHeight" in body
     assert "container.scrollTop = newScrollH - prevScrollH" not in body
 
-    restore_idx = body.index("_restoreMessageViewportAnchor(viewportAnchor, olderMsgs.length)")
+    restore_idx = body.index("_settleMessageScrollToAnchor(viewportAnchor, olderMsgs.length)")
     virtual_idx = body.index("_messageVirtualPrependedHeightDelta(addedRenderable)")
     scroll_delta_idx = body.index("Math.max(0, newScrollH - prevScrollH)")
     unpin_idx = body.rindex("_scrollPinned = false")
@@ -70,6 +73,6 @@ def test_loading_older_messages_captures_anchor_before_replacing_messages():
     anchor_idx = body.index("const viewportAnchor = (container && typeof _captureMessageViewportAnchor === 'function')")
     replace_idx = body.index("S.messages = nextMessages")
     render_idx = body.index("renderMessages({ preserveScroll: true });")
-    restore_idx = body.index("_restoreMessageViewportAnchor(viewportAnchor, olderMsgs.length)")
+    restore_idx = body.index("_settleMessageScrollToAnchor(viewportAnchor, olderMsgs.length)")
 
     assert anchor_idx < replace_idx < render_idx < restore_idx

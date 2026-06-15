@@ -2491,11 +2491,19 @@ async function _loadOlderMessages() {
     _oldestIdx = responseSession._messages_offset || 0;
     renderMessages({ preserveScroll: true });
     if (container) {
+      // renderMessages({preserveScroll}) can take the follow-to-bottom branch on
+      // a short loaded window and schedule delayed bottom-settle re-applies.
+      // Cancel them first so they don't fight the prepend restore below.
+      if (typeof _cancelBottomSettle === 'function') _cancelBottomSettle();
       // Prepending older messages must not teleport the reader. Anchor to the
-      // first visible rendered row and restore that row's top offset after the
-      // prepend so synthetic virtual spacer heights cannot skew the delta.
-      const restoredViaAnchor = (viewportAnchor && typeof _restoreMessageViewportAnchor === 'function')
-        ? _restoreMessageViewportAnchor(viewportAnchor, olderMsgs.length)
+      // first visible rendered row and RE-APPLY that row's top offset as layout
+      // settles (Prism/KaTeX/late images resize rows AFTER the first render —
+      // a single synchronous restore drifts, badly for large prepends, which is
+      // why the second, bigger "load earlier" lost the reader's place). The
+      // ResizeObserver-backed settle keeps the row pinned until layout is quiet
+      // or the user scrolls.
+      const restoredViaAnchor = (viewportAnchor && typeof _settleMessageScrollToAnchor === 'function')
+        ? _settleMessageScrollToAnchor(viewportAnchor, olderMsgs.length)
         : false;
       if (!restoredViaAnchor) {
         const virtualAddedHeight = (typeof _messageVirtualPrependedHeightDelta === 'function')
@@ -2509,13 +2517,6 @@ async function _loadOlderMessages() {
         container.scrollTop = oldTop + addedHeight;
         requestAnimationFrame(()=>{ _programmaticScroll = false; });
       }
-      // renderMessages({preserveScroll}) can take the follow-to-bottom branch
-      // when the reader is briefly near the bottom of a short loaded window and
-      // schedule delayed bottom-settle re-applies. Those async settles fire
-      // AFTER the synchronous prepend restore above and yank the viewport to the
-      // bottom — the reported "scroll jumps down, I lose my place when older
-      // messages load". Cancel any pending settle so the prepend anchor stays put.
-      if (typeof _cancelBottomSettle === 'function') _cancelBottomSettle();
     }
     _scrollPinned = false;
   } catch(e) {

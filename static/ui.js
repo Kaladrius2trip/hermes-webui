@@ -3521,6 +3521,9 @@ if(typeof window!=='undefined'){
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
     if(_programmaticScroll) return; // ignore scrolls we triggered ourselves
+    // A genuine user scroll cancels any in-flight prepend anchor-settle so we
+    // never fight the reader for the viewport while older history settles.
+    if(typeof _cancelAnchorSettle==='function') _cancelAnchorSettle();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
       const top=el.scrollTop;
@@ -4122,6 +4125,61 @@ function _settleFinalScroll(token){
   requestAnimationFrame(()=>{
     setTimeout(()=>{ _programmaticScroll=false; },0);
   });
+}
+
+// ── Prepend anchor settle ─────────────────────────────────────────────────
+// When older messages are prepended (_loadOlderMessages), a single synchronous
+// _restoreMessageViewportAnchor() runs BEFORE postProcessRenderedMessages()
+// (Prism, KaTeX, late images) changes row heights in a later frame — so the
+// reader drifts, badly for large prepends. Mirror the bottom-settle: re-apply
+// the anchor on every #msgInner resize until layout is quiet (or the user
+// scrolls). ResizeObserver-driven, no scrollHeight polling.
+let _anchorSettleToken=0;
+let _anchorSettleRO=null;
+let _anchorSettleTimer=null;
+let _anchorSettleRAF=0;
+function _cancelAnchorSettle(){
+  _anchorSettleToken++;
+  if(_anchorSettleRO){ _anchorSettleRO.disconnect(); _anchorSettleRO=null; }
+  clearTimeout(_anchorSettleTimer);
+  cancelAnimationFrame(_anchorSettleRAF);
+}
+function _settleMessageScrollToAnchor(anchor, rawIdxDelta){
+  if(!anchor||typeof _restoreMessageViewportAnchor!=='function') return false;
+  const token=++_anchorSettleToken;
+  if(_anchorSettleRO){ _anchorSettleRO.disconnect(); _anchorSettleRO=null; }
+  clearTimeout(_anchorSettleTimer);
+  cancelAnimationFrame(_anchorSettleRAF);
+  // Immediate sync apply anchors the viewport before paint.
+  const applied=_restoreMessageViewportAnchor(anchor, rawIdxDelta);
+  const el=document.getElementById('messages');
+  const observed=document.getElementById('msgInner')||el;
+  if(!observed||typeof ResizeObserver==='undefined') return applied;
+  const reapply=()=>{
+    if(token!==_anchorSettleToken) return;
+    _programmaticScroll=true;
+    _restoreMessageViewportAnchor(anchor, rawIdxDelta);
+    requestAnimationFrame(()=>{ if(token===_anchorSettleToken) _programmaticScroll=false; });
+  };
+  const ro=new ResizeObserver(()=>{
+    if(token!==_anchorSettleToken){ ro.disconnect(); if(_anchorSettleRO===ro) _anchorSettleRO=null; return; }
+    cancelAnimationFrame(_anchorSettleRAF);
+    _anchorSettleRAF=requestAnimationFrame(reapply);
+    clearTimeout(_anchorSettleTimer);
+    _anchorSettleTimer=setTimeout(()=>{
+      if(token!==_anchorSettleToken) return;
+      ro.disconnect(); if(_anchorSettleRO===ro) _anchorSettleRO=null;
+      reapply();
+    },300);
+  });
+  _anchorSettleRO=ro;
+  ro.observe(observed);
+  // Static-content safety net: disconnect after 2s even if no resize fired.
+  _anchorSettleTimer=setTimeout(()=>{
+    if(token!==_anchorSettleToken) return;
+    ro.disconnect(); if(_anchorSettleRO===ro) _anchorSettleRO=null;
+  },2000);
+  return applied;
 }
 function scrollIfPinned(){
   if(!_autoScrollFollow) return;
