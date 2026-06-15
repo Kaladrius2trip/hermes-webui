@@ -47,13 +47,19 @@ def test_session_list_external_refresh_uses_sse_invalidation_not_polling():
     assert "ensureSessionEventsSSE();" in SESSIONS_JS
     assert "document._hermesSessionEventsVisibilityHook" in SESSIONS_JS
     ensure_fn = SESSIONS_JS[SESSIONS_JS.find("function ensureSessionEventsSSE()") :]
-    assert ensure_fn.find("document._hermesSessionEventsVisibilityHook") < ensure_fn.find("document.hidden) return")
+    # The visibility hook must be installed before the open-guard early-return.
+    # #4151 replaced the `document.hidden) return` open guard with the focus-aware
+    # `_sidebarSseBackgrounded()) return` predicate (which also covers PWA blur).
+    assert ensure_fn.find("document._hermesSessionEventsVisibilityHook") < ensure_fn.find("_sidebarSseBackgrounded()) return")
     assert "_sessionListExternalRefreshMs" not in SESSIONS_JS
     assert "addEventListener('sessions_changed', (ev) => {" in ensure_fn
     assert "const activeProfile = S.activeProfile || 'default';" in ensure_fn
     assert "const payload = typeof ev?.data === 'string' ? JSON.parse(ev.data) : {};" in ensure_fn
     assert "const eventProfile = payload && typeof payload.profile === 'string' ? payload.profile : '';" in ensure_fn
     assert "if (!_sessionEventProfilesMatch(eventProfile, activeProfile)) {" in ensure_fn
+    assert "function _sessionEventTargetsActiveSession(payload)" in SESSIONS_JS
+    assert "typeof payload.session_id === 'string'" in SESSIONS_JS
+    assert "eventTargetsActiveSession?'event-active-session':'event'" in ensure_fn
 
 
 def test_session_event_profile_filter_tolerates_default_root_aliases():

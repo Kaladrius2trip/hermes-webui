@@ -4615,13 +4615,14 @@ let _notesSelectedSource = 'joplin';
 let _notesPreviewNote = null;
 let _notesSearchError = '';
 let _notesSearchLoading = false;
-let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'external_notes'
+let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'project_context' | 'external_notes'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
 const MEMORY_SECTIONS = [
   { key: 'memory', labelKey: 'my_notes', emptyKey: 'no_notes_yet', iconKey: 'brain' },
   { key: 'user',   labelKey: 'user_profile', emptyKey: 'no_profile_yet', iconKey: 'user' },
   { key: 'soul',   labelKey: 'agent_soul', emptyKey: 'no_soul_yet', iconKey: 'sparkles' },
+  { key: 'project_context', label: 'Project Context', empty: 'No project context file found for this workspace.', iconKey: 'file-text', readOnly: true },
   { key: 'external_notes', labelKey: 'external_notes_sources', emptyKey: 'external_notes_empty', iconKey: 'book-open' },
 ];
 
@@ -4629,10 +4630,21 @@ function _memorySectionMeta(key) {
   return MEMORY_SECTIONS.find(s => s.key === key) || MEMORY_SECTIONS[0];
 }
 
+function _memorySectionLabel(meta) {
+  if (meta.label) return meta.label;
+  return t(meta.labelKey);
+}
+
+function _memorySectionEmpty(meta) {
+  if (meta.empty) return meta.empty;
+  return t(meta.emptyKey);
+}
+
 function _memorySectionContent(key) {
   if (!_memoryData) return '';
   if (key === 'user') return _memoryData.user || '';
   if (key === 'soul') return _memoryData.soul || '';
+  if (key === 'project_context') return _memoryData.project_context || '';
   return _memoryData.memory || '';
 }
 
@@ -4640,6 +4652,7 @@ function _memorySectionMtime(key) {
   if (!_memoryData) return 0;
   if (key === 'user') return _memoryData.user_mtime || 0;
   if (key === 'soul') return _memoryData.soul_mtime || 0;
+  if (key === 'project_context') return _memoryData.project_context_mtime || 0;
   return _memoryData.memory_mtime || 0;
 }
 
@@ -4649,7 +4662,8 @@ function _setMemoryHeaderButtons(mode) {
   const editBtn = $('btnEditMemoryDetail');
   const cancelBtn = $('btnCancelMemoryDetail');
   const saveBtn = $('btnSaveMemoryDetail');
-  if (mode === 'read' && _currentMemorySection !== 'external_notes') { show(editBtn); hide(cancelBtn); hide(saveBtn); }
+  const meta = _memorySectionMeta(_currentMemorySection);
+  if (mode === 'read' && _currentMemorySection !== 'external_notes' && !meta.readOnly) { show(editBtn); hide(cancelBtn); hide(saveBtn); }
   else if (mode === 'edit') { hide(editBtn); show(cancelBtn); show(saveBtn); }
   else { hide(editBtn); hide(cancelBtn); hide(saveBtn); }
 }
@@ -4732,15 +4746,24 @@ function _renderMemoryDetail(section) {
   const body = $('memoryDetailBody');
   const empty = $('memoryDetailEmpty');
   if (!title || !body) return;
-  title.textContent = t(meta.labelKey);
+  title.textContent = _memorySectionLabel(meta);
   const content = _memorySectionContent(section);
   const mtime = _memorySectionMtime(section);
   const mtimeStr = mtime ? new Date(mtime * 1000).toLocaleString() : '';
   const mtimeHtml = mtimeStr ? `<div class="memory-detail-mtime">${esc(mtimeStr)}</div>` : '';
+  const path = section === 'project_context' && _memoryData ? (_memoryData.project_context_path || '') : '';
+  const fileName = section === 'project_context' && _memoryData ? (_memoryData.project_context_name || (path.split(/[\\/]/).pop() || '')) : '';
+  const pathHtml = path ? `<div class="memory-detail-mtime">${esc(fileName)} · ${esc(path)}</div>` : '';
+  const shadowed = section === 'project_context' && _memoryData && Array.isArray(_memoryData.project_context_shadowed)
+    ? _memoryData.project_context_shadowed
+    : [];
+  const shadowedHtml = shadowed.length
+    ? `<div class="memory-detail-mtime">${esc(shadowed.map(item => `${item.name || 'Context file'} present, shadowed by ${item.shadowed_by || fileName || 'active context'}`).join('; '))}</div>`
+    : '';
   const inner = content
     ? `<div class="memory-content preview-md">${renderMd(content)}</div>`
-    : `<div class="memory-empty">${esc(t(meta.emptyKey))}</div>`;
-  body.innerHTML = `<div class="main-view-content">${mtimeHtml}${inner}</div>`;
+    : `<div class="memory-empty">${esc(_memorySectionEmpty(meta))}</div>`;
+  body.innerHTML = `<div class="main-view-content">${pathHtml}${mtimeHtml}${shadowedHtml}${inner}</div>`;
   body.style.display = '';
   if (empty) empty.style.display = 'none';
   _memoryMode = 'read';
@@ -4753,7 +4776,7 @@ function _renderMemoryEdit(section) {
   const body = $('memoryDetailBody');
   const empty = $('memoryDetailEmpty');
   if (!title || !body) return;
-  title.textContent = t(meta.labelKey);
+  title.textContent = _memorySectionLabel(meta);
   const content = _memorySectionContent(section);
   body.innerHTML = `
     <div class="main-view-content">
@@ -4844,7 +4867,8 @@ async function openMemorySection(section, el) {
 }
 
 function editCurrentMemory() {
-  if (!_currentMemorySection || _currentMemorySection === 'external_notes') return;
+  const meta = _memorySectionMeta(_currentMemorySection);
+  if (!_currentMemorySection || _currentMemorySection === 'external_notes' || meta.readOnly) return;
   _renderMemoryEdit(_currentMemorySection);
 }
 
@@ -4859,6 +4883,7 @@ function closeMemoryEdit() { cancelMemoryEdit(); }
 
 async function submitMemorySave() {
   if (!_currentMemorySection) return;
+  if (_memorySectionMeta(_currentMemorySection).readOnly) return;
   const ta = $('memEditContent');
   const errEl = $('memEditError');
   if (!ta) return;
@@ -5648,6 +5673,7 @@ async function switchToWorkspace(path,name){
     S._profileSwitchWorkspace=null;
     syncTopbar();
     await loadDir('.');
+    if (_currentPanel === 'memory') await loadMemory(true);
     showToast(t('workspace_switched_to',name||getWorkspaceFriendlyName(path)));
   }catch(e){setStatus(t('switch_failed')+e.message);}
 }
@@ -6244,7 +6270,10 @@ async function deleteProfile(name) {
 async function loadMemory(force) {
   const panel = $('memoryPanel');
   try {
-    const data = await api('/api/memory');
+    const memoryUrl = S.session && S.session.session_id
+      ? `/api/memory?session_id=${encodeURIComponent(S.session.session_id)}`
+      : '/api/memory';
+    const data = await api(memoryUrl);
     _memoryData = data;
     if (_currentMemorySection === 'external_notes' && !data.external_notes_enabled) {
       _currentMemorySection = null;
@@ -6260,7 +6289,7 @@ async function loadMemory(force) {
         el.type = 'button';
         el.className = 'side-menu-item';
         if (_currentMemorySection === s.key) el.classList.add('active');
-        el.innerHTML = `${li(s.iconKey,16)}<span>${esc(t(s.labelKey))}</span>`;
+        el.innerHTML = `${li(s.iconKey,16)}<span>${esc(_memorySectionLabel(s))}</span>`;
         el.onclick = () => openMemorySection(s.key, el);
         panel.appendChild(el);
       }
@@ -6787,6 +6816,8 @@ function _preferencesPayloadFromUi(){
   if(fadeTextCb) payload.fade_text_effect=fadeTextCb.checked;
   const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
   if(terminalAutoExpandCb) payload.terminal_auto_expand_on_output=terminalAutoExpandCb.checked;
+  const workspaceTodosTabCb=$('settingsWorkspaceTodosTab');
+  if(workspaceTodosTabCb) payload.workspace_todos_tab=workspaceTodosTabCb.checked;
   const apiRedactCb=$('settingsApiRedact');
   if(apiRedactCb) payload.api_redact_enabled=apiRedactCb.checked;
   const showCliCb=$('settingsShowCliSessions');
@@ -6851,6 +6882,15 @@ function _rememberPreferencesSaved(payload){
   if(payload.language!==undefined) localStorage.setItem('hermes-pref-language',payload.language);
 }
 
+function _applyWorkspaceTodosTabVisibility(){
+  const tab=$('workspaceTodosTab');
+  if(tab) tab.hidden=!window._workspaceTodosTab;
+  const rp=document.querySelector('.rightpanel');
+  if(!window._workspaceTodosTab && rp && rp.dataset.activeTab==='todos'){
+    if(typeof switchWorkspacePanelTab==='function') switchWorkspacePanelTab('files');
+  }
+}
+
 function _schedulePreferencesAutosave(){
   const payload=_preferencesPayloadFromUi();
   _rememberPreferencesSaved(payload);
@@ -6865,6 +6905,10 @@ async function _autosavePreferencesSettings(payload){
     const saved=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
     if(payload&&payload.terminal_auto_expand_on_output!==undefined){
       window._terminalAutoExpandOnOutput=!!(saved&&saved.terminal_auto_expand_on_output);
+    }
+    if(payload&&payload.workspace_todos_tab!==undefined){
+      window._workspaceTodosTab=!!(saved&&saved.workspace_todos_tab);
+      if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
     }
     if(payload&&Object.prototype.hasOwnProperty.call(payload,'fade_text_effect')) window._fadeTextEffect=!!payload.fade_text_effect;
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'pinned_sessions_limit')) window._pinnedSessionsLimit=parseInt(saved.pinned_sessions_limit,10)||3;
@@ -7152,10 +7196,21 @@ async function loadSettingsPanel(){
     }
     const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
     if(terminalAutoExpandCb){terminalAutoExpandCb.checked=!!settings.terminal_auto_expand_on_output;window._terminalAutoExpandOnOutput=terminalAutoExpandCb.checked;terminalAutoExpandCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const workspaceTodosTabCb=$('settingsWorkspaceTodosTab');
+    if(workspaceTodosTabCb){
+      workspaceTodosTabCb.checked=!!settings.workspace_todos_tab;
+      window._workspaceTodosTab=workspaceTodosTabCb.checked;
+      _applyWorkspaceTodosTabVisibility();
+      workspaceTodosTabCb.addEventListener('change',()=>{
+        window._workspaceTodosTab=workspaceTodosTabCb.checked;
+        _applyWorkspaceTodosTabVisibility();
+        _schedulePreferencesAutosave();
+      },{once:false});
+    }
     const apiRedactCb=$('settingsApiRedact');
     if(apiRedactCb){apiRedactCb.checked=settings.api_redact_enabled!==false;apiRedactCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
-    if(showCliCb){showCliCb.checked=!!settings.show_cli_sessions;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    if(showCliCb){showCliCb.checked=settings.show_cli_sessions!==false;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showAllWsCb=$('settingsShowAllWorkspaces');
     if(showAllWsCb){showAllWsCb.checked=settings.show_all_workspaces!==false;showAllWsCb.addEventListener('change',()=>{window._showAllWorkspaces=showAllWsCb.checked;if(typeof renderSessionListFromCache==='function')renderSessionListFromCache();_schedulePreferencesAutosave();},{once:false});}
     const showCronCb=$('settingsShowCronSessions');
@@ -8252,7 +8307,14 @@ async function _saveCustomProvider(opts){
 }
 
 async function _deleteCustomProvider(name,btn){
-  if(!confirm((t('custom_providers_confirm_delete')||'Delete custom provider')+' "'+name+'"?')) return;
+  const ok=await showConfirmDialog({
+    title:t('custom_providers_confirm_delete')||'Delete custom provider',
+    message:'"'+name+'"?',
+    confirmLabel:t('providers_remove')||'Delete',
+    danger:true,
+    focusCancel:true,
+  });
+  if(!ok) return;
   if(btn){ btn.disabled=true; }
   try{
     const res=await api('/api/providers/custom/delete',{method:'POST',body:JSON.stringify({name})});
@@ -8457,6 +8519,8 @@ function _applySavedSettingsUi(saved, body, opts){
   window._simplifiedToolCalling=true;
   _syncChatActivityDisplayModeControl(body.chat_activity_display_mode);
   window._terminalAutoExpandOnOutput=!!body.terminal_auto_expand_on_output;
+  window._workspaceTodosTab=!!body.workspace_todos_tab;
+  if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
   window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   window._sidebarDensity=sidebarDensity==='detailed'?'detailed':'compact';
@@ -8803,6 +8867,7 @@ async function saveSettings(andClose){
   body.show_tps=showTps;
   body.fade_text_effect=fadeTextEffect;
   body.terminal_auto_expand_on_output=!!($('settingsTerminalAutoExpand')||{}).checked;
+  body.workspace_todos_tab=!!window._workspaceTodosTab;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
   body.show_all_workspaces=!!(($('settingsShowAllWorkspaces')||{checked:true}).checked);

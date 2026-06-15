@@ -64,26 +64,32 @@ def test_session_menu_exposes_one_canonical_title_action():
     menu_end = SESSIONS_JS.index("document.addEventListener('click'", menu_start)
     menu_block = SESSIONS_JS[menu_start:menu_end]
 
+    # Upstream sync (writable imports can regenerate): the menu drives the
+    # dedicated /api/session/title/regenerate endpoint directly; read-only
+    # sessions are gated by the shared _isReadOnlySession() early-return. Exactly
+    # one canonical title action remains.
     assert "t('session_generate_title')" not in menu_block
     assert "t('session_generate_title_desc')" not in menu_block
     assert menu_block.count("t('session_title_regenerate')") == 1
     assert menu_block.count("t('session_title_regenerate_desc')") == 1
-    assert menu_block.count("_forceGenerateSessionTitle(session)") == 1
-    assert "api('/api/session/title/regenerate'" not in menu_block
+    assert menu_block.count("api('/api/session/title/regenerate'") == 1
 
 
-def test_title_refresh_and_regenerate_routes_share_canonical_handler():
+def test_title_refresh_and_regenerate_routes_are_distinct_handlers():
     refresh_idx = ROUTES_PY.index('"/api/session/title/refresh"')
     regenerate_idx = ROUTES_PY.index('"/api/session/title/regenerate"')
     next_endpoint_idx = ROUTES_PY.index('"/api/personality/set"', regenerate_idx)
     refresh_block = ROUTES_PY[refresh_idx:regenerate_idx]
     regenerate_block = ROUTES_PY[regenerate_idx:next_endpoint_idx]
 
+    # Refresh keeps the canonical shared handler; explicit regenerate uses the
+    # materialize-aware endpoint so writable imported sessions can regenerate
+    # (read-only blocked via PermissionError). Both still persist + publish via
+    # the shared title-generation core (api-routes-003 audit fix preserved).
     assert "_handle_session_title_refresh(handler, body)" in refresh_block
-    # Explicit regenerate forces past the manual-title guard (upstream contract).
-    assert "_handle_session_title_refresh(handler, body, force=True)" in regenerate_block
-    assert "generate_session_title_for_session" not in regenerate_block
-    assert "prefer_latest" not in regenerate_block
+    assert "_get_or_materialize_session(sid)" in regenerate_block
+    assert "except PermissionError:" in regenerate_block
+    assert '_persist_generated_session_title(s, next_title, event_reason="session_title_regenerate")' in regenerate_block
 
 
 def test_balanced_title_context_includes_opening_recent_and_latest_with_role_labels():

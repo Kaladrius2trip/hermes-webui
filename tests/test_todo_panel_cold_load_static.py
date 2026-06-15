@@ -34,3 +34,20 @@ def test_legacy_todos_fallback_still_uses_raw_session_messages():
 
     assert "function _legacyTodosFromMessages()" in src
     assert "const sourceMessages = (S.session && Array.isArray(S.session.messages) && S.session.messages.length) ? S.session.messages : S.messages;" in src
+
+
+def test_workspace_todos_tab_prefers_live_sse_snapshot_before_cold_load_sidecar():
+    # Fork implementation: the Workspace Todos tab renders through
+    # renderWorkspaceTodos() (ui.js), which prefers the live _workspaceTodosState
+    # snapshot (updated from todo_state SSE) over a cold message scan, so opening
+    # the tab after an SSE update does not show the stale sidecar.
+    src = (REPO_ROOT / "static" / "ui.js").read_text(encoding="utf-8")
+    start = src.find("function renderWorkspaceTodos()")
+    assert start != -1, "renderWorkspaceTodos() must exist in ui.js"
+    helper = src[start:start + 600]
+    # Live SSE snapshot is consulted first, message scan only as a fallback.
+    assert "_workspaceTodosState||_latestTodoToolState" in helper, (
+        "Workspace Todos must prefer the live _workspaceTodosState snapshot so "
+        "opening the tab after todo_state SSE updates does not render the stale "
+        "cold-load sidecar"
+    )

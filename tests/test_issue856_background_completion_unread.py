@@ -206,7 +206,7 @@ def test_polling_transition_tracks_the_same_effective_streaming_state_as_sidebar
         "s.is_streaming||s.active_stream_id||s.pending_user_message||s.pending_started_at||_isSessionLocallyStreaming(s)"
         in compact_effective
     )
-    assert "const isStreaming=_isSessionEffectivelyStreaming(s);" in render_block, (
+    assert "const ownStreaming=_isSessionEffectivelyStreaming(s)" in render_block, (
         "the row spinner and polling completion transition must use the same "
         "effective streaming source, including local INFLIGHT-only streams"
     )
@@ -223,8 +223,8 @@ def test_cache_render_seeds_streaming_transition_state_for_visible_spinners():
 
     assert "if (!s || !s.session_id || !isStreaming) return;" in remember_block
     assert "_sessionStreamingById.set(s.session_id, true);" in remember_block
-    assert "const isStreaming=_isSessionEffectivelyStreaming(s);" in render_block
-    assert "_rememberRenderedStreamingState(s, isStreaming);" in render_block, (
+    assert "const ownStreaming=_isSessionEffectivelyStreaming(s)" in render_block
+    assert "_rememberRenderedStreamingState(s, ownStreaming);" in render_block, (
         "renderSessionListFromCache can display a spinner from local INFLIGHT "
         "state before a full poll runs, so it must seed the transition map too"
     )

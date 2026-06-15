@@ -85,24 +85,44 @@ async function _probeOfflineRecovery(){
   if(_offlineHealthProbePromise)return _offlineHealthProbePromise;
   _offlineHealthProbePromise=(async()=>{
     const fetcher=_offlineRawFetch||window.fetch.bind(window);
+    // Bound the probe so a black-hole network (connected, server hung, packets
+    // dropped) can't delay the banner past a few seconds — the probe now gates
+    // the initial banner display on the offline-event/startup paths.
+    let ctrl=null,timer=null;
+    try{ctrl=(typeof AbortController!=='undefined')?new AbortController():null;}catch(_){ctrl=null;}
+    if(ctrl)timer=setTimeout(()=>{try{ctrl.abort();}catch(_){}},3000);
     try{
-      const res=await fetcher(_offlineHealthUrl(),{cache:'no-store',credentials:'include'});
+      const opts={cache:'no-store',credentials:'include'};
+      if(ctrl)opts.signal=ctrl.signal;
+      const res=await fetcher(_offlineHealthUrl(),opts);
       return !!(res&&res.ok);
     }catch(_){return false;}
+    finally{if(timer)clearTimeout(timer);}
   })();
   try{return await _offlineHealthProbePromise;}
   finally{_offlineHealthProbePromise=null;}
+}
+async function _showOfflineBannerIfProbeFails(reason){
+  const visibleAtStart=_offlineVisible;
+  if(visibleAtStart)_setOfflineChecking(true);
+  const ok=await _probeOfflineRecovery();
+  if(visibleAtStart)_setOfflineChecking(false);
+  if(ok){
+    if(_offlineVisible){_stopOfflineProbeTimer();await _recoverFromOfflineSoftly();}
+    return true;
+  }
+  showOfflineBanner(reason||(_browserReportsOnline()?'network':'browser'));
+  return false;
 }
 async function checkOfflineRecoveryNow(){
   if(_offlineProbePromise)return _offlineProbePromise;
   _offlineProbePromise=(async()=>{
     if(!_offlineVisible)return false;
-    if(!_browserReportsOnline()){showOfflineBanner('browser');return false;}
     _setOfflineChecking(true);
     const ok=await _probeOfflineRecovery();
     _setOfflineChecking(false);
-    if(ok){_stopOfflineProbeTimer();await _recoverFromOfflineSoftly();return true;}
-    showOfflineBanner('network');
+    if(ok){if(!_offlineVisible)return true;_stopOfflineProbeTimer();await _recoverFromOfflineSoftly();return true;}
+    showOfflineBanner(_browserReportsOnline()?'network':'browser');
     return false;
   })();
   try{return await _offlineProbePromise;}
@@ -161,17 +181,18 @@ function _patchOfflineFetch(){
   window.fetch=async function(...args){
     try{return await _offlineRawFetch(...args);}
     catch(e){
-      if(!_browserReportsOnline())showOfflineBanner('browser');
-      else if(e instanceof TypeError&&!_isAbortError(e))void _probeOfflineRecovery().then(ok=>{if(!ok)showOfflineBanner('network');});
+      if(!_isAbortError(e)&&(e instanceof TypeError||!_browserReportsOnline())){
+        void _showOfflineBannerIfProbeFails(_browserReportsOnline()?'network':'browser');
+      }
       throw e;
     }
   };
 }
 function initOfflineMonitor(){
   _patchOfflineFetch();
-  window.addEventListener('offline',()=>showOfflineBanner('browser'));
+  window.addEventListener('offline',()=>{void _showOfflineBannerIfProbeFails('browser');});
   window.addEventListener('online',()=>{if(_offlineVisible)checkOfflineRecoveryNow();});
-  if(!_browserReportsOnline())showOfflineBanner('browser');
+  if(!_browserReportsOnline())void _showOfflineBannerIfProbeFails('browser');
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initOfflineMonitor,{once:true});
 else initOfflineMonitor();
@@ -720,8 +741,21 @@ function _expandRenderWindowForActivity(){
   // the user had already loaded more); never exceed the actual message count.
   _messageRenderWindowSize=Math.min(renderable,Math.max(current,MESSAGE_RENDER_WINDOW_ACTIVITY_MAX));
 }
+const MESSAGE_VIRTUAL_THRESHOLD_ROWS=80;
+const MESSAGE_VIRTUAL_BUFFER_PX=900;
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT=140;
+const MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS=2;
 let _messageRenderWindowSid=null;
 let _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
+let _messageVirtualHeightCache=[];
+let _messageVirtualHeightCacheEntries=[];
+let _messageVirtualHeightCacheLen=0;
+let _messageVirtualHeightCacheSrc=null;
+let _messageVirtualEstimatedRowHeight=MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT;
+let _messageVirtualScrollRaf=0;
+let _messageVirtualWindowKey='';
+let _messageVirtualMeasurementCycleKey='';
+let _messageVirtualMeasurementRetryCount=0;
 // Cached visWithIdx array — invalidated when S.messages.length changes.
 let _visWithIdxCache=null;
 let _visWithIdxCacheLen=0;
@@ -731,11 +765,361 @@ function clearVisibleMessageRowCache(){
   _visWithIdxCacheLen=0;
   _visWithIdxCacheSrc=null;
 }
+function _clearMessageVirtualHeightCache(){
+  _messageVirtualHeightCache=[];
+  _messageVirtualHeightCacheEntries=[];
+  _messageVirtualHeightCacheLen=0;
+  _messageVirtualHeightCacheSrc=null;
+  _messageVirtualEstimatedRowHeight=MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT;
+  _messageVirtualWindowKey='';
+  _messageVirtualMeasurementCycleKey='';
+  _messageVirtualMeasurementRetryCount=0;
+}
 function _resetMessageRenderWindow(sid){
   _messageRenderWindowSid=sid||null;
   _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
+  _cancelMessageVirtualizedRender();
   _clearRenderCache();
   clearVisibleMessageRowCache();
+  _clearMessageVirtualHeightCache();
+}
+function _cancelMessageVirtualizedRender(){
+  if(_messageVirtualScrollRaf){
+    cancelAnimationFrame(_messageVirtualScrollRaf);
+    _messageVirtualScrollRaf=0;
+  }
+}
+function _messageIsRenderable(m){
+  if(!m||!m.role||m.role==='tool') return false;
+  if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
+  if(_isRecoveryControlMessage(m)) return false;
+  const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
+  const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
+  const hasPartialTc=Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0;
+  const hasReasoningAnchor=hasTc||hasTu||_messageHasReasoningPayload(m);
+  const hasAssistantVisibleAnchor=hasTc||hasTu||hasPartialTc||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m);
+  return !!(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasReasoningAnchor||hasAssistantVisibleAnchor)));
+}
+function _getVisibleMessagesWithIdx(){
+  if(!_visWithIdxCache || _visWithIdxCacheLen !== S.messages.length || _visWithIdxCacheSrc !== S.messages){
+    const rebuilt=[];
+    let rawIdx=0;
+    for(const m of (S.messages||[])){
+      if(_messageIsRenderable(m)) rebuilt.push({m,rawIdx});
+      rawIdx++;
+    }
+    _visWithIdxCache=rebuilt;
+    _visWithIdxCacheLen=S.messages.length;
+    _visWithIdxCacheSrc=S.messages;
+  }
+  return _visWithIdxCache;
+}
+function _messageVirtualWindow(opts){
+  const total=Math.max(0, Number(opts&&opts.total)||0);
+  const threshold=Math.max(1, Number(opts&&opts.threshold)||MESSAGE_VIRTUAL_THRESHOLD_ROWS);
+  const defaultHeight=Math.max(1, Number(opts&&opts.defaultHeight)||MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT);
+  const bufferPx=Math.max(0, Number(opts&&opts.bufferPx)||MESSAGE_VIRTUAL_BUFFER_PX);
+  const viewportHeight=Math.max(defaultHeight, Number(opts&&opts.viewportHeight)||defaultHeight*6);
+  const keepTailCount=Math.max(0, Number(opts&&opts.keepTailCount)||0);
+  const tailStart=Math.max(0, total-keepTailCount);
+  const heights=Array.isArray(opts&&opts.heights)?opts.heights:[];
+  const rowHeightFor=(idx)=>{
+    const cached=Number(heights[idx]);
+    return Number.isFinite(cached)&&cached>0?cached:defaultHeight;
+  };
+  if(total<=Math.max(threshold, keepTailCount)){
+    return {virtualized:false,start:0,end:total,topPad:0,bottomPad:0,total,tailStart};
+  }
+  const scrollTop=Math.max(0, Number(opts&&opts.scrollTop)||0);
+  const targetTop=Math.max(0, scrollTop-bufferPx);
+  const targetBottom=scrollTop+viewportHeight+bufferPx;
+  let start=0;
+  let offset=0;
+  while(start<tailStart&&offset+rowHeightFor(start)<=targetTop){
+    offset+=rowHeightFor(start);
+    start++;
+  }
+  if(start>=tailStart){
+    return {virtualized:true,start:tailStart,end:tailStart,topPad:offset,bottomPad:0,total,tailStart};
+  }
+  let end=start;
+  let cursor=offset;
+  while(end<tailStart&&cursor<targetBottom){
+    cursor+=rowHeightFor(end);
+    end++;
+  }
+  if(end<=start) end=Math.min(total, start+1);
+  let bottomPad=0;
+  for(let i=end;i<tailStart;i++) bottomPad+=rowHeightFor(i);
+  return {
+    virtualized:true,
+    start,
+    end,
+    topPad:offset,
+    bottomPad,
+    total,
+    tailStart,
+  };
+}
+function _messageVirtualSpacer(height, where){
+  const spacer=document.createElement('div');
+  spacer.className='message-virtual-spacer';
+  spacer.dataset.virtualSpacer=where||'gap';
+  spacer.setAttribute('aria-hidden','true');
+  spacer.style.height=Math.max(0,Math.round(height||0))+'px';
+  spacer.style.flex='0 0 auto';
+  return spacer;
+}
+function _messageVirtualWindowKeyFor(windowMetrics){
+  if(!windowMetrics) return '';
+  return [
+    windowMetrics.virtualized?1:0,
+    windowMetrics.start,
+    windowMetrics.end,
+    Math.round(windowMetrics.topPad||0),
+    Math.round(windowMetrics.bottomPad||0),
+    windowMetrics.tailStart||0,
+  ].join(':');
+}
+function _messageVirtualMeasurementCycleKeyFor(windowMetrics){
+  if(!windowMetrics) return '';
+  return [
+    windowMetrics.virtualized?1:0,
+    windowMetrics.start,
+    windowMetrics.end,
+    windowMetrics.tailStart||0,
+  ].join(':');
+}
+function _scheduleMessageVirtualMeasurementRefresh(windowMetrics){
+  const cycleKey=_messageVirtualMeasurementCycleKeyFor(windowMetrics);
+  if(_messageVirtualMeasurementCycleKey!==cycleKey){
+    _messageVirtualMeasurementCycleKey=cycleKey;
+    _messageVirtualMeasurementRetryCount=0;
+  }
+  if(_messageVirtualMeasurementRetryCount>=MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS) return;
+  _messageVirtualMeasurementRetryCount++;
+  requestAnimationFrame(()=>{ _scheduleMessageVirtualizedRender(true); });
+}
+function _markMessageVirtualMeasurementsSettled(windowMetrics){
+  _messageVirtualMeasurementCycleKey=_messageVirtualMeasurementCycleKeyFor(windowMetrics);
+  _messageVirtualMeasurementRetryCount=0;
+}
+function _messageVirtualHeightEntryMatches(previousEntry, nextEntry){
+  return !!(
+    previousEntry&&nextEntry&&
+    previousEntry.m===nextEntry.m
+  );
+}
+function _messageVirtualHeightPrefixEntryMatches(previousEntry, nextEntry){
+  return !!(
+    previousEntry&&nextEntry&&
+    previousEntry.rawIdx===nextEntry.rawIdx&&
+    _messageVirtualHeightEntryMatches(previousEntry, nextEntry)
+  );
+}
+function _syncMessageVirtualHeightCache(visWithIdx){
+  const nextEntries=Array.isArray(visWithIdx)
+    ? visWithIdx.map(entry=>entry?{rawIdx:entry.rawIdx,m:entry.m}:entry)
+    : [];
+  if(
+    _messageVirtualHeightCacheLen===S.messages.length &&
+    _messageVirtualHeightCacheSrc===S.messages &&
+    _messageVirtualHeightCacheEntries.length===nextEntries.length
+  ) return;
+  const previousEntries=Array.isArray(_messageVirtualHeightCacheEntries)?_messageVirtualHeightCacheEntries:[];
+  const previousHeights=Array.isArray(_messageVirtualHeightCache)?_messageVirtualHeightCache.slice():[];
+  let nextHeights=null;
+  if(!previousEntries.length){
+    nextHeights=new Array(nextEntries.length);
+  }else if(!nextEntries.length){
+    _clearMessageVirtualHeightCache();
+    _messageVirtualHeightCacheLen=S.messages.length;
+    _messageVirtualHeightCacheSrc=S.messages;
+    return;
+  }else{
+    const sharedPrefix=Math.min(previousEntries.length,nextEntries.length);
+    let prefixMatches=true;
+    for(let i=0;i<sharedPrefix;i++){
+      if(!_messageVirtualHeightPrefixEntryMatches(previousEntries[i], nextEntries[i])){
+        prefixMatches=false;
+        break;
+      }
+    }
+    if(prefixMatches){
+      nextHeights=previousHeights.slice(0, sharedPrefix);
+      nextHeights.length=nextEntries.length;
+    }else if(nextEntries.length>=previousEntries.length){
+      const prependedCount=nextEntries.length-previousEntries.length;
+      let suffixMatches=true;
+      for(let i=0;i<previousEntries.length;i++){
+        if(!_messageVirtualHeightEntryMatches(previousEntries[i], nextEntries[i+prependedCount])){
+          suffixMatches=false;
+          break;
+        }
+      }
+      if(suffixMatches){
+        nextHeights=new Array(nextEntries.length);
+        for(let i=0;i<previousEntries.length;i++){
+          nextHeights[prependedCount+i]=previousHeights[i];
+        }
+      }
+    }
+  }
+  if(nextHeights===null){
+    _clearMessageVirtualHeightCache();
+    _messageVirtualHeightCache=new Array(nextEntries.length);
+  }else{
+    _messageVirtualHeightCache=nextHeights;
+    _messageVirtualWindowKey='';
+  }
+  _messageVirtualHeightCacheEntries=nextEntries;
+  _messageVirtualHeightCacheLen=S.messages.length;
+  _messageVirtualHeightCacheSrc=S.messages;
+}
+function _currentMessageVirtualWindow(visWithIdx, keepTailCount){
+  _syncMessageVirtualHeightCache(visWithIdx);
+  const container=$('messages');
+  return _messageVirtualWindow({
+    total:visWithIdx.length,
+    scrollTop:container?container.scrollTop:0,
+    viewportHeight:container?container.clientHeight:(_messageVirtualEstimatedRowHeight*6),
+    heights:_messageVirtualHeightCache,
+    defaultHeight:_messageVirtualEstimatedRowHeight,
+    keepTailCount,
+  });
+}
+function _messageVirtualPrependedHeightDelta(prependedRenderableCount){
+  const count=Math.max(0, Number(prependedRenderableCount)||0);
+  if(count<=0) return null;
+  const visWithIdx=_getVisibleMessagesWithIdx();
+  const virtualWindow=_currentMessageVirtualWindow(visWithIdx,_messageVirtualKeepTailCount());
+  if(!virtualWindow||!virtualWindow.virtualized) return null;
+  const limit=Math.min(count,_messageVirtualHeightCache.length);
+  let total=0;
+  for(let i=0;i<limit;i++){
+    const cached=Number(_messageVirtualHeightCache[i]);
+    total+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualEstimatedRowHeight;
+  }
+  return Math.max(0,Math.round(total));
+}
+function _messageVisibleIndexForRawIdx(rawIdx, visWithIdx){
+  const list=Array.isArray(visWithIdx)?visWithIdx:_getVisibleMessagesWithIdx();
+  for(let i=0;i<list.length;i++){
+    if(list[i]&&list[i].rawIdx===rawIdx) return i;
+  }
+  return -1;
+}
+function _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container){
+  const idx=Math.max(0,Number(visibleIdx)||0);
+  _syncMessageVirtualHeightCache(visWithIdx);
+  const limit=Math.min(idx,_messageVirtualHeightCache.length);
+  let offset=0;
+  for(let i=0;i<limit;i++){
+    const cached=Number(_messageVirtualHeightCache[i]);
+    offset+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualEstimatedRowHeight;
+  }
+  const viewport=container?Math.max(0,Number(container.clientHeight)||0):0;
+  return Math.max(0,Math.round(offset-(viewport*0.35)));
+}
+function _messageVirtualKeepTailCount(){
+  return Math.min(_currentMessageRenderWindowSize(), MESSAGE_RENDER_WINDOW_DEFAULT);
+}
+function _captureMessageViewportAnchor(){
+  const container=$('messages');
+  if(!container) return null;
+  const containerRect=container.getBoundingClientRect();
+  const rows=Array.from(container.querySelectorAll('[data-msg-idx]'));
+  for(const row of rows){
+    const rawIdx=Number(row&&row.dataset&&row.dataset.msgIdx);
+    if(!Number.isFinite(rawIdx)) continue;
+    const rect=row.getBoundingClientRect();
+    if(rect.bottom>containerRect.top+1){
+      return {rawIdx, topOffset:rect.top-containerRect.top};
+    }
+  }
+  return null;
+}
+function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
+  const container=$('messages');
+  if(!container||!anchor) return false;
+  const targetIdx=Number(anchor.rawIdx)+Number(rawIdxDelta||0);
+  if(!Number.isFinite(targetIdx)) return false;
+  const row=container.querySelector(`[data-msg-idx="${targetIdx}"]`);
+  if(!row) return false;
+  const containerRect=container.getBoundingClientRect();
+  const rect=row.getBoundingClientRect();
+  const targetTop=Number(anchor.topOffset)||0;
+  _programmaticScroll=true;
+  container.scrollTop+=(rect.top-containerRect.top)-targetTop;
+  requestAnimationFrame(()=>{ _programmaticScroll=false; });
+  return true;
+}
+function _measureMessageVirtualRow(inner, entry){
+  if(!inner||!entry) return 0;
+  const primary=inner.querySelector(`[data-msg-idx="${entry.rawIdx}"]`);
+  if(!primary) return 0;
+  let totalHeight=Math.max(0, primary.getBoundingClientRect().height||0);
+  if(primary.classList.contains('assistant-segment')){
+    let sibling=primary.nextElementSibling;
+    while(sibling){
+      if(sibling.hasAttribute('data-msg-idx')) break;
+      if(!(sibling.matches&&sibling.matches('.tool-call-group,.tool-card-row,.agent-activity-thinking,.thinking-card-row'))) break;
+      totalHeight+=Math.max(0, sibling.getBoundingClientRect().height||0);
+      sibling=sibling.nextElementSibling;
+    }
+  }
+  return totalHeight;
+}
+function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow){
+  const inner=$('msgInner');
+  if(!inner||!virtualWindow||!virtualWindow.virtualized||!renderVisWithIdx.length) return;
+  let changed=false;
+  let measuredCount=0;
+  let measuredTotal=0;
+  for(let vi=0;vi<renderVisWithIdx.length;vi++){
+    const entry=renderVisWithIdx[vi];
+    if(!entry) continue;
+    const totalHeight=_measureMessageVirtualRow(inner, entry);
+    if(totalHeight<=0) continue;
+    const visibleIdx=Number(renderVisibleIdxs&&renderVisibleIdxs[vi]);
+    if(!Number.isFinite(visibleIdx)) continue;
+    if(Math.abs((Number(_messageVirtualHeightCache[visibleIdx])||0)-totalHeight)>1){
+      _messageVirtualHeightCache[visibleIdx]=totalHeight;
+      changed=true;
+    }
+    measuredTotal+=totalHeight;
+    measuredCount++;
+  }
+  if(measuredCount>0){
+    _messageVirtualEstimatedRowHeight=Math.max(60, Math.round(measuredTotal/measuredCount));
+  }
+  if(changed){
+    _scheduleMessageVirtualMeasurementRefresh(virtualWindow);
+  }else{
+    _markMessageVirtualMeasurementsSettled(virtualWindow);
+  }
+}
+function _scheduleMessageVirtualizedRender(force){
+  const container=$('messages');
+  const inner=$('msgInner');
+  if(!container||!inner) return;
+  const visWithIdx=_getVisibleMessagesWithIdx();
+  const virtualWindow=_currentMessageVirtualWindow(visWithIdx,_messageVirtualKeepTailCount());
+  const nextKey=_messageVirtualWindowKeyFor(virtualWindow);
+  if(!force&&nextKey===_messageVirtualWindowKey) return;
+  if(!virtualWindow.virtualized){
+    _messageVirtualWindowKey=nextKey;
+    return;
+  }
+  if(_messageVirtualScrollRaf) return;
+  _messageVirtualScrollRaf=requestAnimationFrame(()=>{
+    _messageVirtualScrollRaf=0;
+    const liveVisWithIdx=_getVisibleMessagesWithIdx();
+    const liveWindow=_currentMessageVirtualWindow(liveVisWithIdx,_messageVirtualKeepTailCount());
+    const liveKey=_messageVirtualWindowKeyFor(liveWindow);
+    if(!force&&liveKey===_messageVirtualWindowKey) return;
+    renderMessages({ preserveScroll:true });
+  });
 }
 
 // ── renderMd / _renderUserFencedBlocks cache ──────────────────────────────
@@ -771,16 +1155,7 @@ function _currentMessageRenderWindowSize(){
   );
 }
 function _messageRenderableMessageCount(){
-  let count=0;
-  for(const m of (S.messages||[])){
-    if(!m||!m.role||m.role==='tool') continue;
-    if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) continue;
-    if(_isRecoveryControlMessage(m)) continue;
-    const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
-    const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-    if(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m)))) count++;
-  }
-  return count;
+  return _getVisibleMessagesWithIdx().length;
 }
 function _messageHiddenBeforeCount(){
   return Math.max(0,_messageRenderableMessageCount()-_currentMessageRenderWindowSize());
@@ -792,21 +1167,8 @@ function _wireMessageWindowLoadEarlierButton(){
   const indicator=$('loadOlderIndicator');
   if(!indicator) return;
   indicator.onclick=()=>{
-    if(_messageHiddenBeforeCount()>0) _showEarlierRenderedMessages();
-    else if(typeof _loadOlderMessages==='function') _loadOlderMessages();
+    if(typeof _loadOlderMessages==='function') _loadOlderMessages();
   };
-}
-function _showEarlierRenderedMessages(){
-  const container=$('messages');
-  const prevScrollH=container?container.scrollHeight:0;
-  const prevScrollTop=container?container.scrollTop:0;
-  _messageRenderWindowSize=_currentMessageRenderWindowSize()+MESSAGE_RENDER_WINDOW_DEFAULT;
-  renderMessages();
-  if(container){
-    const newScrollH=container.scrollHeight;
-    container.scrollTop=prevScrollTop+(newScrollH-prevScrollH);
-  }
-  _scrollPinned=false;
 }
 function _isSessionJumpButtonsEnabled(){
   return window._sessionJumpButtonsEnabled===true;
@@ -844,6 +1206,8 @@ async function jumpToSessionStart(){
       if(typeof _ensureAllMessagesLoaded==='function') await _ensureAllMessagesLoaded();
     }
     _messageRenderWindowSize=Math.max(_currentMessageRenderWindowSize(),_messageRenderableMessageCount());
+    container.scrollTop=0;
+    _messageVirtualWindowKey='';
     // During streaming, skip renderMessages — it rebuilds the DOM but tool card
     // insertion is blocked by !S.busy, losing Activity until "done" fires.
     if(!(S.busy||S.activeStreamId)){
@@ -906,8 +1270,29 @@ async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
     return true;
   };
   if(scrollToTarget()) return;
+  const visWithIdx=_getVisibleMessagesWithIdx();
+  const visibleIdx=_messageVisibleIndexForRawIdx(questionRawIdx, visWithIdx);
+  if(visibleIdx>=0){
+    _scrollPinned=false;
+    _messageUserUnpinned=true;
+    _programmaticScroll=true;
+    container.scrollTop=_messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container);
+    _messageVirtualWindowKey='';
+    renderMessages({ preserveScroll:true });
+    requestAnimationFrame(()=>{
+      if(!scrollToTarget()&&_messageHiddenBeforeCount()>0){
+        _messageRenderWindowSize=Math.max(_currentMessageRenderWindowSize(),_messageRenderableMessageCount());
+        _messageVirtualWindowKey='';
+        renderMessages({ preserveScroll:true });
+        requestAnimationFrame(scrollToTarget);
+      }
+      requestAnimationFrame(()=>{ _programmaticScroll=false; });
+    });
+    return;
+  }
   if(_messageHiddenBeforeCount()>0){
     _messageRenderWindowSize=Math.max(_currentMessageRenderWindowSize(),_messageRenderableMessageCount());
+    _messageVirtualWindowKey='';
     renderMessages({ preserveScroll:true });
     requestAnimationFrame(scrollToTarget);
   }
@@ -1042,10 +1427,70 @@ function _openImgLightbox(imgEl) {
   }
   _openImgLightboxWithNav(src, alt, allImages, startIndex);
 }
+function _openMermaidLightbox(svgEl) {
+  if(!svgEl) return;
+  const lb = document.createElement('div');
+  lb.className = 'img-lightbox';
+  lb.setAttribute('role', 'dialog');
+  lb.setAttribute('aria-modal', 'true');
+  lb.setAttribute('aria-label', 'Mermaid diagram');
+  const clone = svgEl.cloneNode(true);
+  const idMap = new Map();
+  const idPrefix = 'mermaid-lightbox-'+Math.random().toString(36).slice(2,10)+'-';
+  const idNodes = [clone, ...clone.querySelectorAll('[id]')].filter(el => el.id);
+  idNodes.forEach(el => {
+    const nextId = idPrefix + el.id;
+    idMap.set(el.id, nextId);
+    el.id = nextId;
+  });
+  if(idMap.size){
+    const refAttrs = ['href','xlink:href','fill','stroke','filter','clip-path','mask','marker-start','marker-mid','marker-end','aria-labelledby','aria-describedby'];
+    [clone, ...clone.querySelectorAll('*')].forEach(el => {
+      refAttrs.forEach(attr => {
+        const value = el.getAttribute(attr);
+        if(!value) return;
+        let nextValue = value.replace(/url\(#([^)]+)\)/g, (match, refId) => idMap.has(refId) ? `url(#${idMap.get(refId)})` : match);
+        if(nextValue.startsWith('#') && idMap.has(nextValue.slice(1))){
+          nextValue = '#'+idMap.get(nextValue.slice(1));
+        }
+        if(nextValue !== value){
+          el.setAttribute(attr, nextValue);
+        }
+      });
+    });
+    clone.querySelectorAll('style').forEach(styleEl => {
+      let styleText = styleEl.textContent || '';
+      idMap.forEach((nextId, originalId) => {
+        const escapedId = originalId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        styleText = styleText.replace(new RegExp(`url\\(#${escapedId}\\)`, 'g'), `url(#${nextId})`);
+        styleText = styleText.replace(new RegExp(`(^|[^\\w-])#${escapedId}(?=$|[^\\w-])`, 'g'), (match, prefix) => `${prefix}#${nextId}`);
+      });
+      styleEl.textContent = styleText;
+    });
+  }
+  clone.classList.add('mermaid-lightbox-svg');
+  clone.removeAttribute('width');
+  clone.removeAttribute('height');
+  clone.onclick = e => e.stopPropagation();
+  const cls = document.createElement('button');
+  cls.className = 'img-lightbox-close';
+  cls.setAttribute('aria-label', 'Close');
+  cls.textContent = '×';
+  cls.onclick = () => _closeImgLightbox(lb);
+  lb.appendChild(clone);
+  lb.appendChild(cls);
+  lb.onclick = () => _closeImgLightbox(lb);
+  lb._keyHandler = e => {
+    if(e.key==='Escape') _closeImgLightbox(lb);
+  };
+  document.body.appendChild(lb);
+  document.addEventListener('keydown', lb._keyHandler);
+}
 function _openImgLightboxWithNav(src, alt, images, index) {
   const lb = document.createElement('div');
   lb.className = 'img-lightbox';
   lb.setAttribute('role', 'dialog');
+  lb.setAttribute('aria-modal', 'true');
   lb.setAttribute('aria-label', alt || 'Image');
   const img = document.createElement('img');
   img.src = src;
@@ -1139,6 +1584,8 @@ document.addEventListener('click', e => {
   // Message-attached images (already wired since v0.50.x).
   let img = e.target.closest('.msg-media-img');
   if(img){ _openImgLightbox(img); return; }
+  const mermaidSvg = e.target.closest('.mermaid-rendered svg');
+  if(mermaidSvg){ _openMermaidLightbox(mermaidSvg); return; }
   // Composer attach-tray image thumbnails — click any pasted/dropped image
   // chip to lightbox-zoom it before sending. Excludes audio/video chips,
   // which keep their inline media controls. SVG thumbnails (.attach-thumb--svg)
@@ -1942,10 +2389,11 @@ function _selectedModelOption(){
 
 function _normalizeConfiguredModelKey(modelId){
   let s=String(modelId||'').trim().toLowerCase();
-  // Strip @provider: prefix (e.g., @custom:jingdong:GLM-5 -> GLM-5).
+  let strippedAtProvider=false;
+  // Strip @provider: prefix (e.g., @custom:jingdong:GLM-5 -> jingdong:GLM-5).
   // Defensive: trailing-colon / trailing-slash falls back to the original key
   // so malformed configs don't collapse distinct ids to '' (matches backend _norm_model_id).
-  if(s.startsWith('@')&&s.includes(':')){const last=s.split(':').pop();s=last||s;}
+  if(s.startsWith('@')&&s.includes(':')){const ci=s.indexOf(':',1);const cand=s.slice(ci+1);strippedAtProvider=!!cand;s=cand||s;}
   // Skip slash-based stripping for URI-scheme IDs (e.g. gpt://folder/model)
   // whose slashes are path separators, not provider delimiters (#3429).
   const _hasScheme=/^[a-z][a-z0-9+.-]*:\/\//i.test(s);
@@ -1955,7 +2403,7 @@ function _normalizeConfiguredModelKey(modelId){
     // key variants like 'custom:llm-proxy/opencode_go/deepseek-v4-pro' and the
     // bare 'opencode_go/deepseek-v4-pro' produce different normalized keys and
     // aren't deduped in the configured section (#3360).
-    if(s.includes('/')&&s.indexOf(':')!==-1&&s.indexOf(':')<s.indexOf('/')){
+    if(!strippedAtProvider&&s.includes('/')&&s.indexOf(':')!==-1&&s.indexOf(':')<s.indexOf('/')){
       s=s.slice(s.indexOf('/')+1)||s;
     }
     // Strip only the first slash-segment (provider prefix), preserving any
@@ -3103,6 +3551,7 @@ if(typeof window!=='undefined'){
       _syncScrollToBottomCue(showBottomButton,{newMessage:_newMessageCueVisible});
       _saveMessageScrollState();
       if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
+      _scheduleMessageVirtualizedRender();
       // Prefetch older messages before the reader hits the hard top. Prepending
       // then preserving scrollTop is seamless only if there is runway left for
       // the user's continued upward wheel/touch movement.
@@ -7146,6 +7595,9 @@ function syncTopbar(){
   const sessionTitle=S.session.title||t('untitled');
   const _topbarTitle=$('topbarTitle');if(_topbarTitle)_topbarTitle.textContent=sessionTitle;
   document.title=sessionTitle+' \u2014 '+assistantDisplayName();
+  if(typeof activeSessionHasPendingPromptAttention==='function'&&activeSessionHasPendingPromptAttention()){
+    document.title='● '+document.title;
+  }
   const _topbarMeta=$('topbarMeta');
   if(_topbarMeta){
     let sourceLabel=(S.session&&(S.session.source_label||S.session.source_tag||S.session.raw_source))||'';
@@ -8499,6 +8951,17 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
   }
 }
 function _syncLiveWorklogReasonsForAnchor(anchor, displayTextOverride){
+  // Worklog reason-mirroring (folding intermediate prose into a top Worklog rail
+  // and hiding the inline `assistant-segment` via `assistant-segment-worklog-source`
+  // → display:none) is the Compact Worklog presentation (#3401). In Transparent
+  // Stream mode prose must stay as visible, chronologically-placed inline segments
+  // interleaved with tool rows — so do NOT build the worklog rail or hide the
+  // inline segment here. Without this gate every round's prose mirror piles into
+  // the single top rail while tool rows append at the bottom, so all prose bunches
+  // above all tools during a live multi-round turn (#4096); it only self-heals when
+  // the turn settles and renderMessages() rebuilds with the compact-only
+  // `messageBelongsInWorklog` gate (which is already isCompactWorklogMode()-only).
+  if(typeof isCompactWorklogMode==='function' && !isCompactWorklogMode()) return;
   if(!anchor||!anchor.matches||!anchor.matches('[data-live-assistant="1"]')) return;
   const blocks=anchor.parentElement;
   if(!blocks) return;
@@ -8627,6 +9090,13 @@ function ensureActivityGroup(inner, opts){
 function normalizeLiveActivityGroupPlacement(turn){
   const blocks=_assistantTurnBlocks(turn);
   if(!blocks) return;
+  // Compact Worklog only: this reorders `.tool-call-group`/`.tool-worklog-group`
+  // containers, which exist solely on the Compact Worklog live path. Transparent
+  // Stream renders tool rows as flat `.transparent-event-row`s and never builds
+  // these group containers (see appendLiveToolCard's transparent branch), and the
+  // worklog prose-rail is gated off in transparent mode (#4096), so the selector
+  // below matches nothing and this is a no-op there. Kept implicit (empty match)
+  // rather than an early return so reconnect/restore behavior is unchanged.
   const groups=Array.from(
     blocks.querySelectorAll('.tool-worklog-group[data-live-tool-worklog-group="1"],.tool-call-group[data-live-tool-worklog-group="1"],.tool-call-group[data-live-tool-call-group="1"]')
   );
@@ -9381,6 +9851,7 @@ function clearMessageRenderCache(){
   _sessionHtmlCache.clear();
   _sessionHtmlCacheSid=null;
   clearVisibleMessageRowCache();
+  _clearMessageVirtualHeightCache();
 }
 
 function _messageRenderCacheSignature(){
@@ -9589,6 +10060,16 @@ function _restoreMessageScrollSnapshot(snapshot){
   el.scrollTop=Math.max(0,Math.min(Number(snapshot.top)||0,maxTop));
   // Sync _lastScrollTop after programmatic restore so sticky-unpin does not false-trigger (#1731).
   _lastScrollTop=el.scrollTop;
+  const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+  if(bottomDistance>250){
+    _messageUserUnpinned=true;
+    _scrollPinned=false;
+    _nearBottomCount=0;
+  }else if(bottomDistance<=120){
+    _messageUserUnpinned=false;
+    _scrollPinned=true;
+    _nearBottomCount=2;
+  }
   requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
 }
 function _restoreMessageScrollSnapshotSameFrame(snapshot){
@@ -9700,6 +10181,11 @@ function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   // pinned users stay at bottom; users who manually scrolled up get their
   // pre-render scrollTop restored after the DOM replacement.
   if(preserveScroll){
+    const readerAwayFromBottom=!!(
+      scrollSnapshot &&
+      Number.isFinite(Number(scrollSnapshot.bottom)) &&
+      Number(scrollSnapshot.bottom)>250
+    );
     // Keep master's follow heuristic for pinned / still-near-bottom users:
     // _followMessagesAfterDomReplace() does a FORCED scrollToBottom() (synchronous
     // bottom write + forced settle), so the final settled response can't leave a
@@ -9708,7 +10194,7 @@ function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
     // new-message cue. (Using scrollIfPinned() here instead would skip the forced
     // write unless distance>500 and let the DOM-rebuild scroll event cancel the
     // delayed settles — Codex CORE catch on #3631.)
-    if(!_messageUserUnpinned && _followMessagesAfterDomReplace()) return;
+    if(!readerAwayFromBottom && !_messageUserUnpinned && _followMessagesAfterDomReplace()) return;
     _restoreMessageScrollSnapshot(scrollSnapshot);
     _maybeShowNewMessageScrollCue(scrollSnapshot);
     return;
@@ -9746,12 +10232,30 @@ function renderMessages(options){
   // renderMessages() in this window. Keep the existing loading placeholder.
   if(_loadingSessionId===sid&&msgCount===0&&inner) return;
   if(sid!==_messageRenderWindowSid) _resetMessageRenderWindow(sid);
-  const renderWindowSize=_currentMessageRenderWindowSize();
   let cachedRenderSignature=null;
   const hasTransientTranscriptUi=!!(
     (window._compressionUi&&(!window._compressionUi.sessionId||window._compressionUi.sessionId===sid)) ||
     (window._handoffUi&&(!window._handoffUi.sessionId||window._handoffUi.sessionId===sid))
   );
+
+  const preservedCompressionTaskMessages=_latestPreservedCompressionTaskListMessages(S.messages);
+  const visWithIdx=_getVisibleMessagesWithIdx();
+  $('emptyState').style.display=(visWithIdx.length||preservedCompressionTaskMessages.length)?'none':'';
+  const virtualWindow=_currentMessageVirtualWindow(visWithIdx,_messageVirtualKeepTailCount());
+  const renderWindowKey=_messageVirtualWindowKeyFor(virtualWindow);
+  const windowStart=virtualWindow.start;
+  const windowEnd=virtualWindow.end;
+  const renderHeadVisWithIdx=visWithIdx.slice(windowStart, windowEnd);
+  const renderTailStart=virtualWindow.virtualized?Math.max(windowEnd, virtualWindow.tailStart):windowEnd;
+  const renderTailVisWithIdx=virtualWindow.virtualized&&renderTailStart<visWithIdx.length
+    ? visWithIdx.slice(renderTailStart)
+    : [];
+  const renderVisWithIdx=renderHeadVisWithIdx.concat(renderTailVisWithIdx);
+  const renderVisibleIdxs=[
+    ...renderHeadVisWithIdx.map((_,idx)=>windowStart+idx),
+    ...renderTailVisWithIdx.map((_,idx)=>renderTailStart+idx),
+  ];
+  const headRenderCount=renderHeadVisWithIdx.length;
 
   // Fast path: switching back to a previously rendered session with same count.
   // Guard: sid !== _sessionHtmlCacheSid ensures in-session updates (edits,
@@ -9765,21 +10269,38 @@ function renderMessages(options){
     const renderSignature=_messageRenderCacheSignature();
     cachedRenderSignature=renderSignature;
     const cached=_sessionHtmlCache.get(sid);
-    if(cached&&cached.msgCount===msgCount&&cached.renderWindowSize===renderWindowSize&&cached.signature===renderSignature){
+    if(cached&&cached.msgCount===msgCount&&cached.renderWindowKey===renderWindowKey&&cached.signature===renderSignature){
       inner.innerHTML=cached.html;
+      _messageVirtualWindowKey=renderWindowKey;
       _sessionHtmlCacheSid=sid;
       _rehydrateTransparentStreamDom(inner);
       _wireMessageWindowLoadEarlierButton();
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
+      _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
       requestAnimationFrame(()=>postProcessRenderedMessages(inner));
       if(typeof _initMediaPlaybackObserver==='function') _initMediaPlaybackObserver();
       if(typeof loadTodos==='function'&&document.getElementById('panelTodos')&&document.getElementById('panelTodos').classList.contains('active')){loadTodos();}
       return;
     }
   }
-  const worklogDetailDisclosureState=_captureWorklogDetailDisclosureState(inner);
-
+  // Mid-stream flicker fix (#3877): when a renderMessages() rebuild is reached
+  // while THIS session is actively streaming (e.g. the clarify-response echo at
+  // messages.js, or a CLI-import refresh), the `inner.innerHTML=''` below detaches
+  // the live `#liveAssistantTurn` node — and the smd parser keeps writing into
+  // that now-orphaned node, so the streamed text vanishes until the next stream
+  // event rebuilds the turn ("disappears, then reappears"). Capture the live
+  // turn's actual DOM node (not its HTML — the parser holds a live reference into
+  // it) so it can be re-attached after the rebuild, keeping the parser target
+  // connected and the streamed text visible. Only for the streaming session's own
+  // live turn; never affects settled transcripts.
+  let _preservedLiveTurn=null;
+  if(sid&&INFLIGHT[sid]){
+    const _lt=document.getElementById('liveAssistantTurn');
+    if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
+      _preservedLiveTurn=_lt;
+    }
+  }
   const compressionState=(()=>{
     let compressionState=_compressionStateForCurrentSession();
     if(!S.busy && compressionState && compressionState.automatic){
@@ -9802,41 +10323,7 @@ function renderMessages(options){
   const sessionCompressionSummary=(
     S.session && typeof S.session.compression_anchor_summary==='string'
   ) ? S.session.compression_anchor_summary.trim() : '';
-  const preservedCompressionTaskMessages=_latestPreservedCompressionTaskListMessages(S.messages);
-  const vis=S.messages.filter(m=>{
-    if(!m||!m.role||m.role==='tool')return false;
-    if(_isContextCompactionMessage(m)) return false;
-    if(_isPreservedCompressionTaskListMessage(m)) return false;
-    if(_isRecoveryControlMessage(m)) return false;
-    if(m.role==='assistant'){
-      const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
-      const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-      const hasPartialTc=Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0;
-      if(hasTc||hasTu||hasPartialTc||_messageHasReasoningPayload(m)) return true;
-      if(_assistantMessageHasVisibleContent(m)) return true;
-      const visibleText=_isAssistantEmptyPlaceholderContent(m,msgContent(m))?'':msgContent(m);
-      return m._statusCard||visibleText||m.attachments?.length;
-    }
-    return m._statusCard||msgContent(m)||m.attachments?.length;
-  });
-  $('emptyState').style.display=(vis.length||preservedCompressionTaskMessages.length)?'none':'';
-  // Mid-stream flicker fix (#3877): when a renderMessages() rebuild is reached
-  // while THIS session is actively streaming (e.g. the clarify-response echo at
-  // messages.js, or a CLI-import refresh), the `inner.innerHTML=''` below detaches
-  // the live `#liveAssistantTurn` node — and the smd parser keeps writing into
-  // that now-orphaned node, so the streamed text vanishes until the next stream
-  // event rebuilds the turn ("disappears, then reappears"). Capture the live
-  // turn's actual DOM node (not its HTML — the parser holds a live reference into
-  // it) so it can be re-attached after the rebuild, keeping the parser target
-  // connected and the streamed text visible. Only for the streaming session's own
-  // live turn; never affects settled transcripts.
-  let _preservedLiveTurn=null;
-  if(sid&&INFLIGHT[sid]){
-    const _lt=document.getElementById('liveAssistantTurn');
-    if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      _preservedLiveTurn=_lt;
-    }
-  }
+  const worklogDetailDisclosureState=_captureWorklogDetailDisclosureState(inner);
   inner.innerHTML='';
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
   const {message:referenceMessage, rawIdx:referenceMessageRawIdx}=_latestCompressionReferenceMessage(
@@ -9850,29 +10337,6 @@ function renderMessages(options){
     ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,false)}${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
   let preservedCompressionTaskCardsAttached=!!referenceNode;
-  // Cache visWithIdx so expanding the render window (Load earlier) doesn't
-  // re-scan S.messages from scratch.  Invalidate only when the message array
-  // length changes — i.e. new messages arrived or session was truncated.
-  if(!_visWithIdxCache || _visWithIdxCacheLen !== S.messages.length || _visWithIdxCacheSrc !== S.messages){
-    const rebuilt=[];
-    let ri=0;
-    for(const m of S.messages){
-      if(!m||!m.role||m.role==='tool'){ri++;continue;}
-      if(_isContextCompactionMessage(m)){ri++;continue;}
-      if(_isPreservedCompressionTaskListMessage(m)){ri++;continue;}
-      if(_isRecoveryControlMessage(m)){ri++;continue;}
-      const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
-      const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-      const hasPartialTc=Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0;
-      const visibleText=_isAssistantEmptyPlaceholderContent(m,msgContent(m))?'':msgContent(m);
-      if(visibleText||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||hasPartialTc||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m)))) rebuilt.push({m,rawIdx:ri});
-      ri++;
-    }
-    _visWithIdxCache=rebuilt;
-    _visWithIdxCacheLen=S.messages.length;
-    _visWithIdxCacheSrc=S.messages;
-  }
-  const visWithIdx=_visWithIdxCache;
   const preservedCompressionRawIdxs=[];
   let rawIdx=0;
   for(const m of S.messages){
@@ -9880,33 +10344,23 @@ function renderMessages(options){
     if(_isPreservedCompressionTaskListMessage(m)){preservedCompressionRawIdxs.push(rawIdx);rawIdx++;continue;}
     rawIdx++;
   }
-  // Show a top affordance when earlier transcript content exists either in
-  // memory (DOM windowing) or on the server (paginated session fetch).
-  // Prefer expanding the local render window first so a fully loaded long
-  // session can reduce DOM nodes without losing in-memory transcript data.
-  const windowStart=Math.max(0, visWithIdx.length-renderWindowSize);
-  const hiddenBeforeCount=windowStart;
-  const renderVisWithIdx=visWithIdx.slice(windowStart);
   const firstRenderedRawIdx=renderVisWithIdx.length?renderVisWithIdx[0].rawIdx:Infinity;
   const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx);
   const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx);
   const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
   const serverOlderCount=hasServerOlder&&Number.isFinite(Number(_oldestIdx))?Math.max(0,Number(_oldestIdx)):0;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
-  if(hiddenBeforeCount>0 || hasServerOlder){
+  if(virtualWindow.virtualized&&virtualWindow.topPad>0){
+    inner.appendChild(_messageVirtualSpacer(virtualWindow.topPad,'before'));
+  }
+  if(hasServerOlder){
     const indicator=document.createElement('button');
     indicator.type='button';
     indicator.id='loadOlderIndicator';
     indicator.className='load-older-indicator message-window-load-earlier';
-    indicator.textContent=hiddenBeforeCount>0
-      ? `Load earlier messages (${hiddenBeforeCount} hidden)`
-      : (serverOlderCount>0
-        ? `Load earlier messages (${serverOlderCount} older)`
-        : (typeof t==='function'?t('load_older_messages'):'Load earlier messages'));
-    indicator.onclick=()=>{
-      if(hiddenBeforeCount>0) _showEarlierRenderedMessages();
-      else if(typeof _loadOlderMessages==='function') _loadOlderMessages();
-    };
+    indicator.textContent=serverOlderCount>0
+      ? `Load earlier messages (${serverOlderCount} older)`
+      : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
     inner.appendChild(indicator);
     _wireMessageWindowLoadEarlierButton();
   }
@@ -9926,9 +10380,21 @@ function renderMessages(options){
   );
   let insertionAnchor=null;
   if(typeof insertionAnchorFull==='number'){
-    if(insertionAnchorFull<windowStart) insertionAnchor=renderVisWithIdx.length?0:null;
-    else if(insertionAnchorFull<windowStart+renderVisWithIdx.length) insertionAnchor=insertionAnchorFull-windowStart;
-    else insertionAnchor=renderVisWithIdx.length?renderVisWithIdx.length-1:null;
+    const hasVirtualRenderGap=renderVisibleIdxs.some((idx,pos)=>idx!==windowStart+pos);
+    if(!hasVirtualRenderGap){
+      if(insertionAnchorFull<windowStart) insertionAnchor=renderVisWithIdx.length?0:null;
+      else if(insertionAnchorFull<windowStart+renderVisWithIdx.length) insertionAnchor=insertionAnchorFull-windowStart;
+      else insertionAnchor=renderVisWithIdx.length?renderVisWithIdx.length-1:null;
+    }else if(renderVisibleIdxs.length){
+      let previousVisibleIdx=-1;
+      for(let i=0;i<renderVisibleIdxs.length;i++){
+        if(renderVisibleIdxs[i]<=insertionAnchorFull) previousVisibleIdx=i;
+        else break;
+      }
+      insertionAnchor=previousVisibleIdx>=0?previousVisibleIdx:0;
+    }else{
+      insertionAnchor=null;
+    }
   }
   let _prevSepKey=null;
   let currentAssistantTurn=null;
@@ -9936,18 +10402,13 @@ function renderMessages(options){
   // full visWithIdx.  The jump-to-question button is only rendered for
   // assistant messages that appear in the current render window anyway.
   const questionRawIdxByAssistantRawIdx=new Map();
-  // Seed lastQuestionRawIdx from hidden messages so the first visible
-  // assistant message still gets a valid jump target even when its
-  // corresponding user message sits just before the render window.
   let lastQuestionRawIdx=-1;
-  for(let i=0;i<windowStart;i++){
-    const role=visWithIdx[i]?.m?.role;
-    if(role==='user') lastQuestionRawIdx=visWithIdx[i].rawIdx;
-  }
-  for(const entry of renderVisWithIdx){
+  const renderedRawIdxs=new Set(renderVisWithIdx.map(e=>e.rawIdx));
+  const renderableRawIdxs=new Set(visWithIdx.map(e=>e.rawIdx));
+  for(const entry of visWithIdx){
     const role=entry&&entry.m&&entry.m.role;
     if(role==='user') lastQuestionRawIdx=entry.rawIdx;
-    else if(role==='assistant') questionRawIdxByAssistantRawIdx.set(entry.rawIdx,lastQuestionRawIdx);
+    else if(role==='assistant'&&renderedRawIdxs.has(entry.rawIdx)) questionRawIdxByAssistantRawIdx.set(entry.rawIdx,lastQuestionRawIdx);
   }
   const assistantRawIdxByQuestionRawIdx=new Map();
   for(const [aIdx,qIdx] of questionRawIdxByAssistantRawIdx){
@@ -9995,7 +10456,6 @@ function renderMessages(options){
   // range.
   const toolCallAssistantIdxs=new Set();
   if(Array.isArray(S.toolCalls)){
-    const renderedRawIdxs=new Set(renderVisWithIdx.map(e=>e.rawIdx));
     for(const tc of S.toolCalls){
       if(!tc) continue;
       const idx=tc.assistant_msg_idx;
@@ -10007,6 +10467,13 @@ function renderMessages(options){
   // Windowed render loop replaces the legacy full loop:
   // for(let vi=0;vi<visWithIdx.length;vi++)
   for(let vi=0;vi<renderVisWithIdx.length;vi++){
+    if(virtualWindow.virtualized&&virtualWindow.bottomPad>0&&vi===headRenderCount){
+      // The virtual gap breaks assistant-turn adjacency. Reset the current
+      // turn before rendering the always-visible tail so assistant segments do
+      // not merge across the spacer boundary.
+      currentAssistantTurn=null;
+      inner.appendChild(_messageVirtualSpacer(virtualWindow.bottomPad,'after'));
+    }
     const {m,rawIdx}=renderVisWithIdx[vi];
     const _tsSep=m._ts||m.timestamp;
     if(_tsSep){
@@ -10516,6 +10983,7 @@ function renderMessages(options){
     for(const tc of (S.toolCalls||[])){
       if(!tc) continue;
       const aIdx=tc.assistant_msg_idx!==undefined?parseInt(tc.assistant_msg_idx):-1;
+      if(virtualWindow.virtualized&&renderableRawIdxs.has(aIdx)&&!renderedRawIdxs.has(aIdx)) continue;
       const segmentSeq=normalizeToken(tc.activitySegmentSeq);
       const burstId=normalizeToken(tc.activityBurstId);
       const key=segmentSeq?`segment:${segmentSeq}`:(burstId?`burst:${burstId}`:`assistant:${aIdx}`);
@@ -10524,6 +10992,7 @@ function renderMessages(options){
       entry.includeAnchorReason=true;
     }
     for(const aIdx of assistantThinking.keys()){
+      if(virtualWindow.virtualized&&renderableRawIdxs.has(aIdx)&&!renderedRawIdxs.has(aIdx)) continue;
       const seg=assistantSegments.get(aIdx);
       const segmentSeq=seg&&seg.getAttribute('data-live-segment-seq')||'';
       const burstId=seg&&seg.getAttribute('data-activity-burst-id')||'';
@@ -10533,6 +11002,7 @@ function renderMessages(options){
     }
     for(const [aIdx,seg] of assistantSegments){
       if(!seg||!seg.classList||!seg.classList.contains('assistant-segment-worklog-source')) continue;
+      if(virtualWindow.virtualized&&renderableRawIdxs.has(aIdx)&&!renderedRawIdxs.has(aIdx)) continue;
       if(!_worklogReasonHtmlFromAnchor(seg)) continue;
       const segmentSeq=seg&&seg.getAttribute('data-live-segment-seq')||'';
       const burstId=seg&&seg.getAttribute('data-activity-burst-id')||'';
@@ -10672,6 +11142,7 @@ function renderMessages(options){
     }
   }
   _restoreWorklogDetailDisclosureState(inner, worklogDetailDisclosureState);
+  _messageVirtualWindowKey=renderWindowKey;
   // Render per-turn duration and optional token usage on assistant messages.
   // Duration stays visible even when token usage is disabled, because it answers
   // the basic "how long did that turn take?" UX question. Only walk rendered
@@ -10912,7 +11383,21 @@ function renderMessages(options){
       }
     }
     const _preservedLen=_liveAssistantSegmentTextLength(_preservedSeg||_preservedLiveTurn);
-    if(_preservedLen>0){
+    // Structural-block counts: a live turn can be AHEAD of S.messages with
+    // Activity/tool/worklog blocks that haven't persisted yet — even with ZERO
+    // streamed text (e.g. an Activity-only turn mid-tool-call). The text-length
+    // gate alone would skip preservation in that case, so a scroll-triggered
+    // rebuild on a long (virtualized) transcript could blink those live-only
+    // blocks for a frame. Also restore when the preserved turn carries more
+    // structure than the rebuilt (lagging-S.messages) turn. (#3714 ship-review)
+    const _structuralCount=(turn)=> turn?turn.querySelectorAll(
+      '[data-live-assistant="1"],.tool-call-group,.tool-card-row,'+
+      '.tool-worklog-group,.live-worklog[data-live-worklog-shell="1"],'+
+      '.wl-reason,.agent-activity-thinking,.thinking-card-row'
+    ).length:0;
+    const _preservedStructure=_structuralCount(_preservedLiveTurn);
+    const _rebuiltStructure=_structuralCount(_rebuilt);
+    if(_preservedLen>0 || _preservedStructure>_rebuiltStructure){
       const _rebuiltLen=_rebuilt?_liveAssistantSegmentTextLength(_rebuiltSeg||_rebuilt):-1;
       if(_rebuiltLen<=_preservedLen){
         // Decide segment-level vs whole-turn restore. Segment-level keeps the
@@ -10925,13 +11410,6 @@ function renderMessages(options){
         // blocks for a frame — so restore the WHOLE preserved turn instead.
         // Otherwise (rebuild has >= the preserved turn's structural blocks) do
         // the precise segment swap so rebuilt-only structure is kept.
-        const _structuralCount=(turn)=> turn?turn.querySelectorAll(
-          '[data-live-assistant="1"],.tool-call-group,.tool-card-row,'+
-          '.tool-worklog-group,.live-worklog[data-live-worklog-shell="1"],'+
-          '.wl-reason,.agent-activity-thinking,.thinking-card-row'
-        ).length:0;
-        const _preservedStructure=_structuralCount(_preservedLiveTurn);
-        const _rebuiltStructure=_structuralCount(_rebuilt);
         if(_rebuilt&&_rebuiltSeg&&_preservedSeg&&_rebuiltStructure>=_preservedStructure){
           // Rebuild is the structural superset — swap only the parser-owned
           // (tail) live segment, keeping rebuilt-only segments / tool groups.
@@ -10971,10 +11449,11 @@ function renderMessages(options){
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){
       const renderSignature=cachedRenderSignature===null?_messageRenderCacheSignature():cachedRenderSignature;
-      _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowSize,signature:renderSignature});
+      _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowKey,signature:renderSignature});
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
   }
+  _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
 }
 
 function _toolDisplayName(tc){
@@ -12087,8 +12566,33 @@ function loadDiffInline(container){
   });
 }
 
+const CSV_MAX_SIZE=256*1024; // 256 KB cap for inline CSV rendering
+
+function buildCsvTablePreview(path, text){
+  if(typeof text!=='string') return {errorKey:'csv_error'};
+  if(text.length>CSV_MAX_SIZE) return {errorKey:'csv_too_large'};
+  const rows=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(r=>r.trim());
+  if(rows.length<2) return {errorKey:'csv_no_data'};
+  // Auto-detect separator (comma, semicolon, tab)
+  // Heuristic: uses the first separator found in the header row. Edge case:
+  // quoted fields containing commas without non-quoted commas in the header
+  // could cause misdetection — acceptable trade-off for a preview renderer.
+  const firstLine=rows[0];
+  const separators=[',',';','\t'];
+  const sep=separators.find(s=>firstLine.includes(s))||',';
+  const headers=rows[0].split(sep).map(c=>c.trim().replace(/^["']|["']$/g,''));
+  const bodyRows=rows.slice(1).map(r=>'<tr>'+r.split(sep).map(c=>`<td>${esc(c.trim().replace(/^["']|["']$/g,''))}</td>`).join('')+'</tr>').join('');
+  const headerRow=headers.map(h=>`<th>${esc(h)}</th>`).join('');
+  return {
+    html:`<div class="csv-table-wrap"><div class="pre-header">${esc(path.split('/').pop())} <span style="opacity:.5;font-size:11px">${t('csv_header_note')}</span></div><table class="csv-table"><thead><tr>${headerRow}</tr></thead><tbody>${bodyRows}</tbody></table></div>`,
+  };
+}
+
+function _csvPreviewErrorHtml(path, errorKey){
+  return `<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
+}
+
 function loadCsvInline(container){
-  const CSV_MAX_SIZE=256*1024; // 256 KB cap for inline CSV rendering
   const root=container||document;
   root.querySelectorAll('.csv-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
@@ -12096,29 +12600,11 @@ function loadCsvInline(container){
     fetch('api/media?path='+encodeURIComponent(path))
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
-        if(text.length>CSV_MAX_SIZE){
-          el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('csv_too_large')}</span></div>`;
-          return;
-        }
-        const rows=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(r=>r.trim());
-        if(rows.length<2){
-          el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('csv_no_data')}</span></div>`;
-          return;
-        }
-        // Auto-detect separator (comma, semicolon, tab)
-        // Heuristic: uses the first separator found in the header row. Edge case:
-        // quoted fields containing commas without non-quoted commas in the header
-        // could cause misdetection — acceptable trade-off for a preview renderer.
-        const firstLine=rows[0];
-        const separators=[',',';','\t'];
-        let sep=separators.find(s=>firstLine.includes(s))||',';
-        const headers=rows[0].split(sep).map(c=>c.trim().replace(/^["']|["']$/g,''));
-        const bodyRows=rows.slice(1).map(r=>'<tr>'+r.split(sep).map(c=>`<td>${esc(c.trim().replace(/^["']|["']$/g,''))}</td>`).join('')+'</tr>').join('');
-        const headerRow=headers.map(h=>`<th>${esc(h)}</th>`).join('');
-        el.outerHTML=`<div class="csv-table-wrap"><div class="pre-header">${esc(path.split('/').pop())} <span style="opacity:.5;font-size:11px">${t('csv_header_note')}</span></div><table class="csv-table"><thead><tr>${headerRow}</tr></thead><tbody>${bodyRows}</tbody></table></div>`;
+        const preview=buildCsvTablePreview(path, text);
+        el.outerHTML=preview.html||_csvPreviewErrorHtml(path, preview.errorKey||'csv_error');
       })
       .catch(()=>{
-        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('csv_error')}</span></div>`;
+        el.outerHTML=_csvPreviewErrorHtml(path, 'csv_error');
       });
   });
 }
