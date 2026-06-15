@@ -977,16 +977,21 @@ function _syncMessageVirtualHeightCache(visWithIdx){
   _messageVirtualHeightCacheSrc=S.messages;
 }
 function _currentMessageVirtualWindow(visWithIdx, keepTailCount){
+  // Virtualization disabled in the fork (2026-06-15). Upstream's row virtualization
+  // sizes the scroll container from ESTIMATED row heights (140px default). The
+  // fork's transcripts contain very tall compression-stitched rows, so the
+  // estimated top/bottom spacers collapse far below the real content height —
+  // on scroll the rendered window lands outside the viewport and the WHOLE chat
+  // blanks while the scrollbar jumps to nowhere. Render all loaded rows instead
+  // (server-side truncation + the "Load earlier" indicator bound the count, the
+  // same model the fork shipped before the upstream virtualization landed).
+  // _messageVirtualWindow stays intact for its unit tests; only the live render
+  // and scroll paths read this wrapper, so returning a non-virtualized full
+  // window makes _scheduleMessageVirtualizedRender() a no-op (it early-returns
+  // when !virtualized) and drops the spacer math entirely.
   _syncMessageVirtualHeightCache(visWithIdx);
-  const container=$('messages');
-  return _messageVirtualWindow({
-    total:visWithIdx.length,
-    scrollTop:container?container.scrollTop:0,
-    viewportHeight:container?container.clientHeight:(_messageVirtualEstimatedRowHeight*6),
-    heights:_messageVirtualHeightCache,
-    defaultHeight:_messageVirtualEstimatedRowHeight,
-    keepTailCount,
-  });
+  const total=visWithIdx.length;
+  return {virtualized:false,start:0,end:total,topPad:0,bottomPad:0,total,tailStart:total};
 }
 function _messageVirtualPrependedHeightDelta(prependedRenderableCount){
   const count=Math.max(0, Number(prependedRenderableCount)||0);
