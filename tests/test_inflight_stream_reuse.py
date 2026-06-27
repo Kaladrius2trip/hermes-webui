@@ -898,7 +898,7 @@ def test_restore_succeeded_reconnect_replays_tool_cards():
     body = _function_body(SESSIONS_JS, "loadSession")
     replay_fn = body.find("const replayPersistedLiveToolCards=(opts)=>{")
     reattach_pos = body.find("if(INFLIGHT[sid].reattach&&activeStreamId&&typeof attachLiveStream==='function')")
-    restore_pos = body.find("if(typeof restoreLiveTurnHtmlForSession==='function'){", reattach_pos if reattach_pos != -1 else 0)
+    restore_pos = body.find("restoreLiveTurnHtmlForSession", reattach_pos if reattach_pos != -1 else 0)
     fallback_pos = body.find("if(!restoredLiveTurn){", restore_pos)
     restore_replay_pos = body.find("if(restoredLiveTurn&&didReconnect){", restore_pos)
     restore_replay_block = body[restore_replay_pos:fallback_pos]
@@ -951,8 +951,10 @@ def test_merge_inflight_tail_preserves_all_segmented_live_progress():
     groups whose burst ids point to those anchors pile up at the bottom.
     """
     assert NODE, "node not on PATH"
+    helper_start = SESSIONS_JS.index("function _currentTailUserMessage")
     fn_start = SESSIONS_JS.index("function _mergeInflightTailMessages")
     fn_end = SESSIONS_JS.index("// Load older messages", fn_start)
+    tail_user_helpers = SESSIONS_JS[helper_start:fn_start]
     merge_fn = SESSIONS_JS[fn_start:fn_end]
     script = f"""
 const assert = require('assert');
@@ -960,6 +962,7 @@ function _messageComparableText(m) {{ return String((m&&m.content)||'').trim(); 
 function _sameTranscriptMessage(a,b) {{
   return !!(a&&b&&a.role===b.role&&_messageComparableText(a)===_messageComparableText(b));
 }}
+{tail_user_helpers}
 {merge_fn}
 const base = [{{role:'user', content:'go'}}];
 const inflight = [

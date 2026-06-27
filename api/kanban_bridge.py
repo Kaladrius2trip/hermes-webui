@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+from api.sse_chunked import end_sse_headers
 import time
 from dataclasses import asdict, is_dataclass
 from urllib.parse import parse_qs, unquote
@@ -814,6 +815,35 @@ def _config_payload(*, board=None):
     }
 
 
+def _update_config_payload(body):
+    if not isinstance(body, dict):
+        raise ValueError("JSON object body required")
+    if "lane_by_profile" not in body:
+        raise ValueError("lane_by_profile is required")
+    if not isinstance(body.get("lane_by_profile"), bool):
+        raise ValueError("lane_by_profile must be boolean")
+
+    from api import config
+
+    config_path = config._get_config_path()
+    with config._cfg_lock:
+        config_data = config._load_yaml_config_file(config_path)
+        dashboard_cfg = config_data.get("dashboard")
+        if not isinstance(dashboard_cfg, dict):
+            dashboard_cfg = {}
+        kanban_cfg = dashboard_cfg.get("kanban")
+        if not isinstance(kanban_cfg, dict):
+            kanban_cfg = {}
+        kanban_cfg["lane_by_profile"] = body["lane_by_profile"]
+        dashboard_cfg["kanban"] = kanban_cfg
+        config_data["dashboard"] = dashboard_cfg
+        config._save_yaml_config_file(config_path, config_data)
+    config.reload_config()
+    payload = _config_payload()
+    payload["lane_by_profile"] = body["lane_by_profile"]
+    return payload
+
+
 def _stats_payload(*, board=None):
     """Return per-status and per-assignee task counts for the board."""
     kb = _kb()
@@ -1370,7 +1400,7 @@ def _handle_events_sse_stream(handler, parsed):
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
-    handler.end_headers()
+    end_sse_headers(handler)
 
     # Send an initial frame so the client knows the connection is open
     # and learns the current cursor (in case the server already had a
@@ -1544,6 +1574,8 @@ def handle_kanban_patch(handler, parsed, body) -> bool | None:
     three-valued ``True | None | False`` contract (#1843)."""
     path = parsed.path
     try:
+        if path == "/api/kanban/config":
+            return j(handler, _update_config_payload(body)) or True
         # /boards/<slug> routes operate on the on-disk board collection
         # itself — the slug travels in the URL path, not via ?board=. Match
         # them BEFORE resolving the board param so a stray ?board=ghost in

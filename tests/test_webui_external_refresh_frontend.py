@@ -22,6 +22,16 @@ def test_active_session_external_refresh_uses_metadata_then_force_reload():
     assert "remoteCount > localCount || remoteLast > localLast" in SESSIONS_JS
     assert "if(S.busy || S.activeStreamId) return;" in SESSIONS_JS
     assert "document.hidden" in SESSIONS_JS
+    assert "externalRefreshReason:reason||'poll'" in SESSIONS_JS
+
+
+def test_webui_source_never_counts_as_external_session():
+    assert "function _isWebUiSourceSession(session)" in SESSIONS_JS
+    assert "if (!session || _isWebUiSourceSession(session)) return false;" in SESSIONS_JS
+    external_start = SESSIONS_JS.index("function _isExternalSession(session)")
+    external_body = SESSIONS_JS[external_start : external_start + 300]
+    assert "_isWebUiSourceSession(session)" in external_body
+    assert "session.is_cli_session || _isMessagingSession(session)" in external_body
 
 
 def test_active_session_external_refresh_has_focus_and_visibility_hooks():
@@ -68,7 +78,8 @@ def test_session_event_profile_filter_tolerates_default_root_aliases():
     assert "function _sessionEventProfilesMatch(eventProfile, activeProfile)" in SESSIONS_JS
     assert "if (!_profileMatchesActiveProfile(sessionProfile, activeProfile)) return false;" in SESSIONS_JS
     assert "activeProfileIsDefault:true" in UI_JS
-    assert "S.activeProfileIsDefault=!!p.is_default;" in BOOT_JS
+    assert "const activeProfileState = await _resolveActiveProfileBootstrapState();" in BOOT_JS
+    assert "S.activeProfileIsDefault = activeProfileState.isDefault;" in BOOT_JS
     assert "S.activeProfileIsDefault = !!data.is_default;" in PANELS_JS
 
 

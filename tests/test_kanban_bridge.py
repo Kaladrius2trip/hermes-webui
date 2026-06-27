@@ -1457,3 +1457,40 @@ def test_kanban_running_task_dict_exposes_worker_state(monkeypatch):
     assert worker["claim_expires_in_s"] > 0
     assert worker["failures"] == 1
     assert worker["last_failure_error"] == "boom"
+
+def test_board_payload_includes_unassigned_ready_tasks_without_assignee_filter(monkeypatch):
+    """Regression: unassigned Ready tasks must appear in the board payload columns
+    when no assignee filter is active. If the API omits them, the frontend has no
+    data to build an Unassigned lane from — the bug Brett hit on Dynasty board.
+    """
+    bridge = _load_bridge(monkeypatch)
+    fake_kanban = sys.modules["hermes_cli.kanban_db"]
+
+    # Seed an unassigned ready task alongside the existing assigned one.
+    unassigned_task = FakeTask("t_unassigned_ready", "Unassigned ready task", "ready", None)
+    fake_kanban.tasks.append(unassigned_task)
+
+    # Request board without any assignee filter.
+    data = bridge._board_payload(_parsed())
+
+    assert "columns" in data
+    ready_col = next((c for c in data["columns"] if c["name"] == "ready"), None)
+    assert ready_col is not None, "ready column missing from payload"
+
+    ready_ids = {task["id"] for task in ready_col["tasks"]}
+    assert "t_unassigned_ready" in ready_ids, (
+        "Unassigned ready task must appear in the ready column when no assignee "
+        "filter is active. This is required so the frontend can render an "
+        "Unassigned lane for mobile Kanban."
+    )
+
+    # The task's assignee field must be None/absent so the frontend correctly
+    # classifies it into the Unassigned lane.
+    unassigned_in_payload = next(
+        (t for t in ready_col["tasks"] if t["id"] == "t_unassigned_ready"), None
+    )
+    assert unassigned_in_payload is not None
+    assert not unassigned_in_payload.get("assignee"), (
+        "Unassigned task must have a falsy assignee in the payload so the "
+        "frontend _kanbanLaneKey() maps it to KANBAN_UNASSIGNED_LANE."
+    )
