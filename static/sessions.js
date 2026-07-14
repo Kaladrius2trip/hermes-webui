@@ -2356,13 +2356,15 @@ async function loadSession(sid){
   }
   } catch(e) {
     const _msgInner = $('msgInner');
-    if (_loadingSessionId === sid && _msgInner && /Loading conversation/i.test(_msgInner.textContent || '')) {
+    if (_isCurrentLoad() && _msgInner && /Loading conversation/i.test(_msgInner.textContent || '')) {
       _msgInner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Failed to load conversation. Try switching sessions or refreshing.</div>';
       if (typeof showToast === 'function') showToast('Failed to load conversation', 3000, 'error');
     }
     throw e;
   } finally {
-    if (_loadingSessionId === sid) _loadingSessionId = null;
+    // Generation-guarded: a stale superseded load (same sid, older generation)
+    // must not clear ownership out from under the newer in-flight load.
+    if (_isCurrentLoad()) _loadingSessionId = null;
   }
 }
 
@@ -3097,7 +3099,10 @@ async function _ensureMessagesLoaded(sid, opts) {
   try {
     // 120s: first open after a server restart may stitch a long snapshot
     // chain server-side; the lineage poll above keeps the user informed.
-    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`, {timeoutMs: 120000});
+    data = await api(
+      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
+      {timeoutMs:120000}
+    );
   } finally {
     clearTimeout(_lineageDelay);
     if (_lineagePollTimer !== null) { clearTimeout(_lineagePollTimer); _lineagePollTimer = null; }

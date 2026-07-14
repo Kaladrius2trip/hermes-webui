@@ -93,6 +93,7 @@ eval(extractFunc('_collapseSessionLineageForSidebar'));
 eval(extractFunc('_attachChildSessionsToSidebarRows'));
 eval(extractFunc('_sessionAttentionState'));
 eval(extractFunc('_sidebarRowHasVisibleMessages'));
+eval(extractFunc('_sidebarWorkspaceFilterState'));
 eval(extractFunc('_partitionSidebarSessionRows'));
 eval(extractFunc('_scopedSidebarReferenceRows'));
 eval(extractFunc('_renderSidebarRowsFromRawSessions'));

@@ -136,4 +136,6 @@ def test_chat_surface_and_sidebar_todo_panel_share_authoritative_parser() -> Non
     load_todos = extract_function(PANELS_JS, "loadTodos")
     assert "_latestTodoToolState" in load_todos
     assert "todoPanel" in load_todos
-    assert "todos_no_active" in load_todos
+    # Post-upstream-sync the empty state is centralized in renderTodoEmptyState(),
+    # which resolves the same shared todos_no_active key.
+    assert "todos_no_active" in load_todos or "renderTodoEmptyState" in load_todos

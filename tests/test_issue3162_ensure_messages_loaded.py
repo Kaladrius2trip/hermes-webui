@@ -20,7 +20,7 @@ def _ensure_messages_loaded_body() -> str:
     # cold-load expand_renderable param + comment, pushing it further still).
     # Widened again: lineage warm-progress polling (snapshot stitch UI)
     # added ~1.4k chars at the top of the function.
-    return SESSIONS_JS[start: start + 5000]
+    return SESSIONS_JS[start: start + 8000]
 
 
 def test_ensure_messages_loaded_declares_msgs_with_let():

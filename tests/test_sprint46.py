@@ -277,10 +277,9 @@ def test_session_compress_keeps_engine_system_guidance_model_facing_only(monkeyp
 
     assert handler.status == 200
     loaded = get_session(sid)
-    assert loaded.messages == [
-        {"role": "assistant", "content": "[Recent Summary (d0, node 7)] old context"},
-        {"role": "assistant", "content": "four"},
-    ]
+    # Post-#4836 manual compress keeps the visible transcript intact and
+    # compresses only the model-facing context.
+    assert [m["content"] for m in loaded.messages] == ["one", "two", "three", "four"]
     assert loaded.context_messages[0]["role"] == "system"
     assert "LCM retrieval policy" in loaded.context_messages[0]["content"]
     payload = handler.payload()
@@ -314,10 +313,9 @@ def test_session_compress_strips_injected_lcm_and_anchor_systems_from_display(mo
 
     assert handler.status == 200
     loaded = get_session(sid)
-    assert loaded.messages == [
-        {"role": "assistant", "content": "[Recent Summary (d0, node 7)] old context"},
-        {"role": "assistant", "content": "four"},
-    ]
+    # Post-#4836 manual compress keeps the visible transcript intact and
+    # compresses only the model-facing context.
+    assert [m["content"] for m in loaded.messages] == ["one", "two", "three", "four"]
     assert loaded.context_messages[0]["role"] == "system"
     assert "LCM retrieval policy" in loaded.context_messages[0]["content"]
     assert loaded.context_messages[1]["role"] == "system"

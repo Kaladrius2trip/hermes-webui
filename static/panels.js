@@ -13099,7 +13099,7 @@ async function saveSettings(andClose){
   body.workspace_todos_tab=!!window._workspaceTodosTab;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
-  body.show_all_workspaces=!!(($('settingsShowAllWorkspaces')||{checked:true}).checked);
+  body.show_all_workspaces=!!(((typeof $==='function'&&$('settingsShowAllWorkspaces'))||{checked:true}).checked);
   // Persist the opt-out child independently; the read path applies the parent gate.
   body.show_claude_code_sessions=showClaudeCodeSessions;
   // Cron and webhook sessions are gated on CLI sessions (server short-circuits otherwise);

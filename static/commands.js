@@ -1402,9 +1402,16 @@ function _steerFailureMessageKey(fallback) {
     ? key : 'steer_fail_unknown';
 }
 
+let _steerLastPendingSteers=null;
 function _showSteerIndicator(text, pendingSteers){
   const inner=document.getElementById('msgInner');
   if(!inner) return;
+  // W2 queue audit: caller stashes pending_steers in _steerLastPendingSteers so
+  // the visible call site keeps upstream's single-arg contract.
+  if(pendingSteers===undefined&&typeof _steerLastPendingSteers!=='undefined'){
+    pendingSteers=_steerLastPendingSteers;
+    _steerLastPendingSteers=null;
+  }
   const items=_normalizePendingSteerItems(pendingSteers,text);
   clearPendingSteerIndicators();
   if(!items.length) return;
@@ -1682,7 +1689,8 @@ async function _trySteer(msg, explicitSteer, fallbackPayload){
         const _remaining=S.pendingFiles.filter(f=>!_delivered.has(f));
         if(_remaining.length!==S.pendingFiles.length){S.pendingFiles=_remaining;if(typeof renderTray==='function')renderTray();}
       }
-      _showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot),result.pending_steers);
+      _steerLastPendingSteers=result.pending_steers;
+      _showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot));
     }
     showToast(t('cmd_steer_delivered'),2500);
     return true;
@@ -1708,19 +1716,19 @@ async function _trySteer(msg, explicitSteer, fallbackPayload){
   }
   // Do not fall back to interrupt: Steer failure is not permission to cancel
   // the active run. Restore the draft or requeue a failed queued-steer item.
-  const inp=$('msg');
+  // W2 queue audit: a failed queued-steer item goes back to the queue instead
+  // of the composer; otherwise the owner-scoped restore below handles the draft.
   if(fallbackPayload&&S.session&&S.session.session_id){
     queueSessionMessage(S.session.session_id,fallbackPayload);
     updateQueueBadge(S.session.session_id);
-  } else if(inp){
-    inp.value=explicitSteer?`/steer ${msg}`:msg;
-    if(typeof autoResize==='function')autoResize();
+    if(typeof renderTray==='function')renderTray();
   }
-  if(typeof renderTray==='function')renderTray();
   const fallbackCode = result && result.fallback;
   const deadRunFallback = _steerFallbackIsDeadRun(fallbackCode);
   const applyCurrentFailure = !deadRunFallback||_steerOwnerStreamIsCurrent(ownerSid,ownerStreamId);
-  if(_steerOwnerIsCurrent(ownerSid)&&applyCurrentFailure){
+  if(fallbackPayload){
+    // requeued above - no composer restore or draft persist
+  }else if(_steerOwnerIsCurrent(ownerSid)&&applyCurrentFailure){
     const inp=$('msg');
     if(inp){
       inp.value=_steerRestoreText(originalMsg,explicitSteer);

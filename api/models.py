@@ -1331,7 +1331,9 @@ class Session:
             'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
             'enabled_toolsets', 'composer_draft',
             # #2697 — per-session reasoning effort override (None = inherit profile default)
-            'reasoning_effort', 'anchor_activity_scenes',
+            # NOTE: anchor_activity_scenes deliberately NOT here — #5854 keeps
+            # scene bodies after messages; only anchor_scene_index goes in the prefix.
+            'reasoning_effort',
             'process_wakeup_pause',
             'share_token', 'share_created_at',
         ]

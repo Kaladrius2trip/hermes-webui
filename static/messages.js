@@ -1469,7 +1469,7 @@ async function send(){
           S.messages.push({role:'assistant',content:String(_petOutput.message),_ts:Date.now()/1000});
         }
         renderMessages();
-        $('msg').value='';autoResize();hideCmdDropdown();return;
+        $('msg').value='';autoResize();hideCmdDropdown();return true;
       }
       const _agentCmd=typeof getAgentCommandMetadata==='function'
         ? await getAgentCommandMetadata(_parsedCmd.name)
@@ -1520,7 +1520,7 @@ async function send(){
           try{const _moaCfgU=await api('/api/commands/moa/resolve');_moaUsage=_moaCfgU.usage||_moaUsage;}catch(_eu){}
           S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
           S.messages.push({role:'assistant',content:_moaUsage,_ts:Date.now()/1000});
-          renderMessages();$('msg').value='';autoResize();hideCmdDropdown();return;
+          renderMessages();$('msg').value='';autoResize();hideCmdDropdown();return true;
         }
         try{
           await api('/api/commands/moa/resolve');
@@ -1530,7 +1530,7 @@ async function send(){
         }catch(_e){
           S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
           S.messages.push({role:'assistant',content:'MoA unavailable: '+(_e&&_e.message||_e),_ts:Date.now()/1000});
-          renderMessages();$('msg').value='';autoResize();hideCmdDropdown();return;
+          renderMessages();$('msg').value='';autoResize();hideCmdDropdown();return true;
         }
       }
       const _bundleCmd=!_agentCmd&&typeof getBundleCommandMetadata==='function'
@@ -4792,7 +4792,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _renderStreamingFadeMarkdown(displayText){
     if(!assistantBody) return true;
-    if(_liveSegmentRequiresRenderMd(displayText)){
+    // typeof guard: isolated test drivers eval this function without the
+    // fork's MEDIA gate helpers in scope.
+    if(typeof _liveSegmentRequiresRenderMd==='function'&&_liveSegmentRequiresRenderMd(displayText)){
       _renderLiveSegmentWithRenderMd(displayText);
       return true;
     }

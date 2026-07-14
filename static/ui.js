@@ -5100,8 +5100,14 @@ function _applyReasoningChip(eff,sessionOverride){
   // from ui.js without the surrounding `let` declarations) don't ReferenceError
   // on the outer-scope read. See tests/test_reasoning_chip_js_behaviour.py.
   if(typeof _currentReasoningEffort!=='undefined') _currentReasoningEffort=effort;
+  // Second arg is polymorphic: a session-override STRING (fork #2697) or the
+  // server/meta OBJECT carrying supported_efforts (upstream #5682 transitions).
+  const _isMetaArg=!!(sessionOverride&&typeof sessionOverride==='object');
   if(sessionOverride!==undefined&&typeof _currentReasoningSessionOverride!=='undefined'){
-    _currentReasoningSessionOverride=sessionOverride?_normalizeReasoningEffort(sessionOverride):null;
+    _currentReasoningSessionOverride=(!_isMetaArg&&sessionOverride)?_normalizeReasoningEffort(sessionOverride):null;
+  }
+  if(_isMetaArg&&Array.isArray(sessionOverride.supported_efforts)&&typeof _currentReasoningEffortsSupported!=='undefined'){
+    _currentReasoningEffortsSupported=sessionOverride.supported_efforts;
   }
   const wrap=$('composerReasoningWrap');
   const label=$('composerReasoningLabel');
@@ -5216,7 +5222,7 @@ function fetchReasoningChip(keyOverride){
   // while this GET is in flight short-circuit instead of re-dispatching.  The
   // request URL stays model/provider-only; sid is cache metadata, not API input.
   const query=keyOverride===undefined?_reasoningEffortQuery():keyOverride;
-  const key=keyOverride===undefined?query+`&sid=${encodeURIComponent(sid||'')}`:keyOverride;
+  const key=keyOverride!==undefined?keyOverride:(sid?query+`&sid=${encodeURIComponent(sid)}`:query);
   const seq=++_reasoningFetchSeq;
   _lastReasoningFetchKey=key;
   api('/api/reasoning'+query).then(function(st){
@@ -5252,7 +5258,8 @@ function syncReasoningChip(){
   // #4650: avoid GET /api/reasoning storms during routine syncs; include the
   // loaded session id so per-session reasoning overrides refresh on navigation.
   const sid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)||null;
-  const key=_reasoningEffortQuery()+`&sid=${encodeURIComponent(sid||'')}`;
+  const _q=_reasoningEffortQuery();
+  const key=sid?_q+`&sid=${encodeURIComponent(sid)}`:_q;
   if(_lastReasoningFetchKey===key){
     if(_currentReasoningEffort!==null){
       const override=(typeof _currentReasoningSessionOverride!=='undefined')?_currentReasoningSessionOverride:null;

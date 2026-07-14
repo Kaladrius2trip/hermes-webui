@@ -24715,7 +24715,7 @@ def _handle_session_compress(handler, body):
             from api.session_ops import _truncation_watermark_for
             from api.streaming import _stamp_missing_message_timestamps
 
-            compressed_copy = copy.deepcopy(compressed)
+            compressed_copy = copy.deepcopy(compressed_context)
             _stamp_missing_message_timestamps(compressed_copy)
             s.context_messages = compressed_copy
             s.active_stream_id = None
