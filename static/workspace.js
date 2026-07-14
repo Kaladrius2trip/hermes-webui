@@ -46,7 +46,21 @@ async function api(path,opts={}){
           // re-authenticate. This is especially important for iOS PWA (standalone mode)
           // and for subpath mounts like /hermes/, where /login escapes to the site root.
           if(res.status===401){
-            if(redirect401) window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);
+            // #5578: if we're ALREADY on the login page, appending
+            // window.location.pathname+search (which contains ?next=…) into a
+            // fresh next= wraps the login URL into itself and re-encodes it —
+            // exponential URL growth on each expired-auth bounce until the tab
+            // breaks. On the login page, just reload login WITHOUT a next (the
+            // page preserves its own inner next); elsewhere, capture the path.
+            if(redirect401){
+              // Already on the login page? Reload login WITHOUT a next.
+              const _p=(window.location.pathname||'').replace(/\/+$/,'');
+              if(/(?:^|\/)login$/.test(_p)){
+                window.location.href='login';
+              }else{
+                window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);
+              }
+            }
             // Callers can opt out of navigation and handle the unauthenticated state themselves.
             return;
           }
@@ -228,6 +242,23 @@ function _workspacePathIsReadOnly(path){
 }
 
 function _workspaceRouteForPath(path, kind, opts={}){
+  // Resolve the app-relative "/api/…" route against document.baseURI so the
+  // URLs that are consumed OUTSIDE api() — previewImg.src, the media/pdf/html
+  // frame src, the download anchor, window.open — keep working under a subpath
+  // mount like /hermes/. A bare "/api/…" string resolves to the server root
+  // there and 404s. (api() strips the leading slash and re-resolves against
+  // baseURI itself, so routes passed through it are unaffected by already
+  // being absolute.)
+  const route=_workspaceRouteForPathRel(path, kind, opts);
+  if(!route) return route;
+  // Non-browser test harnesses have no document/location: keep the app-relative form.
+  const base=(typeof document!=='undefined'&&document.baseURI)||(typeof location!=='undefined'&&location.href)||'';
+  if(!base||!/^https?:\/\//i.test(base)) return route;
+  const rel=route.startsWith('/') ? route.slice(1) : route;
+  return new URL(rel, base).href;
+}
+
+function _workspaceRouteForPathRel(path, kind, opts={}){
   if(!S.session) return '';
   const normalizedPath = _normalizeWorkspaceRelPath(path);
   const grant = _workspaceEscapeGrantForPath(normalizedPath);
@@ -289,6 +320,7 @@ async function authorizeWorkspaceEscapeNavigation(item){
 
 let _workspacePanelActiveTab = 'files';
 let _renderSessionArtifactsTimer = null;
+let _workspaceTodosLastRenderedHash = null;
 
 function _setWorkspacePanelTabDataset(){
   const panel = document.querySelector('.rightpanel');
@@ -326,6 +358,35 @@ function scheduleRenderSessionArtifacts(){
   }, 100);
 }
 
+function _workspaceTodosHash(items){
+  if(!Array.isArray(items)) return '';
+  let h=items.length+'|';
+  for(let i=0;i<items.length;i++){
+    const t=items[i]||{};
+    h+=String(t.id==null?'':t.id)+'\x1f'+String(t.content==null?(t.text==null?'':t.text):t.content)+'\x1f'+String(t.status==null?'':t.status)+'\x1e';
+  }
+  return h;
+}
+
+function _workspaceTodosTabIsActive(){
+  if(typeof window==='undefined'||window._workspaceTodosTab!==true) return false;
+  if(typeof document==='undefined') return false;
+  const rightPanel=document.querySelector('.rightpanel');
+  if(!rightPanel||!rightPanel.dataset||rightPanel.dataset.activeTab!=='todos') return false;
+  const tab=document.getElementById('workspaceTodosTab');
+  const panel=document.getElementById('workspaceTodosPanel');
+  return !!(tab&&panel&&!tab.hidden&&!panel.hidden);
+}
+
+function _resetWorkspaceTodosRenderCache(){
+  _workspaceTodosLastRenderedHash=null;
+}
+
+function _refreshWorkspacePanelTodos(){
+  if(!_workspaceTodosTabIsActive()) return;
+  _loadWorkspacePanelTodos();
+}
+
 if(typeof document !== 'undefined'){
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _setWorkspacePanelTabDataset, {once:true});
   else _setWorkspacePanelTabDataset();
@@ -351,6 +412,31 @@ function switchWorkspacePanelTab(tab){
   if(todos) todos.hidden = _workspacePanelActiveTab !== 'todos';
   if(_workspacePanelActiveTab === 'artifacts') renderSessionArtifacts();
   if(_workspacePanelActiveTab === 'todos' && typeof renderWorkspaceTodos === 'function') renderWorkspaceTodos();
+  if(_workspacePanelActiveTab === 'todos') _loadWorkspacePanelTodos();
+}
+
+function _loadWorkspacePanelTodos(){
+  const panel = $('workspaceTodosPanel');
+  if(!panel) return;
+  let todos = [];
+  try{
+    if(S && Array.isArray(S.todos)){
+      todos = S.todos;
+    } else if(S && S.session && S.session.todo_state && Array.isArray(S.session.todo_state.todos)){
+      todos = S.session.todo_state.todos;
+    } else if(typeof _legacyTodosFromMessages === 'function'){
+      todos = _legacyTodosFromMessages() || [];
+    }
+  }catch(e){ todos = []; }
+  if(!todos.length){
+    panel.innerHTML = renderTodoEmptyState({centered:true});
+    return;
+  }
+  panel.innerHTML = renderTodoRows(todos, {metadata:true});
+}
+
+function _escHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 const ARTIFACT_IGNORE_RE = /(^|\/)(?:\.git|\.hg|\.svn|node_modules|\.venv|venv|__pycache__|dist|build|\.next|\.cache)(?:\/|$)/;
@@ -775,7 +861,7 @@ const MD_PREVIEW_RICH_RENDER_MAX_BYTES = 256 * 1024;
 const MD_PREVIEW_RICH_RENDER_MAX_LINES = 5000;
 // Binary formats that should download rather than preview
 const DOWNLOAD_EXTS = new Set([
-  '.docx','.doc','.xlsx','.xls','.pptx','.ppt','.odt','.ods','.odp',
+  '.doc','.xls','.ppt','.odt','.ods','.odp',
   '.zip','.tar','.gz','.bz2','.7z','.rar',
   '.exe','.dmg','.pkg','.deb','.rpm',
   '.woff','.woff2','.ttf','.otf','.eot',
@@ -879,6 +965,10 @@ function forceRenderMarkdownPreview(){
 let _previewCurrentPath = '';  // relative path of currently previewed file
 let _previewCurrentMode = '';  // 'code' | 'csv' | 'md' | 'image' | 'html' | 'pdf' | 'audio' | 'video'
 let _previewDirty = false;     // true when edits are unsaved
+let _previewServerEditable = null;  // backend editability metadata when available
+let _previewSaveRoute = '/api/file/save';  // current save adapter for the open preview
+let _previewOfficeFormat = '';  // current claimed Office format, if any
+let _previewPreviewKind = '';  // preview family returned by the backend
 
 function showPreview(mode){
   // mode: 'code' | 'csv' | 'image' | 'md' | 'html' | 'pdf' | 'audio' | 'video'
@@ -905,7 +995,9 @@ function updateEditBtn(){
   const btn=$('btnEditFile');
   if(!btn)return;
   const editable = !_workspacePathIsReadOnly(_previewCurrentPath)
-    && (_previewCurrentMode==='code'||_previewCurrentMode==='md'||_previewCurrentMode==='csv');
+    && (_previewServerEditable===null
+      ? (_previewCurrentMode==='code'||_previewCurrentMode==='md'||_previewCurrentMode==='csv')
+      : !!_previewServerEditable);
   btn.style.display = editable?'':'none';
   const editing = $('previewEditArea').style.display!=='none';
   btn.innerHTML = editing ? `&#128190; ${t('save')}` : `&#9998; ${t('edit')}`;
@@ -920,23 +1012,34 @@ async function toggleEditMode(){
     showToast(t('external_link_read_only'), 2000);
     return;
   }
+  if(!editing && _previewServerEditable===false){
+    showToast('This Office document is preview-only.', 3000, 'error');
+    return;
+  }
   if(editing){
     // Save
     if(!S.session||!_previewCurrentPath)return;
     const content=$('previewEditArea').value;
     try{
-      await api('/api/file/save',{method:'POST',body:JSON.stringify({
+      const saved=await api(_previewSaveRoute||'/api/file/save',{method:'POST',body:JSON.stringify({
         session_id:S.session.session_id, path:_previewCurrentPath, content
       })});
+      const savedContent=saved&&typeof saved.content==='string'?saved.content:content;
+      if(saved && typeof saved.editable==='boolean') _previewServerEditable = saved.editable;
+      if(saved && saved.preview_kind) _previewPreviewKind = saved.preview_kind;
+      if(saved && saved.office_format) _previewOfficeFormat = saved.office_format;
+      if(saved && saved.preview_kind==='office' && saved.office_format==='docx'){
+        _previewSaveRoute = '/api/file/office-save';
+      }
       _previewDirty=false;
       // Update read-only views AND the cached raw content so a later
       // "Render as markdown anyway" force-render reflects the just-saved text
       // (not the stale pre-edit fetch). #3378 review (Codex).
-      _previewRawContent = content;
+      _previewRawContent = savedContent;
       _previewRawContentPath = _previewCurrentPath;
-      if(_previewCurrentMode==='code') $('previewCode').textContent=content;
-      else if(_previewCurrentMode==='csv') renderCsvPreviewContent(_previewCurrentPath, content);
-      else renderMarkdownPreviewContent({content});
+      if(_previewCurrentMode==='code') $('previewCode').textContent=savedContent;
+      else if(_previewCurrentMode==='csv') renderCsvPreviewContent(_previewCurrentPath, savedContent);
+      else renderMarkdownPreviewContent({content:savedContent});
       $('previewEditArea').style.display='none';
       if(_previewCurrentMode==='code') $('previewCode').style.display='';
       else $('previewMd').style.display='';
@@ -1018,6 +1121,11 @@ async function openFile(path, opts={}){
     downloadFile(path);
     return;
   }
+
+  _previewServerEditable = null;
+  _previewSaveRoute = '/api/file/save';
+  _previewOfficeFormat = '';
+  _previewPreviewKind = '';
 
   $('previewPathText').textContent=path;
   $('previewArea').classList.add('visible');
@@ -1111,6 +1219,14 @@ async function openFile(path, opts={}){
         downloadFile(path);
         return;
       }
+      if(data.preview_kind==='office'){
+        _previewRawContent = data.content || '';
+        _previewRawContentPath = path;
+        _previewServerEditable = typeof data.editable === 'boolean' ? data.editable : null;
+        _previewPreviewKind = data.preview_kind || '';
+        _previewOfficeFormat = data.office_format || '';
+        _previewSaveRoute = data.preview_kind==='office' ? '/api/file/office-save' : '/api/file/save';
+      }
       renderCodePreviewContent(path, data.content);
   }catch(e){
       const grant = _workspaceEscapeGrantForPath(path);
@@ -1182,6 +1298,39 @@ function openInBrowser(){
   window.open(url,'_blank','noopener');
 }
 // openInBrowser keeps the helper-based raw path, which expands to an explicit &inline=1 URL.
+
+async function copyPreviewRelativePath(){
+  if(!_previewCurrentPath) return;
+  const btn=$('btnCopyPreviewRelPath');
+  if(btn&&btn.disabled) return;
+  if(btn) btn.disabled=true;
+  try{
+    const rel=_normalizeWorkspaceRelPath(_previewCurrentPath)||_previewCurrentPath;
+    if(typeof _copyTextWithFallback==='function'){
+      await _copyTextWithFallback(rel,t('path_copied'),t('path_copy_failed'));
+      return;
+    }
+    try{
+      await navigator.clipboard.writeText(rel);
+      showToast(t('path_copied'));
+    }catch(clipErr){
+      const ta=document.createElement('textarea');
+      ta.value=rel;
+      ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
+      document.body.appendChild(ta);
+      ta.select();
+      let copied=false;
+      try{copied=document.execCommand('copy');}catch(_){}
+      ta.remove();
+      if(copied) showToast(t('path_copied'));
+      else showToast(t('path_copy_failed')+(clipErr&&clipErr.message?clipErr.message:String(clipErr)));
+    }
+  }catch(err){
+    showToast(t('path_copy_failed')+(err.message||err));
+  }finally{
+    if(btn) btn.disabled=false;
+  }
+}
 
 // ── Workspace upload ──────────────────────────────────────────────────
 function triggerWorkspaceUpload() {
