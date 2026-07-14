@@ -44,7 +44,7 @@ class TestCustomProvidersInGetProviders:
 
     def _setup_cfg(self, custom_providers, active_provider=None):
         old_cfg = dict(config.cfg)
-        old_mtime = config._cfg_mtime
+        old_mtime = (config._cfg_mtime, config._cfg_path)
         config.cfg.clear()
         config.cfg["model"] = {"provider": active_provider or "anthropic"}
         if custom_providers is not None:
@@ -53,12 +53,16 @@ class TestCustomProvidersInGetProviders:
             config._cfg_mtime = config.Path(config._get_config_path()).stat().st_mtime
         except Exception:
             config._cfg_mtime = 0.0
+        # Pin _cfg_path too: a prior test that redirected _get_config_path
+        # leaves _cfg_path stale and the path-changed guard force-reloads
+        # the real config, wiping the patch (same rationale as the mtime pin).
+        config._cfg_path = config.Path(config._get_config_path())
         return old_cfg, old_mtime
 
     def _restore_cfg(self, old_cfg, old_mtime):
         config.cfg.clear()
         config.cfg.update(old_cfg)
-        config._cfg_mtime = old_mtime
+        config._cfg_mtime, config._cfg_path = old_mtime
 
     def test_custom_provider_with_models(self, monkeypatch, tmp_path):
         """glmcode custom provider with models should appear in provider list."""
